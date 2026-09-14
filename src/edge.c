@@ -4315,10 +4315,15 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             peer = peer->next;
             continue;
         }
-        /* Note: a relayed member that has also established a real direct
-         * connection is shown in P2P_with only - the Relay: section lists
-         * just the members still needing this relay, so no peer is ever
-         * duplicated between the two sections. */
+        /* Members of this relay (any that register to us) are listed in the
+         * "Relay & P2P_with:" section below, whether or not they also have a
+         * direct path; P2P_with keeps only peers with no relay relationship,
+         * so a peer is never duplicated between the two sections. */
+        if (eee->relay_peers != NULL &&
+            find_peer_by_mac(eee->relay_peers, peer->mac_addr)) {
+            peer = peer->next;
+            continue;
+        }
         const char *version = (peer->version[0] != '\0') ? peer->version : "unknown";
         const char *os_name = (peer->os_name[0] != '\0') ? peer->os_name : "unknown";
 
@@ -4378,22 +4383,17 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     }
 
     /* Send relay info: shown on the machine acting as a community relay (R);
-     * list the members it currently relays for. */
+     * list every member that registers to it (the peers relayed through it),
+     * whether or not a direct path has also been established. Peers here are
+     * excluded from P2P_with above, so nothing is duplicated. */
     if (eee->relay_peers != NULL) {
-        msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE, "Relay:\n");
+        msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE, "Relay & P2P_with:\n");
         sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                (struct sockaddr*) &sender_sock, i);
 
         struct peer_info *rp = eee->relay_peers;
         int rid = 1;
         while (rp) {
-            /* A member that has already established a direct connection is
-             * shown in P2P_with instead; the Relay: section keeps only the
-             * members that still depend on this relay (no duplicate). */
-            if (find_peer_by_mac(eee->known_peers, rp->mac_addr)) {
-                rp = rp->next;
-                continue;
-            }
             const char *rver = (rp->version[0] != '\0') ? rp->version : "unknown";
             const char *ros  = (rp->os_name[0] != '\0') ? rp->os_name : "unknown";
             char rvip[16] = "-";
