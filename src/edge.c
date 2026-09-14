@@ -808,7 +808,7 @@ static void help() {
     #endif
     printf("\n");
     printf("                         : A5 = Speck(-k). '-A1' can also be used as '-A 1' (default: chacha20).\n");
-    printf("-c <community>           | N2n community name the edge belongs to.\n");
+    printf("-c <community>           | N2n community name the edge belongs to (ASCII, max 15).\n");
     printf("-k <encrypt key>         | Encryption key (ASCII, max 32) - also N2N_KEY=<encrypt key>.\n");
     printf("-l <supernode host:port> | Supernode address Formats:\n");
     printf("                         : 1 host:port  - direct address, common format (e.g. 1.2.3.4:5678)\n");
@@ -1731,15 +1731,6 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
         {
             scan->punch_failed = 1;
             scan->punch_reset_time = now;
-            if (memcmp(scan->mac_addr, eee->last_psp_log_mac, N2N_MAC_SIZE)) {
-                /* This peer failed hole-punching so it can't go direct; it is
-                 * relayed via the community edge relay, not the supernode —
-                 * unless the relay is unavailable, in which case the send path
-                 * falls back to the supernode transparently. */
-                traceEvent(TRACE_NORMAL, "PsP (edge relay) for %s",
-                           PEER_ID(mac_tmp, scan));
-                memcpy(eee->last_psp_log_mac, scan->mac_addr, N2N_MAC_SIZE);
-            }
         } else if ( scan->punch_start_time != 0 &&
                     !scan->punch_failed &&
                     (now - scan->punch_start_time) <= 5 &&
@@ -2410,8 +2401,12 @@ void set_peer_operational( n2n_edge_t * eee,
             memset(&scan->sock6, 0, sizeof(n2n_sock_t));  /* Clear IPv6 completely */
         }
         scan->last_seen = n2n_now();
-        scan->direct_seen = n2n_now();
-        scan->p2p_est_time = scan->direct_seen;
+        /* Principle 4: direct connectivity must be PROVEN by receiving the
+         * peer's direct data PACKET (handle_PACKET), not by a REGISTER_ACK.
+         * An ACK only proves one-way liveness; latching direct_seen here
+         * would keep the edge off the community relay even when the direct
+         * path is actually dead. p2p_est_time is set at the real proof
+         * point (direct PACKET), where the P2P grace window belongs too. */
         scan->punch_start_time = 0;
         scan->punch_failed = 0;
         scan->register_retry_count = 0;
@@ -3720,11 +3715,27 @@ static int handle_PACKET( n2n_edge_t * eee,
         from_relay = 1;
     if (from_relay && eee->relay_proven == 0)
     {
-        char vip[16]; n2n_sock_str_t relbuf;
-        const char * where = relay_virt_ip_str( eee, vip, sizeof vip );
-        if ( vip[0] == '-' ) where = sock_to_cstr( relbuf, &eee->relay_sock );
+        /* First frame actually delivered back through the community relay:
+         * the relay path is proven end to end. Same wording as the historical
+         * punch-failure marker so P2P-direct / edge-relay / supernode states
+         * read side by side in the log; the acting relay itself is marked
+         * with '*' on the management page. */
         eee->relay_proven = now;
-        traceEvent( TRACE_NORMAL, "Relay path proven via %s", where );
+        uint32_t pip = 0;
+        n2n_mac_t pmac;
+        {
+            struct peer_info *psp_peer = NULL;
+            PEERS_LOCK(eee);
+            psp_peer = find_peer_by_mac(eee->known_peers, pkt->srcMac);
+            if (!psp_peer) psp_peer = find_peer_by_mac(eee->pending_peers, pkt->srcMac);
+            if (psp_peer) { pip = psp_peer->assigned_ip;
+                            memcpy(pmac, psp_peer->mac_addr, N2N_MAC_SIZE); }
+            PEERS_UNLOCK(eee);
+        }
+        macstr_t mb;
+        traceEvent( TRACE_NORMAL, "PsP (edge relay) for %s",
+                    (pip != 0) ? peer_id_str_impl(mb, pip, pmac)
+                               : macaddr_str(mb, pkt->srcMac) );
     }
     else if (from_relay)
         eee->relay_proven = now;
@@ -3805,7 +3816,10 @@ static int handle_PACKET( n2n_edge_t * eee,
                     }
                 }
             } else if (!from_supernode && !from_relay) {
+                /* Principle 4: only a genuine direct data PACKET proves the
+                 * direct path. This is the single point that arms P2P. */
                 scan->direct_seen = now;
+                scan->p2p_est_time = now;
                 scan->last_probe_sent = 0;
                 scan->keepalive_fails = 0;
                 
@@ -4035,6 +4049,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                                 "  b       Toggle bypass on/off\n"
                                 "  f       Sync peers with supernode\n"
                                 "  n       Re-run NAT type detection\n"
+                                "          (briefly drops the network link, use with care)\n"
                                 "  <enter> Display statistics\n\n");
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
@@ -4098,37 +4113,51 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                        (struct sockaddr*) &sender_sock, i);
                 return;
             }
-            /* Reset the whole classification state: the old verdict belongs
-             * to the previous exercise, and re-arming the stranger window
-             * lets a fresh N2NF probe count again. */
-            eee->nat_type = N2N_NAT_UNKNOWN;
-            memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
-            memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
-            eee->nat_bounce_seen = 0;
-            eee->fc_seen = 0;
-            eee->fc_window = 1;
-            /* Let the brother's N2NF probes (fired within a few seconds of
-             * the REPROBE registration) land while the stranger window is
-             * still open; the QUERY_ONLY first-contact that closes it is
-             * therefore delayed to 32s out instead of the usual 12s. */
-            eee->fc_arm_time = n2n_now() + 20;
-            eee->nat_probe_time = eee->fc_arm_time;
-            eee->nat_probe_pending = 0;
-            eee->sn_probe_cookie_valid = 0;
-            /* sn1 registration fires at once: nat_type is UNKNOWN again, so
-             * it re-carries the NAT bounce request; the N2N_AFLAGS_NAT_REPROBE
-             * bit asks the SN to re-trigger the brother's N2NF probe even
-             * without a remap (window is armed, so it counts again). The
-             * QUERY_ONLY probe to sn2 runs through the delayed quick window
-             * this command armed (32s out), leaving the stranger window open
-             * long enough for the N2NF probes to land first. */
+            /* Rebind a fresh random local port: the NAT mapping is brand-new
+             * and its source whitelist is empty again, so the brother's N2NF
+             * probe is a true stranger and the coming classification is
+             * accurate by construction. Everything after this is handled by
+             * the automatic remap path: the first REGISTER_ACK shows a
+             * changed my_public_sock, which wipes the old verdict, re-arms
+             * the stranger window and re-runs the full detection. */
+            eee->nat_suppress_remap = 0; /* drop any leftover flag from a previous revert */
+            closesocket(eee->udp_sock);   eee->udp_sock  = -1;
+            if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
+            if (setup_sockets(eee, 0 /* random port */) < 0) {
+                eee->nat_revert_at = 0;
+                /* Try to bring the main socket back before giving up. */
+                if (eee->local_port != 0)
+                    setup_sockets(eee, (int)eee->local_port);
+                else
+                    setup_sockets(eee, 0);
+                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
+                                    "> socket rebind failed, NAT refresh aborted\n");
+                sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
+                       (struct sockaddr*) &sender_sock, i);
+                return;
+            }
+            /* sn1 registration fires at once: the NAT_REPROBE bit asks the SN
+             * to re-trigger the brother's N2NF probe, which now lands on the
+             * fresh mapping while the stranger window is still open. */
             if ( eee->supernode.family != 0 )
             {
                 eee->nat_reprobe = 1; /* one-shot, consumed by send_register_super */
                 send_register_super( eee, &(eee->supernode), 1, 0, NULL );
             }
-            msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
-                                "> NAT re-probe started (sn1 bounce + brother N2NF now, sn2 QUERY_ONLY in ~32s)\n");
+            if (eee->local_port != 0) {
+                /* Fixed-port mode: stay on the random port until the probe
+                 * window (bounce + N2NF + quick probe) is done, then the main
+                 * loop rebinds the configured port again. The verdict from
+                 * the random mapping is kept — NAT type is a property of the
+                 * NAT device, not of the port it was probed on. */
+                eee->nat_revert_at = n2n_now() + 15;
+                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
+                                    "> NAT refresh: probing on a fresh random port, fixed port restored in ~15s\n");
+            } else {
+                eee->nat_revert_at = 0;
+                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
+                                    "> NAT refresh: probing on a fresh random port\n");
+            }
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
             return;
@@ -4325,9 +4354,12 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                     }
                 }
             }
+            /* '*' marks the row that is the current community relay */
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %2u  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
-                               id++, macaddr_str(mac, peer->mac_addr), virt_ip,
+                               " %2u%c  %-17s  %-15s  %-48s  %-7s  %-7s  %s\n",
+                               id++,
+                               (memcmp(peer->mac_addr, eee->relay_mac, N2N_MAC_SIZE) == 0) ? '*' : ' ',
+                               macaddr_str(mac, peer->mac_addr), virt_ip,
                                wan, version, os_name,
                                N2N_NAT_NAME(peer->nat_type));
         }
@@ -5082,7 +5114,9 @@ process_n2n_packet:
                 }
             } else {
                 known->last_seen = now;
-                known->direct_seen = now;
+                /* No direct_seen update: a PROBE is a control-plane hello,
+                 * not the other side's direct data traffic. Per Principle 4
+                 * it must not latch the direct path. */
             }
             PEERS_UNLOCK(eee);
         }
@@ -5103,7 +5137,10 @@ process_n2n_packet:
             struct peer_info *kp = find_peer_by_mac(eee->known_peers, ack.dstMac);
             if (kp) {
                 kp->last_seen = now;
-                kp->direct_seen = now;
+                /* No direct_seen update: PROBE_ACK is a control reply, not
+                 * the peer's direct data traffic. Per Principle 4 it must
+                 * not latch the direct path (this peer may still need the
+                 * community relay for data). */
                 kp->last_probe_sent = 0;
                 kp->keepalive_fails = 0;
             }
@@ -5794,26 +5831,37 @@ process_n2n_packet:
                             {
                                 traceEvent(TRACE_NORMAL, "Our public address changed to %s",
                                            sock_to_cstr(sockbuf1, &eee->my_public_sock));
-                                /* Fresh NAT mapping: its filter whitelist starts
-                                 * empty again — re-arm the full-cone stranger
-                                 * test and restart classification from scratch
-                                 * (old observations belong to the dead mapping). */
-                                eee->nat_type = N2N_NAT_UNKNOWN;
-                                memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
-                                memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
-                                eee->nat_bounce_seen = 0;
-                                eee->fc_seen = 0;
-                                eee->fc_window = 1;
-                                /* Defer the QUERY_ONLY sn2 probe: if the
-                                 * 300s timer happened to fire right at the
-                                 * remap, that first-contact packet would slam
-                                 * the fresh stranger window shut before the
-                                 * brother's N2NF probes land. fc_arm_time
-                                 * instead schedules one quick probe 12s out
-                                 * (fast symmetric/port-restrict verdict
-                                 * without stealing the brother's window). */
-                                eee->nat_probe_time = now;
-                                eee->fc_arm_time = now;
+                                if (eee->nat_suppress_remap) {
+                                    /* This remap is the fixed-port restore of an
+                                     * "n" refresh: classification already ran on
+                                     * the random mapping, so keep that verdict —
+                                     * just adopt the new public address. */
+                                    eee->nat_suppress_remap = 0;
+                                    traceEvent(TRACE_DEBUG, "NAT refresh: fixed-port restore keeps the fresh NAT verdict");
+                                }
+                                else
+                                {
+                                    /* Fresh NAT mapping: its filter whitelist starts
+                                     * empty again — re-arm the full-cone stranger
+                                     * test and restart classification from scratch
+                                     * (old observations belong to the dead mapping). */
+                                    eee->nat_type = N2N_NAT_UNKNOWN;
+                                    memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
+                                    memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
+                                    eee->nat_bounce_seen = 0;
+                                    eee->fc_seen = 0;
+                                    eee->fc_window = 1;
+                                    /* Defer the QUERY_ONLY sn2 probe: if the
+                                     * 300s timer happened to fire right at the
+                                     * remap, that first-contact packet would slam
+                                     * the fresh stranger window shut before the
+                                     * brother's N2NF probes land. fc_arm_time
+                                     * instead schedules one quick probe 12s out
+                                     * (fast symmetric/port-restrict verdict
+                                     * without stealing the brother's window). */
+                                    eee->nat_probe_time = now;
+                                    eee->fc_arm_time = now;
+                                }
                             }
 
                             /* First observation for NAT classification: which sn
@@ -7517,6 +7565,24 @@ static int run_loop(n2n_edge_t * eee )
         fd_set socket_mask;
         struct timeval wait_time;
         time_t nowTime;
+
+        /* Fixed-port refresh: once the random-port probe window has elapsed,
+         * rebind the configured local port again. Classification already
+         * completed on the random mapping (NAT type is a property of the NAT
+         * device) and the one-shot remap suppression below keeps that verdict
+         * when the first ACK arrives on the restored port. */
+        if (eee->nat_revert_at != 0 && n2n_now() >= eee->nat_revert_at) {
+            eee->nat_revert_at = 0;
+            closesocket(eee->udp_sock);  eee->udp_sock = -1;
+            if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
+            eee->nat_suppress_remap = 1; /* first ACK updates my_public_sock only */
+            if (setup_sockets(eee, (int)eee->local_port) < 0)
+                traceEvent(TRACE_ERROR, "NAT refresh: rebind to fixed port %u failed",
+                           (unsigned int)eee->local_port);
+            else
+                traceEvent(TRACE_NORMAL, "NAT refresh: local port restored to %u",
+                           (unsigned int)eee->local_port);
+        }
 
         FD_ZERO(&socket_mask);
         FD_SET(eee->udp_sock, &socket_mask);
