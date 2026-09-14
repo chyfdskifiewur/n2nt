@@ -4315,13 +4315,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             peer = peer->next;
             continue;
         }
-        /* Members being relayed belong to the relay: section below; show them
-         * there instead of duplicating them in P2P_with. */
-        if (eee->relay_peers != NULL &&
-            find_peer_by_mac(eee->relay_peers, peer->mac_addr)) {
-            peer = peer->next;
-            continue;
-        }
+        /* Note: a relayed member that has also established a real direct
+         * connection is shown in P2P_with only - the Relay: section lists
+         * just the members still needing this relay, so no peer is ever
+         * duplicated between the two sections. */
         const char *version = (peer->version[0] != '\0') ? peer->version : "unknown";
         const char *os_name = (peer->os_name[0] != '\0') ? peer->os_name : "unknown";
 
@@ -4390,6 +4387,13 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
         struct peer_info *rp = eee->relay_peers;
         int rid = 1;
         while (rp) {
+            /* A member that has already established a direct connection is
+             * shown in P2P_with instead; the Relay: section keeps only the
+             * members that still depend on this relay (no duplicate). */
+            if (find_peer_by_mac(eee->known_peers, rp->mac_addr)) {
+                rp = rp->next;
+                continue;
+            }
             const char *rver = (rp->version[0] != '\0') ? rp->version : "unknown";
             const char *ros  = (rp->os_name[0] != '\0') ? rp->os_name : "unknown";
             char rvip[16] = "-";
