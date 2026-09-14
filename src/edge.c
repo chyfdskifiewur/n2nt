@@ -2104,17 +2104,27 @@ static void check_relay( n2n_edge_t * eee, time_t now )
 
     {
         struct peer_info *scan;
+        int nonrelay = 0;
+        int need_relay = 0;
         PEERS_LOCK(eee);
-        /* Only leave relay when ALL non-relay known peers have a direct path.
-         * Under mixed topology (some peers reachable, others still need the relay)
-         * the old "any single direct peer" heuristic triggered premature leave,
-         * causing the relay to flap on/off repeatedly. scan becomes NULL only
-         * when no non-relay peer is found with direct_seen == 0, meaning every
-         * data peer we need to talk to has already established a direct link. */
+        /* Only leave the relay when the known set actually contains at least
+         * one non-relay peer AND every one of them has a confirmed direct
+         * path, AND no pending peer still needs the relay. An empty
+         * known_peers (nothing promoted yet) must NOT count as "everything
+         * is direct" — the vacuous case previously triggered
+         * 'P2P direct up - leaving relay' with zero direct peers. Pending
+         * peers have no confirmed direct path (Principle 4: direct must be
+         * confirmed by the peer), so they keep the relay alive as well. */
         for (scan = eee->known_peers; scan; scan = scan->next)
-            if (scan->direct_seen == 0 && !peer_is_the_relay( eee, scan )) break;
+        {
+            if (peer_is_the_relay( eee, scan )) continue;
+            nonrelay++;
+            if (scan->direct_seen == 0) { need_relay = 1; break; }
+        }
+        if (!need_relay && eee->pending_peers != NULL)
+            need_relay = 1;
         PEERS_UNLOCK(eee);
-        if (!scan) { /* all non-relay known peers are direct -> no more relaying needed */
+        if (!need_relay && nonrelay > 0) { /* all non-relay known peers are direct -> no more relaying needed */
             eee->relay_valid = 0;
             eee->relay_proven = 0;
             traceEvent( TRACE_NORMAL, "P2P direct up - leaving relay" );
@@ -2401,12 +2411,8 @@ void set_peer_operational( n2n_edge_t * eee,
             memset(&scan->sock6, 0, sizeof(n2n_sock_t));  /* Clear IPv6 completely */
         }
         scan->last_seen = n2n_now();
-        /* Principle 4: direct connectivity must be PROVEN by receiving the
-         * peer's direct data PACKET (handle_PACKET), not by a REGISTER_ACK.
-         * An ACK only proves one-way liveness; latching direct_seen here
-         * would keep the edge off the community relay even when the direct
-         * path is actually dead. p2p_est_time is set at the real proof
-         * point (direct PACKET), where the P2P grace window belongs too. */
+        scan->direct_seen = n2n_now();
+        scan->p2p_est_time = scan->direct_seen;
         scan->punch_start_time = 0;
         scan->punch_failed = 0;
         scan->register_retry_count = 0;
@@ -3816,10 +3822,7 @@ static int handle_PACKET( n2n_edge_t * eee,
                     }
                 }
             } else if (!from_supernode && !from_relay) {
-                /* Principle 4: only a genuine direct data PACKET proves the
-                 * direct path. This is the single point that arms P2P. */
                 scan->direct_seen = now;
-                scan->p2p_est_time = now;
                 scan->last_probe_sent = 0;
                 scan->keepalive_fails = 0;
                 
@@ -5114,9 +5117,7 @@ process_n2n_packet:
                 }
             } else {
                 known->last_seen = now;
-                /* No direct_seen update: a PROBE is a control-plane hello,
-                 * not the other side's direct data traffic. Per Principle 4
-                 * it must not latch the direct path. */
+                known->direct_seen = now;
             }
             PEERS_UNLOCK(eee);
         }
@@ -5137,10 +5138,7 @@ process_n2n_packet:
             struct peer_info *kp = find_peer_by_mac(eee->known_peers, ack.dstMac);
             if (kp) {
                 kp->last_seen = now;
-                /* No direct_seen update: PROBE_ACK is a control reply, not
-                 * the peer's direct data traffic. Per Principle 4 it must
-                 * not latch the direct path (this peer may still need the
-                 * community relay for data). */
+                kp->direct_seen = now;
                 kp->last_probe_sent = 0;
                 kp->keepalive_fails = 0;
             }
