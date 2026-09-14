@@ -4315,10 +4315,9 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             peer = peer->next;
             continue;
         }
-        /* Members of this relay (any that register to us) are listed in the
-         * "Relay & P2P_with:" section below, whether or not they also have a
-         * direct path; P2P_with keeps only peers with no relay relationship,
-         * so a peer is never duplicated between the two sections. */
+        /* Peers that register to this relay are listed in the Relay: section
+         * (whether or not they also have a direct path); P2P_with keeps
+         * only peers with no relay relationship, so nothing is duplicated. */
         if (eee->relay_peers != NULL &&
             find_peer_by_mac(eee->relay_peers, peer->mac_addr)) {
             peer = peer->next;
@@ -4383,11 +4382,11 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     }
 
     /* Send relay info: shown on the machine acting as a community relay (R);
-     * list every member that registers to it (the peers relayed through it),
-     * whether or not a direct path has also been established. Peers here are
-     * excluded from P2P_with above, so nothing is duplicated. */
+     * lists the peers that register to it - every peer it relays for - with
+     * stale entries cleaned up periodically (60s) like a mini SN. Those peers
+     * are excluded from P2P_with above, so nothing is duplicated. */
     if (eee->relay_peers != NULL) {
-        msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE, "Relay & P2P_with:\n");
+        msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE, "Relay:\n");
         sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                (struct sockaddr*) &sender_sock, i);
 
