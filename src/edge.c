@@ -3651,6 +3651,21 @@ static int handle_PACKET( n2n_edge_t * eee,
         struct peer_info *dst = NULL;
         n2n_sock_t *dst_sock = NULL;
         PEERS_LOCK(eee);
+        /* Data-frame driven member liveness: a peer stays in the relay table
+         * only while it actually forwards frames through us. REGISTER enters
+         * the table (see MSG_TYPE_REGISTER handler); here we refresh ONLY the
+         * source of a frame that is genuinely being relayed, and only when it
+         * reached us directly (not forwarded by the supernode). Peers that
+         * only punch/register (22/30 case) get no refresh and are dropped by
+         * check_relay after 60s. */
+        if (!from_supernode) {
+            struct peer_info *srcp = find_peer_by_mac(eee->relay_peers, pkt->srcMac);
+            if (srcp) {
+                srcp->last_seen = now;
+                if (orig_sender->family == AF_INET) srcp->sock = *orig_sender;
+                else if (orig_sender->family == AF_INET6) srcp->sock6 = *orig_sender;
+            }
+        }
         /* Prefer the dedicated member table (mini-SN). Fall back to the P2P
          * tables only if the registrant has not arrived via REGISTER yet
          * (e.g. the first frame before registration completes). */
@@ -4382,9 +4397,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     }
 
     /* Send relay info: shown on the machine acting as a community relay (R);
-     * lists the peers that register to it - every peer it relays for - with
-     * stale entries cleaned up periodically (60s) like a mini SN. Those peers
-     * are excluded from P2P_with above, so nothing is duplicated. */
+     * lists the peers currently forwarding data through it - REGISTER enters
+     * the table, relayed data frames keep it alive, stale entries are cleaned
+     * up on a 60s cycle like a mini SN. Those peers are excluded from
+     * P2P_with above, so nothing is duplicated. */
     if (eee->relay_peers != NULL) {
         msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE, "Relay:\n");
         sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
@@ -4975,12 +4991,22 @@ process_n2n_packet:
                             memcpy(rp->mac_addr, reg.srcMac, N2N_MAC_SIZE);
                             rp->next = eee->relay_peers;
                             eee->relay_peers = rp;
+                            /* First REGISTER enters the table. From here on
+                             * keep-alive is driven ONLY by real data frames
+                             * forwarded through us (handle_PACKET relay
+                             * branch), so a peer that merely punches /
+                             * keeps registering without relaying traffic is
+                             * aged out by check_relay after 60s.
+                             * NOTE: in this fork every edge->edge REGISTER
+                             * carries dstMac == 00:00 (send_register_with_local
+                             * never sets it), so "dstMac == self" is dead code
+                             * and this zero-mac branch is the real entry. */
+                            rp->last_seen = n2n_now();
                         }
                     }
                     if (rp) {
                         if (sender.family == AF_INET) rp->sock = sender;
                         else rp->sock6 = sender;
-                        rp->last_seen = n2n_now();
                         /* Enrich the member entry with the info R already has
                          * about this MAC (from SN PEER_INFO) so the management
                          * page can show its virtual IP / version / OS / NAT. */
