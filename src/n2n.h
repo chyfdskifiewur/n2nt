@@ -298,6 +298,7 @@ struct peer_info {
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
     time_t              relay_adv_time;    /* sn: last time this edge was advertised as the relay (throttle) */
+    time_t              sn_fwd_first;      /* sn: first time this edge's unicast data was relayed via SN (0=never); gates community-relay announcement */
     uint8_t             relay_willing;     /* sn: edge's relay stance: 0=refuse,1=default,2=willing,3=force */
     /* Compact packet protocol support (version 0xE5 header) */
     uint8_t             compact_capable;   /* 1=understands compact format, 0=legacy/unknown */

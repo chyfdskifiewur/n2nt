@@ -13,6 +13,13 @@
 #include "n2n_wire.h"
 #include <fcntl.h>
 
+/* Community-relay announcement gate: only announce the community relay peer
+ * once a member's unicast data has been relayed by this supernode for at
+ * least this many seconds. The first few seconds of hole-punching traffic
+ * are expected (punches always start out via the SN) and must not trigger
+ * the announcement. */
+#define SN_RELAY_ADVERT_ACTIVE_SECS  5
+
 /* forward declarations - needed by run_loop before their definitions */
 struct n2n_sn;
 static int resolve_brother_addr(const char *text, n2n_sock_t *out);
@@ -2629,9 +2636,20 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
     if ( !req ) return;
 
     time_t now = time(NULL);
+
+    /* Sustained-traffic gate: every member punches through this supernode
+     * for the first few seconds, and that initial burst must not trigger
+     * the community-relay announcement. Once a member's unicast data has
+     * been relayed here continuously for SN_RELAY_ADVERT_ACTIVE_SECS its
+     * hole-punching has apparently not succeeded — only then announce. */
+    if ( req->sn_fwd_first == 0 )
+        req->sn_fwd_first = now;
+    if ( (now - req->sn_fwd_first) < SN_RELAY_ADVERT_ACTIVE_SECS )
+        return;
+
     if ( (now - req->relay_adv_time) < 15 ) return; /* throttled */
 
-    /* R must be a proper third peer: neither the sender nor the target. */
+    /* The relay must be a proper third peer: neither the sender nor the target. */
     struct peer_info * relay = find_community_relay( sss, cmn->community, req_mac, force_only );
     if ( !relay || (memcmp(relay->mac_addr, tgt_mac, N2N_MAC_SIZE) == 0) )
         return; /* no good peer (incl. globally-off with no forcing member) -> plain SN */
@@ -2639,7 +2657,16 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
 
     struct peer_info * tgt = find_peer_by_mac( sss->edges, tgt_mac );
     advertise_relay_to( sss, cmn, req, relay );
-    if ( tgt ) advertise_relay_to( sss, cmn, tgt, relay );
+    if ( tgt )
+    {
+        /* Same sustained-traffic gate on the target side: if its own punching
+         * is still in its first seconds (barely relayed through here), do not
+         * burden it with the announcement yet. */
+        if ( tgt->sn_fwd_first == 0 )
+            tgt->sn_fwd_first = now;
+        if ( (now - tgt->sn_fwd_first) >= SN_RELAY_ADVERT_ACTIVE_SECS )
+            advertise_relay_to( sss, cmn, tgt, relay );
+    }
     /* Notify the relay itself (PEER_INFO RELAY naming its own MAC) so it
      * switches on forwarding without self-judging eligibility. Idempotent. */
     advertise_relay_to( sss, cmn, relay, relay );
