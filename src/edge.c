@@ -5878,6 +5878,64 @@ process_n2n_packet:
                 traceEvent( TRACE_INFO, "Rx REGISTER_SUPER_ACK (no pending req)." );
             }
         }
+        else if(msg_type == n2n_nat_probe_req)
+        {
+            /* The supernode asks us to fire NAT_PROBEs at another edge's public
+             * mapping, from our own communication socket — the socket that
+             * already carries n2n traffic, and that UPnP has explicitly
+             * forwarded where a mapping was installed. The probed edge then
+             * sees a stranger source address arriving on a port known to work,
+             * which is how full cone is proven when the supernode has no
+             * brother. Only our current supernode may ask, and at most one
+             * request per N2N_NAT_ASK_MIN_GAP is honoured so the request cannot
+             * be turned into an amplifier. */
+            n2n_NAT_PROBE_REQ_t ask;
+
+            if ( sock_equal( &sender, &eee->supernode ) != 0 )
+            {
+                traceEvent( TRACE_WARNING, "Ignoring NAT probe request from %s",
+                            sock_to_cstr(sockbuf1, &sender) );
+            }
+            else if ( 0 == decode_NAT_PROBE_REQ( &ask, &cmn, udp_buf, &rem, &idx ) )
+            {
+                traceEvent( TRACE_WARNING, "Malformed NAT probe request, ignored" );
+            }
+            else if ( ask.target_sock.family != AF_INET || ask.target_sock.port == 0 )
+            {
+                traceEvent( TRACE_WARNING, "NAT probe request without a usable target, ignored" );
+            }
+            else if ( now - eee->nat_ask_at < N2N_NAT_ASK_MIN_GAP )
+            {
+                traceEvent( TRACE_INFO, "NAT probe request ignored, one was honoured %ds ago",
+                            (int)(now - eee->nat_ask_at) );
+            }
+            else
+            {
+                uint8_t             pbuf[N2N_PKT_BUF_SIZE];
+                size_t              px = 0;
+                n2n_common_t        pcmn;
+                n2n_NAT_PROBE_t     np;
+                int                 k;
+
+                memset( &pcmn, 0, sizeof(pcmn) );
+                pcmn.ttl = N2N_DEFAULT_TTL;
+                pcmn.pc  = n2n_nat_probe;
+                memcpy( pcmn.community, eee->community_name, N2N_COMMUNITY_SIZE );
+                memcpy( np.cookie, ask.cookie, N2N_COOKIE_SIZE );
+
+                encode_NAT_PROBE( pbuf, &px, &pcmn, &np );
+
+                for ( k = 0; k < N2N_NAT_PROBE_REPEAT; k++ )
+                    sendto_sock( sock_for_dest( eee, &ask.target_sock ), pbuf, px,
+                                 &ask.target_sock );
+
+                eee->nat_ask_at = now;
+
+                traceEvent( TRACE_INFO, "Supernode asked, fired %d nat probes at %s",
+                            N2N_NAT_PROBE_REPEAT,
+                            sock_to_cstr( sockbuf1, &ask.target_sock ) );
+            }
+        }
         else if(msg_type == n2n_nat_probe)
         {
             /* Two meanings share this packet type:

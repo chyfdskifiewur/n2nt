@@ -249,7 +249,10 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
 #define N2N_NAT_FC_WINDOW           8       /* after a fresh mapping: stay silent towards
                                                sn2 for this long while its main socket
                                                probes us as a stranger, then start sampling */
-#define N2N_NAT_PROBE_REPEAT        3       /* helper and brother-main-socket probes each */
+#define N2N_NAT_PROBE_REPEAT        3       /* helper, brother and edge-sourced probes each */
+#define N2N_NAT_ASK_MIN_GAP         10      /* honour at most one "probe for me" request
+                                               from the supernode per this many seconds, so
+                                               the request cannot become an amplifier */
 
 /* Relay service timing. The supernode hands a pair over to a relay only after
  * seeing its traffic cross the supernode for a few seconds, and refreshes the
@@ -618,6 +621,8 @@ struct n2n_edge
     time_t              nat_fc_window_until; /* keep silent towards sn2 until this time, so
                                                 its main-socket probe arrives from a stranger
                                                 IP and proves (or not) full cone */
+    time_t              nat_ask_at;        /* last "probe another edge for the supernode"
+                                              request we honoured (rate limiting) */
 
     /* ---- Relay: this edge acting as the relay peer (mini supernode) ---- */
     int                 relay_mode;

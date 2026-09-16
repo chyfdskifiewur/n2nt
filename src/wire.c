@@ -955,9 +955,9 @@ size_t decode_NAT_REPORT( n2n_NAT_REPORT_t * pkt,
     return retval;
 }
 
-size_t encode_BROTHER_NAT_REQ( uint8_t * base, size_t * idx,
-                               const n2n_common_t * common,
-                               const n2n_BROTHER_NAT_REQ_t * pkt )
+size_t encode_NAT_PROBE_REQ( uint8_t * base, size_t * idx,
+                             const n2n_common_t * common,
+                             const n2n_NAT_PROBE_REQ_t * pkt )
 {
     size_t retval = 0;
     retval += encode_common( base, idx, common );
@@ -968,10 +968,10 @@ size_t encode_BROTHER_NAT_REQ( uint8_t * base, size_t * idx,
     return retval;
 }
 
-size_t decode_BROTHER_NAT_REQ( n2n_BROTHER_NAT_REQ_t * pkt,
-                               const n2n_common_t * cmn,
-                               const uint8_t * base,
-                               size_t * rem, size_t * idx )
+size_t decode_NAT_PROBE_REQ( n2n_NAT_PROBE_REQ_t * pkt,
+                             const n2n_common_t * cmn,
+                             const uint8_t * base,
+                             size_t * rem, size_t * idx )
 {
     size_t retval = 0;
     /* cookie + mac + IPv4 sock (family/port/addr) + community */

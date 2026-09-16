@@ -1634,6 +1634,67 @@ static const char * sn_nat_type_name( uint8_t t )
     }
 }
 
+/* Ask up to two other edges of the same community to fire NAT_PROBEs at this
+ * peer from their own communication sockets. Nothing new is bound: the source
+ * is a socket that already carries n2n traffic and is explicitly forwarded
+ * wherever UPnP installed a mapping, which is what makes an arrival
+ * trustworthy. Only arrival carries meaning — a candidate that has already
+ * exchanged traffic with the target yields no full-cone proof, so two with
+ * distinct addresses are tried and the brother supernode (a stranger by
+ * construction) remains the primary test. */
+static void sn_nat_ask_edges( n2n_sn_t * sss, struct peer_info * target, time_t now,
+                              const n2n_cookie_t cookie )
+{
+    struct peer_info *  scan;
+    n2n_sock_t          used[2];
+    int                 used_n = 0, asked = 0;
+
+    for ( scan = sss->edges; scan && asked < 2; scan = scan->next )
+    {
+        uint8_t                 reqbuf[N2N_SN_PKTBUF_SIZE];
+        size_t                  reqx = 0;
+        n2n_common_t            reqcmn;
+        n2n_NAT_PROBE_REQ_t     req;
+        int                     j, dup = 0;
+
+        if ( scan == target )
+            continue;
+        if ( 0 != memcmp( scan->community_name, target->community_name, N2N_COMMUNITY_SIZE ) )
+            continue;
+        if ( scan->sock.family != AF_INET || scan->sock.port == 0 )
+            continue;
+        if ( scan->last_seen == 0 || now - scan->last_seen > 120 )
+            continue;
+        if ( 0 == memcmp( scan->sock.addr.v4, target->sock.addr.v4, IPV4_SIZE ) )
+            continue;       /* same public address: not a stranger */
+
+        for ( j = 0; j < used_n; j++ )
+        {
+            if ( 0 == memcmp( used[j].addr.v4, scan->sock.addr.v4, IPV4_SIZE ) )
+                dup = 1;
+        }
+        if ( dup )
+            continue;
+
+        memset( &reqcmn, 0, sizeof(reqcmn) );
+        reqcmn.ttl = N2N_DEFAULT_TTL;
+        reqcmn.pc  = n2n_nat_probe_req;
+        memcpy( reqcmn.community, target->community_name, N2N_COMMUNITY_SIZE );
+
+        memset( &req, 0, sizeof(req) );
+        memcpy( req.cookie, cookie, N2N_COOKIE_SIZE );
+        memcpy( req.target_mac, target->mac_addr, N2N_MAC_SIZE );
+        req.target_sock = target->sock;
+        memcpy( req.community, target->community_name, N2N_COMMUNITY_SIZE );
+
+        encode_NAT_PROBE_REQ( reqbuf, &reqx, &reqcmn, &req );
+        sendto_sock( sss, &scan->sock, reqbuf, reqx );
+
+        used[used_n++] = scan->sock;
+        asked++;
+    }
+}
+
 /* Fire one NAT probe round at an edge, three ways at once:
  *  1. helper socket x3: same address as the main socket, a random source port
  *     the edge's NAT has no mapping for (stranger-port inbound, the
@@ -1697,11 +1758,11 @@ static void sn_nat_probe_send( n2n_sn_t * sss, struct peer_info * peer, time_t n
         uint8_t                 reqbuf[N2N_SN_PKTBUF_SIZE];
         size_t                  reqx = 0;
         n2n_common_t            reqcmn;
-        n2n_BROTHER_NAT_REQ_t   req;
+        n2n_NAT_PROBE_REQ_t     req;
 
         memset( &reqcmn, 0, sizeof(reqcmn) );
         reqcmn.ttl = N2N_DEFAULT_TTL;
-        reqcmn.pc  = n2n_brother_nat_req;
+        reqcmn.pc  = n2n_nat_probe_req;
         memcpy( reqcmn.community, "brother_reg", 11 );
 
         memset( &req, 0, sizeof(req) );
@@ -1710,9 +1771,14 @@ static void sn_nat_probe_send( n2n_sn_t * sss, struct peer_info * peer, time_t n
         req.target_sock = peer->sock;
         memcpy( req.community, peer->community_name, N2N_COMMUNITY_SIZE );
 
-        encode_BROTHER_NAT_REQ( reqbuf, &reqx, &reqcmn, &req );
+        encode_NAT_PROBE_REQ( reqbuf, &reqx, &reqcmn, &req );
         sendto_sock( sss, &sss->backup_sock, reqbuf, reqx );
     }
+
+    /* 4. Other edges of the community, from their own communication sockets.
+     * This is the full-cone test when there is no brother supernode, and a
+     * second chance otherwise. */
+    sn_nat_ask_edges( sss, peer, now, probe.cookie );
 
     memcpy( peer->nat_probe_cookie, probe.cookie, N2N_COOKIE_SIZE );
     peer->nat_probe_pending = 1;
@@ -1755,7 +1821,7 @@ static int sn_handle_brother_nat_req( n2n_sn_t * sss, const struct sockaddr * se
                                       size_t * rem, size_t * idx, time_t now )
 {
     n2n_sock_t              sender;
-    n2n_BROTHER_NAT_REQ_t   req;
+    n2n_NAT_PROBE_REQ_t     req;
     n2n_common_t            outcmn;
     n2n_NAT_PROBE_t         probe;
     uint8_t                 outbuf[N2N_SN_PKTBUF_SIZE];
@@ -1790,7 +1856,7 @@ static int sn_handle_brother_nat_req( n2n_sn_t * sss, const struct sockaddr * se
         return 0;
     }
 
-    if ( 0 == decode_BROTHER_NAT_REQ( &req, cmn, udp_buf, rem, idx ) )
+    if ( 0 == decode_NAT_PROBE_REQ( &req, cmn, udp_buf, rem, idx ) )
         return 0;       /* truncated or malformed */
 
     if ( req.target_sock.family != AF_INET || req.target_sock.port == 0 )
@@ -3024,7 +3090,7 @@ static int process_udp( n2n_sn_t * sss,
     /* Brother-only traffic: sn1 asking us (sn2) to probe an edge from our
      * main socket. Kept on the "brother_reg" pseudo-community so it is never
      * mistaken for an edge message. */
-    if ( msg_type == n2n_brother_nat_req &&
+    if ( msg_type == n2n_nat_probe_req &&
          memcmp( cmn.community, "brother_reg", 11 ) == 0 )
     {
         return sn_handle_brother_nat_req( sss, sender_sock, &cmn,
