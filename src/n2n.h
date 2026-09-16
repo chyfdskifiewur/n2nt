@@ -221,49 +221,46 @@ typedef char ipstr_t[INET6_ADDRSTRLEN];
 #define N2N_MACSTR_SIZE 32
 typedef char macstr_t[N2N_MACSTR_SIZE];
 
-/* NAT type as measured by the edge itself (see build/nat-relay-design.md) and reported
- * to the supernode. Only the four types that decide relay candidacy, plus "not enough
- * samples yet". */
-#define N2N_NAT_UNKNOWN             0
-#define N2N_NAT_FULL_CONE           1
-#define N2N_NAT_ADDR_RESTRICTED     2
-#define N2N_NAT_PORT_RESTRICTED     3
-#define N2N_NAT_SYMMETRIC           4
+/* NAT type classification from dual-sn reflection (edge measures, sn displays).
+ * Dual-sn reflection compares the mappings toward two destinations:
+ * identical -> cone family, any difference -> symmetric. The sn bounce test
+ * (helper socket with a different source port) then splits the cone family:
+ * the bounce gets through on full-cone/address-restricted NATs and is
+ * dropped by port-restricted ones. A brother sn plays the never-contacted
+ * third IP: its N2NF probe reaching the edge proves the filter admits any
+ * source -> full cone. Without a brother, full cone cannot be told apart
+ * and reports as addr-restr. */
+#define N2N_NAT_UNKNOWN        0
+#define N2N_NAT_SYMMETRIC      2
+#define N2N_NAT_FULL_CONE      3  /* N2NF probe from a never-contacted brother got through */
+#define N2N_NAT_RESTRICTED     4  /* addr-restr: helper bounce got through (incl. full cone w/o brother) */
+#define N2N_NAT_PORT_RESTRICT  5  /* no bounce despite requests */
 
-/* Relay willingness, from -Z on the edge and on the supernode. */
-#define N2N_RELAY_REFUSE            0
-#define N2N_RELAY_DEFAULT           1
-#define N2N_RELAY_WILLING           2
-#define N2N_RELAY_FORCE             3
+/* Shared display name for a N2N_NAT_* value ("unknown" when not measured). */
+#define N2N_NAT_NAME(t) ( (t) == N2N_NAT_FULL_CONE ? "full-cone" : \
+                          (t) == N2N_NAT_RESTRICTED ? "addr-restr" : \
+                          (t) == N2N_NAT_PORT_RESTRICT ? "port-restr" : \
+                          (t) == N2N_NAT_SYMMETRIC ? "symmetric" : "unknown" )
 
-#define N2N_NAT_SAMPLE_SLOTS        4       /* observations of our own public address */
-#define N2N_NAT_SAMPLE_TTL          120
-#define N2N_NAT_SENT_SLOTS          32      /* recent send destinations, for inbound classification */
-#define N2N_NAT_SENT_TTL            300
-#define N2N_NAT_PROBE_RETRY         120     /* ask for a helper-port probe again this often
-                                               while nothing inbound has been proven (an
-                                               inbound observation itself never expires, it
-                                               is dropped when the public mapping changes) */
-#define N2N_NAT_REPORT_INTERVAL     30      /* re-report even when nothing changed */
-#define N2N_NAT_SAMPLE_INTERVAL     60      /* routine sn2 sample period */
-#define N2N_NAT_FC_WINDOW           8       /* after a fresh mapping: stay silent towards
-                                               sn2 for this long while its main socket
-                                               probes us as a stranger, then start sampling */
-#define N2N_NAT_PROBE_REPEAT        3       /* helper, brother and edge-sourced probes each */
-#define N2N_NAT_ASK_MIN_GAP         10      /* honour at most one "probe for me" request
-                                               from the supernode per this many seconds, so
-                                               the request cannot become an amplifier */
+/* NAT type <-> aflags bits: REGISTER_SUPER carries the edge's own type,
+ * PEER_INFO carries a peer's type to edges for mgmt display. */
+#define N2N_NAT_AFLAGS(t) ( (t) == N2N_NAT_FULL_CONE ? N2N_AFLAGS_NAT_FULL_CONE : \
+                            (t) == N2N_NAT_RESTRICTED ? N2N_AFLAGS_NAT_RESTRICTED : \
+                            (t) == N2N_NAT_PORT_RESTRICT ? N2N_AFLAGS_NAT_PORT_RESTRICT : \
+                            (t) == N2N_NAT_SYMMETRIC ? N2N_AFLAGS_NAT_SYMMETRIC : 0 )
+#define N2N_NAT_FROM_AFLAGS(a) ( ((a) & N2N_AFLAGS_NAT_RESTRICTED) ? N2N_NAT_RESTRICTED : \
+                                 ((a) & N2N_AFLAGS_NAT_PORT_RESTRICT) ? N2N_NAT_PORT_RESTRICT : \
+                                 ((a) & N2N_AFLAGS_NAT_FULL_CONE) ? N2N_NAT_FULL_CONE : \
+                                 ((a) & N2N_AFLAGS_NAT_SYMMETRIC) ? N2N_NAT_SYMMETRIC : N2N_NAT_UNKNOWN )
 
-/* Relay service timing. The supernode hands a pair over to a relay only after
- * seeing its traffic cross the supernode for a few seconds, and refreshes the
- * hand-over while it keeps seeing it. */
-#define N2N_RELAY_ACTIVE_SECS       3       /* forwarding this long = the punch failed */
-#define N2N_RELAY_FWD_GAP           10      /* silence that ends a forwarding episode */
-#define N2N_RELAY_CAND_TTL          60      /* candidate must have been heard this recently */
-#define N2N_RELAY_PROBE_TIMEOUT     3       /* helper-port probe round trip budget */
-#define N2N_RELAY_ADVERT_INTERVAL   15      /* election / advert refresh period */
-#define N2N_RELAY_IGNORE_SECS       120     /* stay away from relays this long after giving up */
-#define N2N_RELAY_FAILS_MAX         3       /* consecutive send failures before giving up */
+/* NAT types eligible to act as the community relay peer (mini-SN):
+ * can the peer be reached without punching? Only a full-cone (NAT1) or a
+ * restricted-cone (NAT2) mapping -- any stricter kind (port-restricted,
+ * symmetric) falls back to the plain SN relay. This single macro is the
+ * SN's only relay-eligibility gate (the SN is the single authority deciding
+ * which peer is eligible to be the community relay). */
+#define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE || \
+                                   (t) == N2N_NAT_RESTRICTED )
 
 struct peer_info {
     struct peer_info *  next;
@@ -273,6 +270,8 @@ struct peer_info {
     n2n_sock_t          sock6;             /* IPv6 public address (family=0 if unavailable) */
     int                 num_sockets;       /* 1=public only, 2=public+LAN */
     n2n_sock_t          sockets[2];        /* [0]=public (primary), [1]=LAN */
+    uint8_t             nat_type;          /* N2N_NAT_* as reported by the edge (0 if not reported) */
+    time_t              last_nat_push;     /* sn: last time this edge's nat_type was pushed to the community */
     uint8_t             connect_family;    /* AF_INET or AF_INET6 - how edge connected to supernode */
     time_t              last_seen;
     char                version[8];
@@ -298,45 +297,14 @@ struct peer_info {
     uint8_t             p2p_logged;        /* 1 if P2P direct message already printed for current state */
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
+    time_t              relay_adv_time;    /* sn: last time this edge was advertised as the relay (throttle) */
+    time_t              sn_fwd_first;      /* sn: first time this edge's unicast data was relayed via SN (0=never); gates community-relay announcement */
+    uint8_t             relay_willing;     /* sn: edge's relay stance: 0=refuse,1=default,2=willing,3=force */
     /* Compact packet protocol support (version 0xE5 header) */
     uint8_t             compact_capable;   /* 1=understands compact format, 0=legacy/unknown */
     uint16_t            transform_id;      /* transform ID learned from PACKET headers (for SN legacy conversion) */
     /* WebSocket: non-NULL means this edge is connected via WS, forwarding uses ws_send instead of UDP sendto */
     ws_conn_t *         ws;
-
-    /* ---- NAT / relay, reported by the peer to the supernode ---- */
-    uint8_t             nat_type;          /* N2N_NAT_*, N2N_NAT_UNKNOWN until it reports */
-    uint8_t             relay_willing;     /* N2N_RELAY_*, 0 (refuse) until it reports */
-    time_t              nat_report_at;     /* when the last NAT_REPORT arrived */
-
-    /* Supernode side: verification of the peer through the auxiliary socket.
-     * nat_probe_at != 0 with neither pending nor pass set means the probe timed out,
-     * which is what proves a port-restricted NAT. */
-    uint8_t             nat_probe_pending;
-    uint8_t             nat_probe_pass;
-    n2n_cookie_t        nat_probe_cookie;
-    time_t              nat_probe_at;
-
-    /* Supernode side: election result for traffic this peer *sends* */
-    n2n_mac_t           relay_sel_mac;     /* chosen relay peer, all zero = none */
-    n2n_sock_t          relay_sel_sock;
-    uint8_t             relay_sel_nat;
-    time_t              relay_sel_at;
-    time_t              relay_advert_at;   /* last relay advert sent to this peer */
-
-    /* Supernode side: how long we have been forwarding this peer's traffic */
-    time_t              fwd_first;         /* first forward, 0 = not currently forwarding */
-    time_t              fwd_last;
-
-    /* Edge side: this peer is reached through a relay peer instead of via the supernode */
-    n2n_sock_t          relay_sock;
-    n2n_mac_t           relay_mac;
-    uint8_t             relay_active;
-    uint8_t             relay_proven;      /* 1 = traffic came back through the relay, send only there */
-    uint8_t             relay_fails;       /* consecutive send failures towards the relay */
-    time_t              relay_adopt_at;    /* last advert adopted from the supernode */
-    time_t              relay_keepalive_at;/* last REGISTER sent to the relay, keeps our mapping open */
-    time_t              relay_ignore_until; /* ignore new relay adverts until then */
 };
 
 struct n2n_edge; /* forward declaration, defined below */
@@ -561,6 +529,32 @@ struct n2n_edge
     n2n_sock_t          cached_dst_sock;
     time_t              cached_dst_time;
 
+    /* Relay client: community relay peer (mini-SN). Set when the SN advertises
+     * the relay (PEER_INFO with N2N_AFLAGS_RELAY): the edge registers itself to
+     * the relay, dual-sends relay+SN until a frame returns through the relay
+     * (relay_proven), then single-sends. Cleared once a direct P2P path exists. */
+    n2n_mac_t           relay_mac;      /* the relay peer's MAC */
+    n2n_sock_t          relay_sock;     /* the relay's forwarding endpoint */
+    uint8_t             relay_valid;    /* 1 = relay installed */
+    time_t              relay_last_reg; /* last REGISTER sent to the relay (3s heartbeat) */
+    time_t              relay_proven;   /* last frame received THROUGH the relay; 0=never */
+    time_t              relay_last_ack; /* last relay REGISTER_ACK; 0=never. Liveness, not traffic. */
+
+    /* Relay server: 1 = this edge IS the relay (mini-SN): it forwards PACKETs
+     * addressed to peers that registered to it (directly reachable, NAT1). */
+    uint8_t             relay_mode;
+
+    /* Members registered to this relay for forwarding: a dedicated table,
+     * independent of the P2P peer tables so the relay path survives churn. */
+    struct peer_info *  relay_peers;
+
+    /* Relay client state: no ACK for RELAY_ACK_SECS -> dead relay, fall back
+     * to the SN and retry every relay_probe_next. relay_proven drives the
+     * send-side single/dual decision. */
+    time_t              relay_probe_next;   /* when to retry a dead relay */
+    uint8_t             relay_giveup;       /* 1 = relay dead, stay on SN until retry */
+    uint8_t             relay_willing;      /* relay stance advertised to SN: 0/1/2/3 */
+
     struct peer_info *  known_peers;
     struct peer_info *  pending_peers;
 #ifdef _WIN32
@@ -578,6 +572,8 @@ struct n2n_edge
     n2n_mac_t           sn1_mac;        /* MAC of the SN the edge is currently registered with. */
     n2n_sock_t          sn1_v6;         /* sn1's IPv6 address (as reported by sn1 in the ACK). */
     uint8_t             sn_ack_backup[N2N_EDGE_NUM_SUPERNODES]; /* indices whose entry came from the sn1 ACK (backup). */
+    uint8_t             sn_ak_parsed;   /* sn1's ACK backup string parsed (learnt or already present) */
+    char                sn_bak_masked[N2N_EDGE_SN_HOST_SIZE]; /* ACK-learned brother: masked display copy ('*' + tail) */
     uint8_t             sn_relay_fails;   /* consecutive relay send failures, reset on success */
     n2n_cookie_t        last_cookie;
     uint8_t             sn_ack_count;
@@ -588,51 +584,31 @@ struct n2n_edge
 
     n2n_sock_t          my_public_sock;
 
-    /* ---- NAT type detection (see build/nat-relay-design.md) ---- */
-    uint8_t             nat_type;          /* last verdict, N2N_NAT_* */
-    uint8_t             nat_reported;      /* verdict last sent to the supernode */
-    uint8_t             nat_willing;       /* -Z, N2N_RELAY_* */
-    uint8_t             nat_probe_req;     /* 1 = ask the supernode for a helper-port probe */
-    time_t              nat_last_report;   /* when the last NAT_REPORT was sent */
-    time_t              nat_first_sample;  /* first sn1 observation; drives the initial sn2 burst */
-    int                 nat_burst_left;    /* remaining samples of that burst */
-    time_t              nat_next_sample;   /* when the next routine sn2 sample is due */
-    n2n_cookie_t        nat_cookie;        /* cookie for our own samples, kept apart from sn_probe_cookie */
-    uint8_t             nat_cookie_valid;
-    struct {                               /* vantage points that saw our public address */
-        n2n_sock_t      vantage;
-        n2n_sock_t      mapped;
-        time_t          when;
-    }                   nat_samples[N2N_NAT_SAMPLE_SLOTS];
-    uint8_t             nat_sample_next;   /* ring write index */
-    struct {                               /* destinations we sent to recently */
-        n2n_sock_t      sock;
-        time_t          when;
-    }                   nat_sent[N2N_NAT_SENT_SLOTS];
-    uint8_t             nat_sent_next;
-    time_t              nat_fc_evid;       /* last unsolicited inbound, from an IP we never sent to */
-    time_t              nat_addr_evid;     /* last inbound from a known IP on a stranger port */
-    uint8_t             nat_echo_valid;    /* a NAT_PROBE cookie is waiting to be echoed */
-    n2n_cookie_t        nat_echo_cookie;
-    time_t              nat_probe_req_at;  /* when we last asked the supernode to probe us */
-    time_t              nat_probe_seen_at; /* last real NAT_PROBE received, 0 = never */
-    time_t              nat_notify_at;     /* main-socket notification: supernode has fired a
-                                              probe round, so silence is the NAT refusing */
-    time_t              nat_fc_window_until; /* keep silent towards sn2 until this time, so
-                                                its main-socket probe arrives from a stranger
-                                                IP and proves (or not) full cone */
-    time_t              nat_ask_at;        /* last "probe another edge for the supernode"
-                                              request we honoured (rate limiting) */
-
-    /* ---- Relay: this edge acting as the relay peer (mini supernode) ---- */
-    int                 relay_mode;
-    struct {                               /* peers we were asked to relay for */
-        n2n_mac_t       mac;
-        time_t          when;
-    }                   relay_serve[8];
-    uint8_t             relay_serve_count;
-    time_t              relay_last_reg;    /* last FORCE_PEER_INFO re-registration as relay */
-    uint8_t             relay_force_pi;    /* one-shot: ask the supernode to push the community to us */
+    /* NAT type detection: dual-sn reflection (mapping compare) plus the sn
+     * bounce test (helper socket, different source port) for cone sub-types. */
+    uint8_t             nat_type;       /* N2N_NAT_* */
+    n2n_sock_t          nat_seen_sn1;   /* edge addr observed by sn1 (family=0 if none) */
+    n2n_sock_t          nat_seen_sn2;   /* edge addr observed by sn2 (family=0 if none) */
+    time_t              nat_seen_sn1_at; /* when sn1's observation was taken (0 = none) */
+    time_t              nat_seen_sn2_at; /* when sn2's observation was taken (0 = none) */
+    time_t              nat_probe_time; /* last periodic NAT probe tick */
+    uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
+    uint8_t             nat_bounce_seen;   /* a public helper-port bounce arrived */
+    uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
+    time_t              fc_window_until; /* stranger window closes here: the brother's
+                                           N2NF probes count only before this instant */
+    time_t              nat_probe_notified; /* sn1 told us a bounce round was launched
+                                           (0 = never); a "no bounce" verdict needs it */
+    time_t              fc_arm_time;    /* when the stranger window was last (re-)armed:
+                                           an armed window gets its quick NAT re-probe
+                                           12s later instead of waiting for the 60s
+                                           periodic tick */
+    uint8_t             nat_reprobe;    /* one-shot: next sn1 registration asks the SN to
+                                           re-trigger the brother's N2NF probe (mgmt "n") */
+    time_t              nat_revert_at;  /* mgmt "n" in fixed-port mode: rebind the configured
+                                           local port again once this time is reached (0 = none) */
+    uint8_t             nat_suppress_remap; /* one-shot: next ACK-remap only updates
+                                           my_public_sock, keeps the fresh NAT verdict */
 
     n2n_sock_t          own_ipv6;       /* routable global IPv6 (GUA) of this edge,
                                            reported to supernode for IPv6 hole-punching
@@ -680,7 +656,6 @@ struct n2n_edge
     /* Rate-limiting for P2P/PsP log messages */
     uint8_t             last_p2p_log_mac[N2N_MAC_SIZE];
     n2n_sock_t          last_p2p_log_addr;
-    uint8_t             last_psp_log_mac[N2N_MAC_SIZE];
 
     /* Bypass module */
     bypass_context_t   *bp;
