@@ -1625,8 +1625,8 @@ static const char * sn_nat_type_name( uint8_t t )
     switch ( t )
     {
     case N2N_NAT_FULL_CONE:       return "full-cone";
-    case N2N_NAT_ADDR_RESTRICTED: return "address-restricted";
-    case N2N_NAT_PORT_RESTRICTED: return "port-restricted";
+    case N2N_NAT_ADDR_RESTRICTED: return "addr-restr";
+    case N2N_NAT_PORT_RESTRICTED: return "port-restr";
     case N2N_NAT_SYMMETRIC:       return "symmetric";
     default:                      return "unknown";
     }
@@ -3129,6 +3129,11 @@ static int process_udp( n2n_sn_t * sss,
             traceEvent( TRACE_DEBUG, "NAT report from unregistered %s", sock_to_cstr(sockbuf, sender_sock) );
             return 0;
         }
+
+        if ( peer->nat_type != rep.nat_type )
+            traceEvent( TRACE_INFO, "Nat type of %s is now %s",
+                        macaddr_str( mac_buf, peer->mac_addr ),
+                        sn_nat_type_name( rep.nat_type ) );
 
         peer->nat_type      = rep.nat_type;
         peer->relay_willing = rep.relay_willing;

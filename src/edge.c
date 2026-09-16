@@ -960,8 +960,8 @@ static const char * nat_type_name( uint8_t t )
     switch ( t )
     {
     case N2N_NAT_FULL_CONE:       return "full-cone";
-    case N2N_NAT_ADDR_RESTRICTED: return "address-restricted";
-    case N2N_NAT_PORT_RESTRICTED: return "port-restricted";
+    case N2N_NAT_ADDR_RESTRICTED: return "addr-restr";
+    case N2N_NAT_PORT_RESTRICTED: return "port-restr";
     case N2N_NAT_SYMMETRIC:       return "symmetric";
     default:                      return "unknown";
     }
