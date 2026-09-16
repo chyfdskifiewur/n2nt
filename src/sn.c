@@ -18,7 +18,7 @@
  * least this many seconds. The first few seconds of hole-punching traffic
  * are expected (punches always start out via the SN) and must not trigger
  * the announcement. */
-#define SN_RELAY_ADVERT_ACTIVE_SECS  5
+#define SN_RELAY_ADVERT_ACTIVE_SECS  3
 
 /* forward declarations - needed by run_loop before their definitions */
 struct n2n_sn;
@@ -1533,7 +1533,8 @@ static int update_edge( n2n_sn_t * sss,
             }
 
             scan->last_seen = now;
-            return 1;  /* address changed - treat as new for peer push */
+            return 3;  /* known edge whose address changed: the community must
+                          learn the new endpoint (mgmt "n" refresh, CGNAT remap) */
         }
         else
         {
@@ -1546,7 +1547,8 @@ static int update_edge( n2n_sn_t * sss,
 
     scan->last_seen = now;
     return nat_changed ? 2 : 0;  /* 2 = unchanged address but NAT type changed:
-                                     peers need a fresh PEER_INFO push */
+                                    peers need a fresh PEER_INFO push;
+                                    3 = known edge, address changed (see above) */
 }
 
 
@@ -2312,59 +2314,53 @@ static int try_broadcast( n2n_sn_t * sss,
  * construction a never-contacted source. The edge accepts the probe only
  * from its sn2 query channel IP and only before its first packet there. */
 
-/* Fire the probe at a forwarded edge mapping. Sender must match a live
- * brother entry (IP level) so only the paired SN can trigger it. */
+/* N2NF full-cone probe request from the brother SN (16 raw bytes, not n2n):
+ * sender must be a live brother (IP-level match). Fire 3 UDP packets at the
+ * forwarded edge mapping from a source the edge never contacted; the first
+ * arrives now, #2/#3 are staggered via fc_probes_tick in the main loop so a
+ * just-remapped edge's re-armed "stranger window" is hit by the later ones. */
 static void handle_fc_probe_request( n2n_sn_t *sss,
                                      const struct sockaddr *sender_sock,
                                      const uint8_t *udp_buf,
                                      time_t now )
 {
     n2n_sock_str_t sockbuf;
-    n2n_sock_t sender_n2n;
-    n2n_sock_t target;
-    int from_brother = 0;
+    n2n_sock_t sender_n2n, target;
     static const uint8_t msg[4] = { 'N', '2', 'N', 'F' };
+    static const uint8_t zero[6] = { 0 };
+    int i, from_brother = 0;
 
     if ( sss->last_brother_seen == 0 || now - sss->last_brother_seen > 180 )
         return;
-
     sock_from_sender( &sender_n2n, sender_sock );
     if ( sender_n2n.family != AF_INET )
         return;
-
-    {
-        uint8_t zero[6] = {0,0,0,0,0,0};
-        for ( int j = 0; j < MAX_BROTHER_SNS && !from_brother; j++ )
-        {
-            n2n_brother_entry_t *b = &sss->brothers[j];
-            if ( memcmp( b->mac, zero, 6 ) == 0 ) continue;
-            if ( b->sock.family == AF_INET &&
-                 memcmp( b->sock.addr.v4, sender_n2n.addr.v4, IPV4_SIZE ) == 0 )
-                from_brother = 1;
+    for ( i = 0; i < MAX_BROTHER_SNS; i++ ) {
+        n2n_brother_entry_t *b = &sss->brothers[i];
+        if ( memcmp( b->mac, zero, 6 ) == 0 ) continue;
+        if ( b->sock.family == AF_INET &&
+             memcmp( b->sock.addr.v4, sender_n2n.addr.v4, IPV4_SIZE ) == 0 ) {
+            from_brother = 1;
+            break;
         }
     }
-    if ( !from_brother ) return;
+    if ( !from_brother )
+        return;
 
-    memset( &target, 0, sizeof(target) );
     target.family = AF_INET;
     memcpy( target.addr.v4, udp_buf + 10, IPV4_SIZE );
     target.port = ( (uint16_t)udp_buf[14] << 8 ) | udp_buf[15];
     if ( is_private_ipv4( target.addr.v4 ) )
-        return; /* probes only cross a NAT; never send to private addresses */
+        return;   /* a probe must cross a NAT, never go to a private address */
 
-    /* #1 now; #2/#3 staggered (fc_probes, ticked by the main loop). On a
-     * re-mapped edge the ACK that re-arms its stranger window beats probe
-     * #1 — the later probes are the ones that land in the open window. */
     sendto_sock( sss, &target, msg, sizeof(msg) );
-    for ( int i = 0; i < FC_PROBE_MAX; i++ )
-    {
+    for ( i = 0; i < FC_PROBE_MAX; i++ ) {
         if ( sss->fc_probes[i].left > 0 ) continue;
         sss->fc_probes[i].target = target;
         sss->fc_probes[i].due    = now + FC_PROBE_SPREAD;
         sss->fc_probes[i].left   = 2;
         break;
     }
-
     traceEvent( TRACE_INFO, "FC probe: N2NF x3 -> %s",
                 sock_to_cstr( sockbuf, &target ) );
 }
@@ -2385,16 +2381,17 @@ static void fc_probes_tick( n2n_sn_t * sss, time_t now )
     }
 }
 
-/* Forward a brand-new edge mapping to the brother SN(s) so THEY can act
- * as the never-contacted source. Targets: live brothers[] entries first,
- * fallback to the resolved -b address (asymmetric -b configs). */
+/* Forward a brand-new edge mapping to the brother SN(s) so THEY probe it as
+ * the never-contacted source: live brothers[] first, fallback to the resolved
+ * -b address (asymmetric -b configs). */
 static void send_fc_probe_request( n2n_sn_t *sss,
                                    const n2n_mac_t edgeMac,
                                    const n2n_sock_t *edge_sock,
                                    time_t now )
 {
     uint8_t pkt[16];
-    int sent = 0;
+    int j, sent = 0;
+    macstr_t mac_buf;
 
     if ( edge_sock->family != AF_INET ) return; /* NAT test is IPv4-only */
 
@@ -2404,39 +2401,31 @@ static void send_fc_probe_request( n2n_sn_t *sss,
     pkt[14] = ( edge_sock->port >> 8 ) & 0xFF;
     pkt[15] = edge_sock->port & 0xFF;
 
-    for ( int j = 0; j < MAX_BROTHER_SNS; j++ )
-    {
+    for ( j = 0; j < MAX_BROTHER_SNS; j++ ) {
         n2n_brother_entry_t *b = &sss->brothers[j];
         time_t seen = b->seen > b->seen6 ? b->seen : b->seen6;
-        if ( b->sock.family == AF_INET && seen != 0 && now - seen <= 180 )
-        {
+        if ( b->sock.family == AF_INET && seen != 0 && now - seen <= 180 ) {
             sendto_sock( sss, &b->sock, pkt, sizeof(pkt) );
             sent = 1;
         }
     }
-    if ( !sent && sss->backup_addr_text[0] != '\0' )
-    {
+    if ( !sent && sss->backup_addr_text[0] != '\0' ) {
         n2n_sock_t bs;
         if ( resolve_brother_addr( sss->backup_addr_text, &bs ) == 0 &&
-             bs.family == AF_INET )
-        {
+             bs.family == AF_INET ) {
             sendto_sock( sss, &bs, pkt, sizeof(pkt) );
             sent = 1;
         }
     }
     if ( sent )
-    {
-        macstr_t mac_buf;
         traceEvent( TRACE_DEBUG, "FC probe request forwarded for %s",
                     macaddr_str( mac_buf, edgeMac ) );
-    }
 }
 
-/* push_nat_to_community: an edge's reported NAT type changed (update_edge
- * returned 2) while its address stayed the same — nobody else would learn
- * it (PEER_INFO pushes otherwise fire only on new/addr-changed edges).
- * Send one PEER_INFO about the changed edge to every other community
- * member so their mgmt "nat" column stays fresh. */
+/* An edge's NAT type changed while its address stayed put (update_edge
+ * returned 2): PEER_INFO pushes fire only on new/addr-changed edges, so send
+ * one PEER_INFO about the changed edge to every other community member to
+ * keep their mgmt "nat" column fresh (also heals a lost earlier push). */
 static void push_nat_to_community( n2n_sn_t *sss,
                                    struct peer_info *changed,
                                    const n2n_community_t community )
@@ -2450,53 +2439,41 @@ static void push_nat_to_community( n2n_sn_t *sss,
 
     if ( !changed ) return;
 
-    memset(&pi_cmn, 0, sizeof(pi_cmn));
-    memset(&pi, 0, sizeof(pi));
+    memset( &pi_cmn, 0, sizeof(pi_cmn) );
+    memset( &pi, 0, sizeof(pi) );
     pi_cmn.ttl   = N2N_DEFAULT_TTL;
     pi_cmn.pc    = n2n_peer_info;
     pi_cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
-    memcpy(pi_cmn.community, community, sizeof(n2n_community_t));
+    memcpy( pi_cmn.community, community, sizeof(n2n_community_t) );
 
-    memcpy(pi.mac, changed->mac_addr, N2N_MAC_SIZE);
-    /* Always put IPv4 in sockets[0] if available */
-    if (changed->sock.family == AF_INET)
-        pi.sockets[0] = changed->sock;
-    else if (changed->sock6.family == AF_INET6)
-        pi.sockets[0] = changed->sock6;
-    if (changed->num_sockets > 1 &&
-        changed->sockets[1].family != 0 &&
-        changed->sockets[1].port != 0)
-    {
+    memcpy( pi.mac, changed->mac_addr, N2N_MAC_SIZE );
+    pi.sockets[0] = ( changed->sock.family == AF_INET )
+                    ? changed->sock : changed->sock6;
+    if ( changed->num_sockets > 1 && changed->sockets[1].family != 0 &&
+         changed->sockets[1].port != 0 ) {
         pi.aflags = N2N_AFLAGS_LOCAL_SOCKET;
         pi.sockets[1] = changed->sockets[1];
-    } else {
-        pi.aflags = 0;
     }
-    /* Include IPv6 address if available */
-    if (changed->sock6.family == AF_INET6) {
+    if ( changed->sock6.family == AF_INET6 ) {
         pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
         pi.sock6 = changed->sock6;
-    } else {
-        memset(&pi.sock6, 0, sizeof(n2n_sock_t));
     }
-    if (changed->same_lan_as_sn) {
+    if ( changed->same_lan_as_sn )
         pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
-    }
-    strncpy(pi.version, changed->version, sizeof(pi.version) - 1);
-    strncpy(pi.os_name, changed->os_name, sizeof(pi.os_name) - 1);
+    strncpy( pi.version, changed->version, sizeof(pi.version) - 1 );
+    strncpy( pi.os_name, changed->os_name, sizeof(pi.os_name) - 1 );
     pi.assigned_ip = changed->assigned_ip;
-    pi.aflags |= N2N_NAT_AFLAGS(changed->nat_type);
+    pi.aflags |= N2N_NAT_AFLAGS( changed->nat_type );
     pix = 0;
-    encode_PEER_INFO(pibuf, &pix, &pi_cmn, &pi);
+    encode_PEER_INFO( pibuf, &pix, &pi_cmn, &pi );
 
-    for ( p = sss->edges; p; p = p->next )
-    {
+    for ( p = sss->edges; p; p = p->next ) {
         if ( p == changed ) continue;
-        if ( memcmp(p->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
+        if ( memcmp( p->community_name, community, sizeof(n2n_community_t) ) != 0 ) continue;
         sn_send_to_peer( sss, p, pibuf, pix );
     }
-    traceEvent(TRACE_DEBUG, "pushed NAT change of %s to community",
-               macaddr_str(mac_buf, changed->mac_addr));
+    traceEvent( TRACE_DEBUG, "pushed NAT change of %s to community",
+                macaddr_str( mac_buf, changed->mac_addr ) );
 }
 
 /* ---- community relay helpers (mini-SN) -----------------------------------
@@ -2508,75 +2485,52 @@ static void push_nat_to_community( n2n_sn_t *sss,
  * "else -> back to SN" path.
  * ------------------------------------------------------------------------ */
 
-/* A peer is relay-capable only if its extern addr is a public IPv4 and its
- * NAT type is relay-eligible (N2N_NAT_RELAY_CAPABLE). Private addrs would
- * make A/B unreachable. */
+/* Peer is relay-capable only with a relay-eligible cone NAT and a public
+ * IPv4 endpoint (a private addr would make members unreachable). */
 static int is_relay_capable( const struct peer_info * peer )
 {
-    if (!peer) return 0;
-    if (!N2N_NAT_RELAY_CAPABLE(peer->nat_type)) return 0;
-    if (peer->sock.family != AF_INET) return 0;
-    return !is_private_ipv4(peer->sock.addr.v4);
+    return peer && N2N_NAT_RELAY_CAPABLE( peer->nat_type ) &&
+           peer->sock.family == AF_INET &&
+           !is_private_ipv4( peer->sock.addr.v4 );
 }
 
-/* Pick the community's relay among the registered edges. Excludes a given MAC
- * (e.g. the registering party) so the relay never relays for itself. A -Z 3
- * (force) member is always used as-is and never filtered by NAT/public state
- * -- if it cannot relay, the edge's 5s relay_proven fallback routes back
- * through the SN. When several forcing members exist, exactly one is chosen at
- * random and given a single chance (no rotation) -- this is an edge case and
- * is intentionally rough. Only when nobody forces does the normal priority
- * apply: willing (2) over default (1); a refusing peer (-Z 0) is never picked,
- * and when relay is globally off (force_only) nobody forces means no relay at
- * all. Newest peer first (edges list is latest-first). Returns NULL if none
- * eligible. */
+/* Pick the community's relay among the registered edges (newest first).
+ * The excluded MAC (the registering party) is skipped so a peer never
+ * relays for itself. Priority: a -Z 3 forcing member wins as-is, without
+ * any NAT/public check (if it cannot relay, the edges' 5s relay_proven
+ * fallback routes back through the SN); when nobody forces, a willing (-Z 2)
+ * beats a default (-Z 1), and a refusing peer (-Z 0) is never picked. With
+ * several forcing members the first (newest) one gets a single chance --
+ * intentionally rough, this is an edge case. When relay is globally off
+ * (force_only) and nobody forces, no relay at all. Returns NULL if none. */
 static struct peer_info * find_community_relay( n2n_sn_t *sss,
                                                 const n2n_community_t community,
                                                 const n2n_mac_t exclude_mac,
                                                 int force_only )
 {
     struct peer_info * scan;
-    struct peer_info * forcers[32];
-    int n = 0;
+    struct peer_info * forcer = NULL;
+    struct peer_info * best_willing = NULL; /* willing==2 */
+    struct peer_info * best_default = NULL; /* willing==1 */
 
     for ( scan = sss->edges; scan; scan = scan->next )
     {
-        if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
-        if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
-        if ( scan->relay_willing == 3 )
-        {
-            if ( n < 32 ) forcers[n++] = scan; /* never state-checked */
-        }
+        if ( memcmp( scan->mac_addr, exclude_mac, N2N_MAC_SIZE ) == 0 ) continue;
+        if ( memcmp( scan->community_name, community, sizeof(n2n_community_t) ) != 0 ) continue;
+        if ( scan->relay_willing == 3 ) { if ( !forcer ) forcer = scan; continue; }
+        if ( force_only ) continue;                       /* off and nobody forces */
+        if ( scan->relay_willing == 0 ) continue;         /* refusing: never pick */
+        if ( !is_relay_capable( scan ) ) continue;
+        if ( scan->relay_willing == 2 ) { if ( !best_willing ) best_willing = scan; }
+        else if ( !best_default ) best_default = scan;
     }
-    if ( n > 0 )
-    {
-        /* Random single pick among the forcing members -- one chance. */
-        unsigned long seed = (unsigned long)time(NULL) ^ (unsigned long)&forcers[0];
-        seed = seed * 2654435761u;
-        seed += (unsigned long)&scan; /* vary with layout across calls */
-        return forcers[ seed % n ];
-    }
-
-    {
-        struct peer_info * best_willing = NULL;  /* willing==2 */
-        struct peer_info * best_default = NULL;  /* willing==1 */
-        for ( scan = sss->edges; scan; scan = scan->next )
-        {
-            if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
-            if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
-            if ( !is_relay_capable(scan) ) continue;
-            if ( scan->relay_willing == 0 ) continue;      /* refusing: never pick */
-            if ( force_only ) continue;                    /* globally off, nobody forces: no relay */
-            if ( scan->relay_willing == 2 ) { if (!best_willing) best_willing = scan; }
-            else if ( !best_default ) best_default = scan;
-        }
-        if ( best_willing ) return best_willing;
-        return best_default;
-    }
+    if ( forcer ) return forcer;
+    if ( best_willing ) return best_willing;
+    return best_default;
 }
 
 /* Send one PEER_INFO telling <dest> that <relay> is the community's relay
- * peer. The RELAY flag makes the receiving edge register to it and fall back
+ * peer: the RELAY flag makes the receiving edge register to it and fall back
  * to it when direct punching fails. */
 static void advertise_relay_to( n2n_sn_t *sss,
                                 const n2n_common_t * cmn,
@@ -2590,85 +2544,76 @@ static void advertise_relay_to( n2n_sn_t *sss,
 
     if ( !dest || !relay ) return;
 
-    memset(&pi_cmn, 0, sizeof(pi_cmn));
-    memset(&pi, 0, sizeof(pi));
+    memset( &pi_cmn, 0, sizeof(pi_cmn) );
+    memset( &pi, 0, sizeof(pi) );
     pi_cmn.ttl   = N2N_DEFAULT_TTL;
     pi_cmn.pc    = n2n_peer_info;
     pi_cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
-    memcpy(pi_cmn.community, cmn->community, sizeof(n2n_community_t));
+    memcpy( pi_cmn.community, cmn->community, sizeof(n2n_community_t) );
 
-    memcpy(pi.mac, relay->mac_addr, N2N_MAC_SIZE);
-    pi.aflags = N2N_AFLAGS_RELAY; /* this peer is the relay, not a punch target */
-    if (relay->sock.family == AF_INET)
-        pi.sockets[0] = relay->sock;
-    else if (relay->sock6.family == AF_INET6)
-        pi.sockets[0] = relay->sock6;
-    if (relay->sock6.family == AF_INET6) {
+    memcpy( pi.mac, relay->mac_addr, N2N_MAC_SIZE );
+    pi.aflags = N2N_AFLAGS_RELAY;   /* relay peer, not a punch target */
+    pi.sockets[0] = ( relay->sock.family == AF_INET )
+                    ? relay->sock : relay->sock6;
+    if ( relay->sock6.family == AF_INET6 ) {
         pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
         pi.sock6 = relay->sock6;
     }
-    strncpy(pi.version, relay->version, sizeof(pi.version) - 1);
-    strncpy(pi.os_name, relay->os_name, sizeof(pi.os_name) - 1);
-    pi.aflags |= N2N_NAT_AFLAGS(relay->nat_type);
+    strncpy( pi.version, relay->version, sizeof(pi.version) - 1 );
+    strncpy( pi.os_name, relay->os_name, sizeof(pi.os_name) - 1 );
+    pi.aflags |= N2N_NAT_AFLAGS( relay->nat_type );
 
     encode_PEER_INFO( pibuf, &pix, &pi_cmn, &pi );
     sn_send_to_peer( sss, dest, pibuf, pix );
 }
 
-/* When the supernode actually relays unicast traffic between <req_mac> and
- * <tgt_mac> ("communication attempt / failed direct"), advertise the community
- * relay peer to both so they start registering to it and route through it.
- * Throttled to ~once per 15s per requester so heavy flows don't flood PEER_INFO. */
+/* When the supernode relays unicast traffic between <req_mac> and <tgt_mac>
+ * (punching has failed), advertise the community relay peer to both so they
+ * register to it and route through it. Whole-relay switch: sn -Z 0 means stay
+ * on the plain SN relay UNLESS a member forces with edge -Z 3 (turns the
+ * group relay back on, used as-is; if it cannot relay, the edge's 5s
+ * relay_proven fallback routes back through the SN). Throttled per requester. */
 static void advertise_relay_on_pair( n2n_sn_t *sss,
                                      const n2n_common_t * cmn,
                                      const n2n_mac_t req_mac,
                                      const n2n_mac_t tgt_mac )
 {
-    int force_only;
-    /* Whole-relay feature switch: when the admin disabled community relay
-     * advertisement (sn -Z 0), stay on plain SN relay UNLESS a member forces
-     * (edge -Z 3) -- a forcing member turns the group relay back on and is then
-     * used as-is (SN never checks its NAT/public state); if it cannot relay,
-     * the edge's 5s relay_proven fallback routes back through the SN. */
-    force_only = !sss->relay_advert_enabled;
-
+    time_t now = time( NULL );
     struct peer_info * req = find_peer_by_mac( sss->edges, req_mac );
+    struct peer_info * tgt, * relay;
+    int force_only = !sss->relay_advert_enabled;
+
     if ( !req ) return;
 
-    time_t now = time(NULL);
-
-    /* Sustained-traffic gate: every member punches through this supernode
-     * for the first few seconds, and that initial burst must not trigger
-     * the community-relay announcement. Once a member's unicast data has
-     * been relayed here continuously for SN_RELAY_ADVERT_ACTIVE_SECS its
-     * hole-punching has apparently not succeeded — only then announce. */
+    /* Announcing during the first SN_RELAY_ADVERT_ACTIVE_SECS of a member's
+     * SN-relayed traffic would fire on the normal pre-punch burst; only once
+     * the data has bounced here continuously for that long is the punch
+     * considered failed. Also cap the announcement rate. */
     if ( req->sn_fwd_first == 0 )
         req->sn_fwd_first = now;
     if ( (now - req->sn_fwd_first) < SN_RELAY_ADVERT_ACTIVE_SECS )
         return;
+    if ( (now - req->relay_adv_time) < 15 )
+        return;
 
-    if ( (now - req->relay_adv_time) < 15 ) return; /* throttled */
-
-    /* The relay must be a proper third peer: neither the sender nor the target. */
-    struct peer_info * relay = find_community_relay( sss, cmn->community, req_mac, force_only );
-    if ( !relay || (memcmp(relay->mac_addr, tgt_mac, N2N_MAC_SIZE) == 0) )
-        return; /* no good peer (incl. globally-off with no forcing member) -> plain SN */
+    /* The relay must be a proper third peer: neither requester nor target. */
+    relay = find_community_relay( sss, cmn->community, req_mac, force_only );
+    if ( !relay || memcmp( relay->mac_addr, tgt_mac, N2N_MAC_SIZE ) == 0 )
+        return;   /* none eligible (incl. globally off with no forcing member) */
     req->relay_adv_time = now;
 
-    struct peer_info * tgt = find_peer_by_mac( sss->edges, tgt_mac );
     advertise_relay_to( sss, cmn, req, relay );
-    if ( tgt )
-    {
-        /* Same sustained-traffic gate on the target side: if its own punching
-         * is still in its first seconds (barely relayed through here), do not
-         * burden it with the announcement yet. */
+
+    tgt = find_peer_by_mac( sss->edges, tgt_mac );
+    if ( tgt ) {
+        /* Same sustained-traffic gate on the target side. */
         if ( tgt->sn_fwd_first == 0 )
             tgt->sn_fwd_first = now;
         if ( (now - tgt->sn_fwd_first) >= SN_RELAY_ADVERT_ACTIVE_SECS )
             advertise_relay_to( sss, cmn, tgt, relay );
     }
-    /* Notify the relay itself (PEER_INFO RELAY naming its own MAC) so it
-     * switches on forwarding without self-judging eligibility. Idempotent. */
+    /* Tell the relay itself (PEER_INFO naming its own MAC) to switch on
+     * forwarding without self-judging eligibility. Idempotent. */
     advertise_relay_to( sss, cmn, relay, relay );
 }
 
@@ -2947,9 +2892,8 @@ static int process_udp( n2n_sn_t * sss,
 
         if ( unicast )
         {
-            /* Relay: the supernode relaying the first member-to-member data
-             * frame is the signal to start registering to the relay peer
-             * (concurrent with the on-going punch). */
+            /* SN relaying the first member data = the signal to start using
+             * the community relay peer (concurrent with the ongoing punch). */
             if ( sender_peer )
                 advertise_relay_on_pair( sss, &cmn, sender_peer->mac_addr, compact_dstMac );
             try_forward( sss, &cmn, compact_dstMac, rec_buf, encx );
@@ -3085,9 +3029,8 @@ static int process_udp( n2n_sn_t * sss,
         /* Common section to forward the final product. */
         if ( unicast )
         {
-            /* Relay: the supernode relaying member-to-member data is a clear
-             * sign direct failed; push the community relay peer so the members
-             * can switch to it. */
+            /* SN relaying member data = direct failed; push the community
+             * relay peer so the members can switch to it. */
             advertise_relay_on_pair( sss, &cmn, pkt.srcMac, pkt.dstMac );
             try_forward( sss, &cmn, pkt.dstMac, rec_buf, encx );
         }
@@ -3124,9 +3067,8 @@ static int process_udp( n2n_sn_t * sss,
 
         if ( unicast )
         {
-        /* Relay: one member wants another -> tell both about the community
-         * relay peer so they can register to it and use it once direct
-         * punching fails. */
+        /* One member wants another: tell both about the community relay peer
+         * so they can register to it once direct punching fails. */
         advertise_relay_on_pair( sss, &cmn, reg.srcMac, reg.dstMac );
 
         traceEvent( TRACE_DEBUG, "Rx REGISTER %s -> %s %s",
@@ -3660,37 +3602,30 @@ static int process_udp( n2n_sn_t * sss,
                      N2N_NAT_FROM_AFLAGS(reg.aflags),
                      use_request_ip, use_requested_ip );
 
-        /* NAT type changed with unchanged address (update_edge == 2):
-         * other edges would never learn it — push the fresh value. */
-        if ( is_new_edge == 2 )
+        /* Edge metadata changed while staying in the table (==2 NAT type
+         * changed, ==3 address changed: "n" refresh / CGNAT re-map): push a
+         * fresh PEER_INFO so peers stop pointing at the abandoned endpoint. */
+        if ( is_new_edge == 2 || is_new_edge == 3 )
             push_nat_to_community( sss,
                                    find_peer_by_mac(sss->edges, reg.edgeMac),
                                    cmn.community );
 
-        /* Brand-new (or re-mapped) edge — or an edge that explicitly asked for a
-         * manual NAT re-probe (mgmt "n", N2N_AFLAGS_NAT_REPROBE): one-shot
-         * chance for the brother SN to full-cone-probe it as a
-         * never-contacted source. */
+        /* New (or re-mapped) edge — or one that asked for a manual NAT
+         * re-probe (N2N_AFLAGS_NAT_REPROBE, mgmt "n"): give the brother SN a
+         * one-shot chance to full-cone-probe it as a never-contacted source. */
         if ( is_new_edge || (reg.aflags & N2N_AFLAGS_NAT_REPROBE) )
             send_fc_probe_request( sss, reg.edgeMac, &(ack.sock), now );
 
-        /* Remember the edge's relay stance so find_community_relay can prefer
-         * willing/force / skip refusing candidates. Default (neither bit)=1;
-         * force (3) is the relay even if relay is globally off. */
-        if (!query_only)
+        /* Record the edge's relay stance for find_community_relay: force=3
+         * (relay even when the group relay is off), willing=2, default=1,
+         * refuse=0 (never picked). */
+        if ( !query_only )
         {
             struct peer_info *w_edge = find_peer_by_mac( sss->edges, reg.edgeMac );
             if ( w_edge )
-            {
-                if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_FORCE )
-                    w_edge->relay_willing = 3;
-                else if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_NO )
-                    w_edge->relay_willing = 0;
-                else if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_YES )
-                    w_edge->relay_willing = 2;
-                else
-                    w_edge->relay_willing = 1;
-            }
+                w_edge->relay_willing = ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_FORCE ) ? 3 :
+                                        ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_NO   ) ? 0 :
+                                        ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_YES  ) ? 2 : 1;
         }
 
         /* Set assigned IP in ACK */
