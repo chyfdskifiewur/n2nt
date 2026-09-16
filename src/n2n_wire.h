@@ -60,7 +60,11 @@ enum n2n_pc
     n2n_probe=9,                /* P2P hole-punch probe: edge->edge direct */
     n2n_probe_ack=10,           /* P2P hole-punch result: observed addr via supernode */
     n2n_peer_info=11,           /* Supernode pushes peer address to edge */
-    n2n_query_peer=12           /* Edge asks supernode for peer address */
+    n2n_query_peer=12,          /* Edge asks supernode for peer address */
+    n2n_nat_probe=13,           /* Supernode asks an edge to echo a cookie, sent from the
+                                   auxiliary socket (same IP, random port) so the edge can
+                                   tell address-restricted from port-restricted NAT */
+    n2n_nat_report=14           /* Edge reports its NAT type and relay willingness to supernode */
 };
 
 typedef enum n2n_pc n2n_pc_t;
@@ -68,7 +72,10 @@ typedef enum n2n_pc n2n_pc_t;
 #define N2N_FLAGS_OPTIONS               0x0080
 #define N2N_FLAGS_SOCKET                0x0040
 #define N2N_FLAGS_FROM_SUPERNODE        0x0020
-#define N2N_FLAGS_FROM_RELAY            0x0100  /* frame forwarded by a community relay peer (mini-SN) */
+/* Set by a relaying edge when it re-wraps a peer's payload, so the receiver can tell
+ * a frame that came through the relay peer from one that came through the real
+ * supernode. Old code only masks the low bits for the type and never tests 0x8000. */
+#define N2N_FLAGS_RELAY                 0x8000
 
 /* The bits in flag that are the packet type */
 #define N2N_FLAGS_TYPE_MASK             0x001f  /* 0 - 31 */
@@ -167,25 +174,11 @@ typedef struct n2n_PACKET n2n_PACKET_t;
 
 /* Linked with n2n_register_super in n2n_pc_t. Only from edge to supernode. */
 #define N2N_AFLAGS_LOCAL_SOCKET   0x0001  /* local_sock field is valid */
-#define N2N_AFLAGS_NAT_SYMMETRIC  0x0040  /* edge reports symmetric NAT (dual-sn reflection) */
-#define N2N_AFLAGS_NAT_BOUNCE     0x0080  /* edge asks this sn for a NAT bounce test: reply
-                                             from the helper socket with 4-byte magic "N2NB" */
-#define N2N_AFLAGS_NAT_FULL_CONE  0x0100  /* edge reports full-cone NAT (proved by an "N2NF"
-                                             probe from the brother sn, a never-contacted source) */
-#define N2N_AFLAGS_NAT_RESTRICTED 0x0200  /* edge reports address-restricted cone NAT */
-#define N2N_AFLAGS_NAT_PORT_RESTRICT 0x0400 /* edge reports port-restricted NAT */
 #define N2N_AFLAGS_FORCE_PEER_INFO 0x0008  /* force supernode to push all peer info */
-#define N2N_AFLAGS_RELAY_WILLING_NO  0x0800 /* edge refuses to act as the relay (SN never picks it) */
-#define N2N_AFLAGS_RELAY_WILLING_YES 0x1000 /* edge is willing to act as the relay (SN prefers it) */
-#define N2N_AFLAGS_RELAY_WILLING_FORCE 0x2000 /* edge forces to be the relay even if the SN turned
-                                             community relay off (sn -Z 0): re-enables the group
-                                             relay and uses only the forcing member */
-                                        /* neither set = default "can be" relay (secondary) */
-#define N2N_AFLAGS_QUERY_ONLY     0x0010  /* REGISTER_SUPER is a one-shot query: ACK but do NOT
-                                             register/persist this edge as a peer */
-#define N2N_AFLAGS_NAT_REPROBE    0x4000  /* edge asks the sn to re-trigger the brother's full-cone
-                                             "N2NF" probe even though this registration is not a
-                                             new/remapped edge (mgmt "n" re-runs NAT detection) */
+#define N2N_AFLAGS_QUERY_ONLY     0x0010  /* REGISTER_SUPER is a one-shot query
+                                             (e.g. ask sn2 for sn1's current address):
+                                             supernode replies with an ACK but does
+                                             NOT register/persist this edge as a peer */
 
 struct n2n_REGISTER_SUPER
 {
@@ -283,6 +276,31 @@ size_t encode_PROBE( uint8_t * base, size_t * idx, const n2n_common_t * common, 
 size_t decode_PROBE( n2n_PROBE_t * probe, const n2n_common_t * cmn, const uint8_t * base, size_t * rem, size_t * idx );
 size_t encode_PROBE_ACK( uint8_t * base, size_t * idx, const n2n_common_t * common, const n2n_PROBE_ACK_t * ack );
 size_t decode_PROBE_ACK( n2n_PROBE_ACK_t * ack, const n2n_common_t * cmn, const uint8_t * base, size_t * rem, size_t * idx );
+
+
+/* NAT_PROBE: supernode -> edge. Sent from the supernode's auxiliary socket (same IP as
+ * the registration socket, random port) so that a reply proves the edge's NAT lets in
+ * traffic from a known IP but an unknown port (address-restricted) rather than only the
+ * exact ip:port pair it has talked to (port-restricted). */
+typedef struct n2n_NAT_PROBE
+{
+    n2n_cookie_t        cookie;         /* echoed back in NAT_REPORT.nat_echo */
+} n2n_NAT_PROBE_t;
+
+/* NAT_REPORT: edge -> supernode. Also doubles as the keepalive for the supernode's copy
+ * of the edge's NAT verdict. */
+typedef struct n2n_NAT_REPORT
+{
+    uint8_t             nat_type;       /* N2N_NAT_* */
+    uint8_t             relay_willing;  /* 0 refuse / 1 default / 2 willing / 3 force, from -Z */
+    uint8_t             nat_probe_req;  /* 1 = please probe my helper port right away */
+    n2n_cookie_t        nat_echo;       /* cookie of the NAT_PROBE just received, all zero if none */
+} n2n_NAT_REPORT_t;
+
+size_t encode_NAT_PROBE( uint8_t * base, size_t * idx, const n2n_common_t * common, const n2n_NAT_PROBE_t * pkt );
+size_t decode_NAT_PROBE( n2n_NAT_PROBE_t * pkt, const n2n_common_t * cmn, const uint8_t * base, size_t * rem, size_t * idx );
+size_t encode_NAT_REPORT( uint8_t * base, size_t * idx, const n2n_common_t * common, const n2n_NAT_REPORT_t * pkt );
+size_t decode_NAT_REPORT( n2n_NAT_REPORT_t * pkt, const n2n_common_t * cmn, const uint8_t * base, size_t * rem, size_t * idx );
 
 
 
@@ -438,8 +456,10 @@ size_t decode_PACKET( n2n_PACKET_t * pkt,
 #define N2N_AFLAGS_IPV6_SOCKET     0x0002  /* sock6 field is valid */
 #define N2N_AFLAGS_PUNCH_REQUEST   0x0004  /* QUERY_PEER triggered, edge should start punching */
 #define N2N_AFLAGS_SAME_LAN_AS_SN  0x0008  /* peer is in same LAN as supernode, replace IP with SN's public IP */
-#define N2N_AFLAGS_RELAY           0x0010  /* this peer is the community's relay peer (mini-SN):
-                                              members must register to it and use it when direct fails */
+#define N2N_AFLAGS_RELAY           0x0010  /* relay_* block present */
+#define N2N_AFLAGS_RELAY_SERVE     0x0020  /* with RELAY: relay_* names a peer this edge should relay for
+                                            * (only sent to the elected relay peer); without it,
+                                            * relay_* names the relay peer to send through */
 typedef struct n2n_PEER_INFO {
     uint16_t   aflags;       /* N2N_AFLAGS_LOCAL_SOCKET if sockets[1] valid, N2N_AFLAGS_IPV6_SOCKET if sock6 valid, N2N_AFLAGS_PUNCH_REQUEST if should punch, N2N_AFLAGS_SAME_LAN_AS_SN if same LAN as SN */
     n2n_mac_t  mac;
@@ -448,6 +468,12 @@ typedef struct n2n_PEER_INFO {
     char       version[8];  /* peer edge version string (optional, may be empty) */
     char       os_name[16]; /* peer OS name (optional, may be empty) */
     uint32_t   assigned_ip; /* peer's n2n virtual LAN IP address (0 if unknown) */
+    /* relay block, present only when aflags & N2N_AFLAGS_RELAY, encoded after assigned_ip.
+     * Old edges stop reading at assigned_ip and ignore the extra bytes. */
+    n2n_sock_t relay_sock;  /* address of the involved relay peer / served peer */
+    n2n_mac_t  relay_mac;
+    uint8_t    relay_nat;   /* that peer's N2N_NAT_*, for display only */
+    uint8_t    relay_willing; /* that peer's relay willingness, for display only */
 } n2n_PEER_INFO_t;
 
 size_t encode_PEER_INFO( uint8_t * base, size_t * idx,

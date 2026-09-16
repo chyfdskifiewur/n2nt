@@ -829,6 +829,15 @@ size_t encode_PEER_INFO( uint8_t * base, size_t * idx,
     retval += encode_buf( base, idx, pkt->os_name, sizeof(pkt->os_name) );
     /* Append assigned_ip for backward compat; old edges ignore extra bytes */
     retval += encode_uint32( base, idx, pkt->assigned_ip );
+    /* Relay block, gated by an aflag so that a peer with no relay information stays
+     * byte-identical to what old code produced. */
+    if ( pkt->aflags & N2N_AFLAGS_RELAY )
+    {
+        retval += encode_sock( base, idx, &pkt->relay_sock );
+        retval += encode_mac( base, idx, pkt->relay_mac );
+        retval += encode_uint8( base, idx, pkt->relay_nat );
+        retval += encode_uint8( base, idx, pkt->relay_willing );
+    }
     return retval;
 }
 
@@ -860,6 +869,19 @@ size_t decode_PEER_INFO( n2n_PEER_INFO_t * pkt,
         retval += decode_uint32( &pkt->assigned_ip, base, rem, idx );
     else
         pkt->assigned_ip = 0;
+    /* Relay block: optional, appended by new supernodes. relay_sock is the only field
+     * whose size varies (8 bytes IPv4, 20 bytes IPv6), so probe it first; the rest are
+     * fixed size and each carries its own guard to stay aligned on a truncated packet. */
+    if ( (pkt->aflags & N2N_AFLAGS_RELAY) && *rem >= 8 )
+    {
+        retval += decode_sock( &pkt->relay_sock, base, rem, idx );
+        if ( *rem >= N2N_MAC_SIZE )
+            retval += decode_mac( pkt->relay_mac, base, rem, idx );
+        if ( *rem >= 1 )
+            retval += decode_uint8( &pkt->relay_nat, base, rem, idx );
+        if ( *rem >= 1 )
+            retval += decode_uint8( &pkt->relay_willing, base, rem, idx );
+    }
     return retval;
 }
 
@@ -883,5 +905,52 @@ size_t decode_QUERY_PEER( n2n_QUERY_PEER_t * pkt,
     memset( pkt, 0, sizeof(*pkt) );
     retval += decode_mac( pkt->srcMac, base, rem, idx );
     retval += decode_mac( pkt->targetMac, base, rem, idx );
+    return retval;
+}
+
+
+size_t encode_NAT_PROBE( uint8_t * base, size_t * idx,
+                         const n2n_common_t * common,
+                         const n2n_NAT_PROBE_t * pkt )
+{
+    size_t retval = 0;
+    retval += encode_common( base, idx, common );
+    retval += encode_buf( base, idx, pkt->cookie, N2N_COOKIE_SIZE );
+    return retval;
+}
+
+size_t decode_NAT_PROBE( n2n_NAT_PROBE_t * pkt,
+                         const n2n_common_t * cmn,
+                         const uint8_t * base,
+                         size_t * rem, size_t * idx )
+{
+    memset( pkt, 0, sizeof(*pkt) );
+    return decode_buf( pkt->cookie, N2N_COOKIE_SIZE, base, rem, idx );
+}
+
+size_t encode_NAT_REPORT( uint8_t * base, size_t * idx,
+                          const n2n_common_t * common,
+                          const n2n_NAT_REPORT_t * pkt )
+{
+    size_t retval = 0;
+    retval += encode_common( base, idx, common );
+    retval += encode_uint8( base, idx, pkt->nat_type );
+    retval += encode_uint8( base, idx, pkt->relay_willing );
+    retval += encode_uint8( base, idx, pkt->nat_probe_req );
+    retval += encode_buf( base, idx, pkt->nat_echo, N2N_COOKIE_SIZE );
+    return retval;
+}
+
+size_t decode_NAT_REPORT( n2n_NAT_REPORT_t * pkt,
+                          const n2n_common_t * cmn,
+                          const uint8_t * base,
+                          size_t * rem, size_t * idx )
+{
+    size_t retval = 0;
+    memset( pkt, 0, sizeof(*pkt) );
+    retval += decode_uint8( &pkt->nat_type, base, rem, idx );
+    retval += decode_uint8( &pkt->relay_willing, base, rem, idx );
+    retval += decode_uint8( &pkt->nat_probe_req, base, rem, idx );
+    retval += decode_buf( pkt->nat_echo, N2N_COOKIE_SIZE, base, rem, idx );
     return retval;
 }
