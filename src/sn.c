@@ -1080,7 +1080,7 @@ static void deinit_sn( n2n_sn_t * sss )
 /* Mgmt table header, shared by the brother and edges tables so the column
  * positions (e.g. the trailing "os" column) stay in sync. */
 static const char mgmt_header[] =
-    "  id  mac                n2n_ip           wan_ip               <KB/s     GB/24h   GB/30d>  ver      os               nat\n";
+    "  id  mac                n2n_ip           wan_ip               <KB/s     GB/24h   GB/30d>  ver      os       nat\n";
 
 /* brother_list display helper: format brother SN status lines (for -Q / trace). */
 static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t bufsz)
@@ -2221,7 +2221,7 @@ static int process_mgmt( n2n_sn_t * sss,
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s", mgmt_header);
 	if (ressize < N2N_SN_PKTBUF_SIZE)
         ressize += snprintf(resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize,
-                           "---v2.3----------------------------------------------------------------------------------------------------\n");
+                           "---v2.3----------------------------------------------------------------------------------------------------------------\n");
     /* brother table sits between the two v2.3 separator lines */
     ressize += brother_list_format(sss, time(NULL), resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize);
 
@@ -2381,7 +2381,7 @@ static int process_mgmt( n2n_sn_t * sss,
                     }
                 }
                 ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                                   "  %2u  %-17s  %-15s  %-47s  %-7s  %-15s  %s\n",
+                                   "  %2u  %-17s  %-15s  %-47s  %-7s  %-7s  %s\n",
                                    id++, macaddr_str(mac_buf, edge->mac_addr), virt_ip,
                                    wan, version, os_name,
                                    sn_nat_type_name(edge->nat_type));
@@ -2472,7 +2472,7 @@ static int process_mgmt( n2n_sn_t * sss,
 
     /* Send footer and statistics */
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                      "----------------------------------------------------------------------------------------------------v2.3---\n");
+                      "----------------------------------------------------------------------------------------------------------------v2.3---\n");
 
     time_t uptime = now - sss->start_time;
     int days = uptime / 86400;

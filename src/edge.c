@@ -1025,19 +1025,61 @@ static void edge_nat_classify( n2n_edge_t * eee, const n2n_sock_t * src, time_t 
     eee->nat_fc_evid = now;
 }
 
-/** Record what a vantage point saw our public address as. */
+/** Record what a vantage point saw our public address as.
+ *  Each vantage point owns one slot: the active supernode is sampled on every
+ *  registration ACK, so a plain ring would let it push the other observation out
+ *  and the comparison between the two could never be made again. */
 static void edge_nat_add_sample( n2n_edge_t * eee,
                                  const n2n_sock_t * vantage,
                                  const n2n_sock_t * mapped,
                                  time_t now )
 {
+    int i;
+
     if ( vantage->family != AF_INET || mapped->family != AF_INET )
         return;
+
+    for ( i = 0; i < N2N_NAT_SAMPLE_SLOTS; i++ )
+    {
+        /* Same observer as an earlier sample (the verdict compares vantage
+         * addresses, so one slot per address is the right granularity). */
+        if ( eee->nat_samples[i].when != 0 &&
+             eee->nat_samples[i].vantage.family == AF_INET &&
+             0 == memcmp( eee->nat_samples[i].vantage.addr.v4,
+                          vantage->addr.v4, IPV4_SIZE ) )
+        {
+            eee->nat_samples[i].vantage = *vantage;
+            eee->nat_samples[i].mapped  = *mapped;
+            eee->nat_samples[i].when    = now;
+            return;
+        }
+    }
 
     eee->nat_samples[eee->nat_sample_next].vantage = *vantage;
     eee->nat_samples[eee->nat_sample_next].mapped  = *mapped;
     eee->nat_samples[eee->nat_sample_next].when    = now;
     eee->nat_sample_next = ( eee->nat_sample_next + 1 ) % N2N_NAT_SAMPLE_SLOTS;
+}
+
+/** Forget everything measured so far. Called when the public mapping changes:
+ *  the old observations describe a different NAT and would keep the verdict
+ *  pinned to a type that no longer applies. */
+static void edge_nat_reset( n2n_edge_t * eee, time_t now )
+{
+    memset( eee->nat_samples, 0, sizeof(eee->nat_samples) );
+    eee->nat_sample_next   = 0;
+    eee->nat_fc_evid       = 0;
+    eee->nat_addr_evid     = 0;
+    eee->nat_probe_seen_at = 0;
+    eee->nat_probe_req_at  = 0;
+    eee->nat_reported      = N2N_NAT_UNKNOWN;
+
+    /* Measure and probe the new mapping from scratch, with the same settling
+     * burst the startup path uses. */
+    eee->nat_first_sample = now;
+    eee->nat_burst_left   = 3;
+    eee->nat_next_sample  = now;
+    eee->nat_probe_req    = 3;
 }
 
 /** Turn the collected evidence into a verdict. Deliberately conservative:
@@ -1082,11 +1124,15 @@ static void edge_nat_verdict( n2n_edge_t * eee, time_t now )
             }
     }
 
-    if ( eee->nat_fc_evid != 0 && now - eee->nat_fc_evid <= N2N_NAT_EVID_TTL )
+    /* Both kinds of inbound proof stay valid until the mapping changes (see
+     * edge_nat_reset): a NAT that admitted an unsolicited packet keeps doing so,
+     * and expiring the evidence on a timer is what made the type fall back to
+     * unknown a few minutes after startup. */
+    if ( eee->nat_fc_evid != 0 )
     {
         eee->nat_type = N2N_NAT_FULL_CONE;
     }
-    else if ( eee->nat_addr_evid != 0 && now - eee->nat_addr_evid <= N2N_NAT_EVID_TTL )
+    else if ( eee->nat_addr_evid != 0 )
     {
         eee->nat_type = N2N_NAT_ADDR_RESTRICTED;
     }
@@ -1721,6 +1767,15 @@ static void edge_nat_tick( n2n_edge_t * eee, time_t now )
         }
         edge_nat_sample_sn2( eee );
     }
+
+    /* Nothing inbound has ever been proven yet: ask for a helper-port probe
+     * once in a while. A report the supernode drops (the address it registered
+     * us under no longer matches, for instance) consumes the request without
+     * anyone probing, and without this retry the type would stay unknown. */
+    if ( eee->nat_fc_evid == 0 && eee->nat_addr_evid == 0 &&
+         eee->nat_probe_req == 0 && eee->nat_first_sample != 0 &&
+         now - eee->nat_probe_req_at >= N2N_NAT_PROBE_RETRY )
+        eee->nat_probe_req = 1;
 
     edge_nat_verdict( eee, now );
 
@@ -5487,6 +5542,31 @@ process_n2n_packet:
                         eee->sn1_ever_ok = 1;
 
                     eee->sn_ack_count++;
+
+                    /* Every ACK from the current supernode is a fresh sighting of
+                     * our public address from that network, which is what the NAT
+                     * verdict compares against the second observation point. It
+                     * has to be taken here and not only once at startup, or the
+                     * comparison expires a couple of minutes in and the type
+                     * falls back to unknown. ACKs from the other supernode (the
+                     * dual probe during failover) are not this vantage point, so
+                     * they are left out. */
+                    if ( ra.sock.family == AF_INET && sender.family == AF_INET &&
+                         ( sock_equal( &sender, &eee->supernode ) == 0 ||
+                           eee->my_public_sock.family != AF_INET ) )
+                    {
+                        if ( eee->my_public_sock.family == AF_INET &&
+                             sock_equal( &eee->my_public_sock, &ra.sock ) != 0 )
+                        {
+                            n2n_sock_str_t pub_str;
+                            traceEvent( TRACE_NORMAL, "Our public address changed to %s",
+                                        sock_to_cstr( pub_str, &ra.sock ) );
+                            edge_nat_reset( eee, now );
+                        }
+                        eee->my_public_sock = ra.sock;
+                        edge_nat_add_sample( eee, &sender, &ra.sock, now );
+                    }
+
                     /* Identity gate captured before any switch below: this
                      * ACK carries sn1's identity when it comes from sn1's own
                      * registration (sn_idx==0) or is an ask_backup reply
@@ -5717,20 +5797,10 @@ process_n2n_packet:
                             initial_connection_complete = 1;
                         }
 
-                        /* Store our own public address as seen by supernode.
-                         * Log if it changed (e.g. WiFi switch). */
-                        n2n_sock_t old_pub = eee->my_public_sock;
-                        eee->my_public_sock = ra.sock;
-                        if (old_pub.family != 0 &&
-                            sock_equal(&old_pub, &eee->my_public_sock) != 0)
-                        {
-                            traceEvent(TRACE_NORMAL, "Our public address changed to %s",
-                                       sock_to_cstr(sockbuf1, &eee->my_public_sock));
-                        }
-
                         /* Start NAT detection from the first real observation of
-                         * our own public address. The burst of sn2 samples and
-                         * the helper-port probe request both wait for that. */
+                         * our own public address (recorded above, on every ACK).
+                         * The burst of sn2 samples and the helper-port probe
+                         * request both wait for that first sighting. */
                         if ( eee->nat_first_sample == 0 && ra.sock.family == AF_INET &&
                              sender.family == AF_INET )
                         {
@@ -5738,7 +5808,6 @@ process_n2n_packet:
                             eee->nat_burst_left   = 3;
                             eee->nat_next_sample  = now;
                             eee->nat_probe_req    = 3;
-                            edge_nat_add_sample( eee, &sender, &ra.sock, now );
                         }
 
                         eee->register_lifetime = ra.lifetime;

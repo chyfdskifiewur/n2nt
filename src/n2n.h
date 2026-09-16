@@ -240,7 +240,10 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
 #define N2N_NAT_SAMPLE_TTL          120
 #define N2N_NAT_SENT_SLOTS          32      /* recent send destinations, for inbound classification */
 #define N2N_NAT_SENT_TTL            300
-#define N2N_NAT_EVID_TTL            300     /* how long an inbound observation stays usable */
+#define N2N_NAT_PROBE_RETRY         120     /* ask for a helper-port probe again this often
+                                               while nothing inbound has been proven (an
+                                               inbound observation itself never expires, it
+                                               is dropped when the public mapping changes) */
 #define N2N_NAT_REPORT_INTERVAL     30      /* re-report even when nothing changed */
 #define N2N_NAT_SAMPLE_INTERVAL     60      /* routine sn2 sample period */
 
