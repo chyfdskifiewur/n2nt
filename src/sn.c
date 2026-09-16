@@ -1665,8 +1665,11 @@ static void sn_nat_ask_edges( n2n_sn_t * sss, struct peer_info * target, time_t 
             continue;
         if ( scan->last_seen == 0 || now - scan->last_seen > 120 )
             continue;
-        if ( 0 == memcmp( scan->sock.addr.v4, target->sock.addr.v4, IPV4_SIZE ) )
-            continue;       /* same public address: not a stranger */
+        /* Peers sharing the target's public address are deliberately NOT
+         * excluded: they still probe from their own external port, which is a
+         * usable signal, and a coarser verdict in that case is accepted rather
+         * than dropping half the community's candidates. What it cannot give is
+         * a full-cone proof (see build/nat-relay-design.md §10.7). */
 
         for ( j = 0; j < used_n; j++ )
         {
