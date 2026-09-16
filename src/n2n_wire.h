@@ -64,7 +64,10 @@ enum n2n_pc
     n2n_nat_probe=13,           /* Supernode asks an edge to echo a cookie, sent from the
                                    auxiliary socket (same IP, random port) so the edge can
                                    tell address-restricted from port-restricted NAT */
-    n2n_nat_report=14           /* Edge reports its NAT type and relay willingness to supernode */
+    n2n_nat_report=14,          /* Edge reports its NAT type and relay willingness to supernode */
+    n2n_brother_nat_req=15      /* sn1 -> brother sn2 over the "brother_reg" channel: probe an
+                                   edge's public mapping from sn2's MAIN socket, so the source
+                                   is a stranger IP on a port already known to carry traffic */
 };
 
 typedef enum n2n_pc n2n_pc_t;
@@ -301,6 +304,19 @@ size_t encode_NAT_PROBE( uint8_t * base, size_t * idx, const n2n_common_t * comm
 size_t decode_NAT_PROBE( n2n_NAT_PROBE_t * pkt, const n2n_common_t * cmn, const uint8_t * base, size_t * rem, size_t * idx );
 size_t encode_NAT_REPORT( uint8_t * base, size_t * idx, const n2n_common_t * common, const n2n_NAT_REPORT_t * pkt );
 size_t decode_NAT_REPORT( n2n_NAT_REPORT_t * pkt, const n2n_common_t * cmn, const uint8_t * base, size_t * rem, size_t * idx );
+
+/* BROTHER_NAT_REQ: sn1 -> sn2 only, carried on the pseudo-community "brother_reg".
+ * sn2 fires NAT_PROBEs with the cookie at target_sock from its own main socket. */
+typedef struct n2n_BROTHER_NAT_REQ
+{
+    n2n_cookie_t        cookie;         /* cookie the edge must see / echo */
+    n2n_mac_t           target_mac;     /* edge being probed (diagnostics) */
+    n2n_sock_t          target_sock;    /* edge public mapping, IPv4 only */
+    n2n_community_t     community;      /* community to send the probes in */
+} n2n_BROTHER_NAT_REQ_t;
+
+size_t encode_BROTHER_NAT_REQ( uint8_t * base, size_t * idx, const n2n_common_t * common, const n2n_BROTHER_NAT_REQ_t * pkt );
+size_t decode_BROTHER_NAT_REQ( n2n_BROTHER_NAT_REQ_t * pkt, const n2n_common_t * cmn, const uint8_t * base, size_t * rem, size_t * idx );
 
 
 

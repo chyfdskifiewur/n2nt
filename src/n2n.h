@@ -246,6 +246,10 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
                                                is dropped when the public mapping changes) */
 #define N2N_NAT_REPORT_INTERVAL     30      /* re-report even when nothing changed */
 #define N2N_NAT_SAMPLE_INTERVAL     60      /* routine sn2 sample period */
+#define N2N_NAT_FC_WINDOW           8       /* after a fresh mapping: stay silent towards
+                                               sn2 for this long while its main socket
+                                               probes us as a stranger, then start sampling */
+#define N2N_NAT_PROBE_REPEAT        3       /* helper and brother-main-socket probes each */
 
 /* Relay service timing. The supernode hands a pair over to a relay only after
  * seeing its traffic cross the supernode for a few seconds, and refreshes the
@@ -608,7 +612,12 @@ struct n2n_edge
     uint8_t             nat_echo_valid;    /* a NAT_PROBE cookie is waiting to be echoed */
     n2n_cookie_t        nat_echo_cookie;
     time_t              nat_probe_req_at;  /* when we last asked the supernode to probe us */
-    time_t              nat_probe_seen_at; /* last NAT_PROBE received, 0 = never */
+    time_t              nat_probe_seen_at; /* last real NAT_PROBE received, 0 = never */
+    time_t              nat_notify_at;     /* main-socket notification: supernode has fired a
+                                              probe round, so silence is the NAT refusing */
+    time_t              nat_fc_window_until; /* keep silent towards sn2 until this time, so
+                                                its main-socket probe arrives from a stranger
+                                                IP and proves (or not) full cone */
 
     /* ---- Relay: this edge acting as the relay peer (mini supernode) ---- */
     int                 relay_mode;

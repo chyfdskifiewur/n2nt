@@ -724,6 +724,8 @@ struct n2n_sn
     int                    backup_token_set;
     struct promoted_peer   promoted[PROMOTED_LIST_MAX]; /* ask-backup-verified sn1 edges */
     char                   backup_addr_text[256]; /* sn2 address (sn1 given via -b) */
+    n2n_sock_t             backup_sock;       /* resolved sn2, cached by send_brother_reg */
+    int                    backup_sock_ok;    /* 0 = never resolved, do not ask it to probe */
     time_t                 last_brother_seen;
     n2n_mac_t              device_mac;       /* local NIC MAC used as SN identity in brother_reg */
 };
@@ -1632,10 +1634,20 @@ static const char * sn_nat_type_name( uint8_t t )
     }
 }
 
-/* Ask an edge to echo a cookie, from the auxiliary socket. The edge answers on
- * its regular report, so a lost probe (port-restricted NAT) stays
- * distinguishable from a lost reply. The same helper port is used for every
- * edge: sending from a second port of the same address is the whole point. */
+/* Fire one NAT probe round at an edge, three ways at once:
+ *  1. helper socket x3: same address as the main socket, a random source port
+ *     the edge's NAT has no mapping for (stranger-port inbound, the
+ *     address- vs port-restricted test);
+ *  2. MAIN socket x1: a notification on the path that is certainly open. It
+ *     proves the round was actually fired even when the edge's NAT drops the
+ *     other probes, so "nothing arrived" can be read as a restriction instead
+ *     of an old/quiet supernode;
+ *  3. when a brother supernode is configured (-b), it is asked over the
+ *     brother_reg channel to fire the same cookie from ITS main socket: a
+ *     stranger IP on a port already proven to carry supernode traffic, which
+ *     is the reliable full-cone test (see build/nat-relay-design.md §10).
+ * The edge echoes the cookie back in its NAT_REPORT as soon as any real probe
+ * (1 or 3) reaches it. */
 static void sn_nat_probe_send( n2n_sn_t * sss, struct peer_info * peer, time_t now )
 {
     uint8_t             buf[N2N_SN_PKTBUF_SIZE];
@@ -1643,8 +1655,9 @@ static void sn_nat_probe_send( n2n_sn_t * sss, struct peer_info * peer, time_t n
     n2n_common_t        cmn;
     n2n_NAT_PROBE_t     probe;
     struct sockaddr_in  dst;
+    int                 k;
 
-    if ( sss->nat_helper_sock < 0 || peer->sock.family != AF_INET || peer->sock.port == 0 )
+    if ( peer->sock.family != AF_INET || peer->sock.port == 0 )
         return;
 
     memset( &cmn, 0, sizeof(cmn) );
@@ -1661,7 +1674,45 @@ static void sn_nat_probe_send( n2n_sn_t * sss, struct peer_info * peer, time_t n
     dst.sin_port   = htons( peer->sock.port );
     memcpy( &(dst.sin_addr), peer->sock.addr.v4, IPV4_SIZE );
 
-    sendto( sss->nat_helper_sock, buf, idx, 0, (struct sockaddr*)&dst, sizeof(dst) );
+    /* 1. helper socket: known IP, stranger port. */
+    for ( k = 0; k < N2N_NAT_PROBE_REPEAT; k++ )
+    {
+        if ( sss->nat_helper_sock >= 0 )
+            sendto( sss->nat_helper_sock, buf, idx, 0, (struct sockaddr*)&dst, sizeof(dst) );
+    }
+
+    /* 2. Main socket notification, exact endpoint the edge registers with. */
+    sendto_sock( sss, &peer->sock, buf, idx );
+
+    /* 3. Ask the brother supernode to fire from its main socket. The address
+     * is normally cached already by the startup brother_reg, but resolve on
+     * the spot if that has not run yet, so an edge registering within the
+     * first second still gets the full-cone test. */
+    if ( !sss->backup_sock_ok && sss->backup_addr_text[0] != 0 &&
+         resolve_brother_addr( sss->backup_addr_text, &sss->backup_sock ) == 0 )
+        sss->backup_sock_ok = 1;
+
+    if ( sss->backup_sock_ok && sss->backup_sock.family == AF_INET )
+    {
+        uint8_t                 reqbuf[N2N_SN_PKTBUF_SIZE];
+        size_t                  reqx = 0;
+        n2n_common_t            reqcmn;
+        n2n_BROTHER_NAT_REQ_t   req;
+
+        memset( &reqcmn, 0, sizeof(reqcmn) );
+        reqcmn.ttl = N2N_DEFAULT_TTL;
+        reqcmn.pc  = n2n_brother_nat_req;
+        memcpy( reqcmn.community, "brother_reg", 11 );
+
+        memset( &req, 0, sizeof(req) );
+        memcpy( req.cookie, probe.cookie, N2N_COOKIE_SIZE );
+        memcpy( req.target_mac, peer->mac_addr, N2N_MAC_SIZE );
+        req.target_sock = peer->sock;
+        memcpy( req.community, peer->community_name, N2N_COMMUNITY_SIZE );
+
+        encode_BROTHER_NAT_REQ( reqbuf, &reqx, &reqcmn, &req );
+        sendto_sock( sss, &sss->backup_sock, reqbuf, reqx );
+    }
 
     memcpy( peer->nat_probe_cookie, probe.cookie, N2N_COOKIE_SIZE );
     peer->nat_probe_pending = 1;
@@ -1669,16 +1720,13 @@ static void sn_nat_probe_send( n2n_sn_t * sss, struct peer_info * peer, time_t n
     peer->nat_probe_at      = now;
 }
 
-/* Supernode-side NAT upkeep. A probe that ran out of time is the authoritative
- * proof of a port-restricted NAT, so the timestamp is kept and only the
- * pending flag is dropped. */
+/* Supernode-side NAT upkeep. A probe that ran out of time means neither the
+ * helper socket nor the brother's main socket got anything back, so the
+ * timestamp is kept and only the pending flag is dropped. */
 static void sn_nat_tick( n2n_sn_t * sss, time_t now )
 {
     macstr_t            mac_buf;
     struct peer_info *  scan;
-
-    if ( sss->nat_helper_sock < 0 )
-        return;
 
     for ( scan = sss->edges; scan; scan = scan->next )
     {
@@ -1690,6 +1738,81 @@ static void sn_nat_tick( n2n_sn_t * sss, time_t now )
                         macaddr_str( mac_buf, scan->mac_addr ) );
         }
     }
+}
+
+/* sn2 side of the full-cone test: a brother sn1 asks us to probe one of its
+ * edges from THIS supernode's main socket. sn1 only asks during the edge's
+ * stranger window, so the edge has never sent us anything — a packet from our
+ * main socket reaching it proves its NAT admits any source address.
+ *
+ * Stateless by design: fire a few copies straight away and let sn1 follow the
+ * cookie echo. The sender must be a brother registered within 180s, matched
+ * on IP; the backup token was already enforced when that registration
+ * arrived, so it does not need to ride along here. */
+static int sn_handle_brother_nat_req( n2n_sn_t * sss, const struct sockaddr * sender_sock,
+                                      const n2n_common_t * cmn,
+                                      const uint8_t * udp_buf,
+                                      size_t * rem, size_t * idx, time_t now )
+{
+    n2n_sock_t              sender;
+    n2n_BROTHER_NAT_REQ_t   req;
+    n2n_common_t            outcmn;
+    n2n_NAT_PROBE_t         probe;
+    uint8_t                 outbuf[N2N_SN_PKTBUF_SIZE];
+    size_t                  outx = 0;
+    macstr_t                mac_buf;
+    n2n_sock_str_t          sockbuf;
+    int                     trusted = 0, j, k;
+
+    sock_from_sender( &sender, sender_sock );
+    if ( sender.family != AF_INET )
+        return 0;
+
+    if ( sss->last_brother_seen != 0 && now - sss->last_brother_seen <= 180 )
+    {
+        for ( j = 0; j < MAX_BROTHER_SNS; j++ )
+        {
+            n2n_brother_entry_t * b = &sss->brothers[j];
+            if ( b->seen != 0 && now - b->seen <= 180 &&
+                 b->sock.family == AF_INET &&
+                 0 == memcmp( b->sock.addr.v4, sender.addr.v4, IPV4_SIZE ) )
+            {
+                trusted = 1;
+                break;
+            }
+        }
+    }
+
+    if ( !trusted )
+    {
+        traceEvent( TRACE_WARNING, "Brother nat probe request from unregistered %s, ignored",
+                    sock_to_cstr( sockbuf, &sender ) );
+        return 0;
+    }
+
+    if ( 0 == decode_BROTHER_NAT_REQ( &req, cmn, udp_buf, rem, idx ) )
+        return 0;       /* truncated or malformed */
+
+    if ( req.target_sock.family != AF_INET || req.target_sock.port == 0 )
+        return 0;
+
+    memset( &outcmn, 0, sizeof(outcmn) );
+    outcmn.ttl = N2N_DEFAULT_TTL;
+    outcmn.pc  = n2n_nat_probe;
+    memcpy( outcmn.community, req.community, N2N_COMMUNITY_SIZE );
+    memcpy( probe.cookie, req.cookie, N2N_COOKIE_SIZE );
+
+    encode_NAT_PROBE( outbuf, &outx, &outcmn, &probe );
+
+    /* From the main socket — the port already carrying all supernode traffic. */
+    for ( k = 0; k < N2N_NAT_PROBE_REPEAT; k++ )
+        sendto_sock( sss, &req.target_sock, outbuf, outx );
+
+    traceEvent( TRACE_INFO, "Brother nat probe fired at edge %s on %s",
+                macaddr_str( mac_buf, req.target_mac ),
+                sock_to_cstr( sockbuf, &req.target_sock ) );
+
+    return 0;
 }
 
 /* Fill the address part of a PEER_INFO the same way the QUERY_PEER reply does,
@@ -2897,6 +3020,16 @@ static int process_udp( n2n_sn_t * sss,
     }
 
     --(cmn.ttl); /* The value copied into all forwarded packets. */
+
+    /* Brother-only traffic: sn1 asking us (sn2) to probe an edge from our
+     * main socket. Kept on the "brother_reg" pseudo-community so it is never
+     * mistaken for an edge message. */
+    if ( msg_type == n2n_brother_nat_req &&
+         memcmp( cmn.community, "brother_reg", 11 ) == 0 )
+    {
+        return sn_handle_brother_nat_req( sss, sender_sock, &cmn,
+                                          udp_buf, &rem, &idx, now );
+    }
 
     if ( msg_type == MSG_TYPE_PACKET )
     {
@@ -4375,6 +4508,14 @@ static void send_brother_reg(n2n_sn_t *sss, time_t now)
 
     /* Send to sn2 over the address family the resolver returned. */
     sendto_sock( sss, &backup_sock, pktbuf, idx );
+
+    /* Mirror the resolved address for NAT probe requests: the brother full-cone
+     * test is IPv4 only, so a v6-only backup does not enable it. */
+    if ( backup_sock.family == AF_INET )
+    {
+        sss->backup_sock    = backup_sock;
+        sss->backup_sock_ok = 1;
+    }
 
     traceEvent(TRACE_DEBUG, "Sent brother_reg to %s as %02x:%02x:%02x:%02x:%02x:%02x",
                sock_to_cstr(sockbuf, &backup_sock),

@@ -1070,16 +1070,20 @@ static void edge_nat_reset( n2n_edge_t * eee, time_t now )
     eee->nat_sample_next   = 0;
     eee->nat_fc_evid       = 0;
     eee->nat_addr_evid     = 0;
+    eee->nat_notify_at     = 0;
     eee->nat_probe_seen_at = 0;
     eee->nat_probe_req_at  = 0;
     eee->nat_reported      = N2N_NAT_UNKNOWN;
 
-    /* Measure and probe the new mapping from scratch, with the same settling
-     * burst the startup path uses. */
-    eee->nat_first_sample = now;
-    eee->nat_burst_left   = 3;
-    eee->nat_next_sample  = now;
-    eee->nat_probe_req    = 3;
+    /* New mapping: sn2 must first probe us from its main socket while its IP
+     * is still a stranger (full-cone test), and only afterwards become the
+     * second vantage point (symmetric test). Stay silent towards sn2 until
+     * the window closes; the settling burst starts right then. */
+    eee->nat_first_sample    = now;
+    eee->nat_fc_window_until = now + N2N_NAT_FC_WINDOW;
+    eee->nat_burst_left      = 3;
+    eee->nat_next_sample     = eee->nat_fc_window_until;
+    eee->nat_probe_req       = 1;
 }
 
 /** Turn the collected evidence into a verdict. Deliberately conservative:
@@ -1136,15 +1140,17 @@ static void edge_nat_verdict( n2n_edge_t * eee, time_t now )
     {
         eee->nat_type = N2N_NAT_ADDR_RESTRICTED;
     }
-    else if ( eee->nat_probe_seen_at != 0 && eee->nat_probe_req_at != 0 &&
-              eee->nat_probe_req_at > eee->nat_probe_seen_at &&
-              now - eee->nat_probe_req_at > 10 )
+    else if ( eee->nat_notify_at != 0 &&
+              eee->nat_fc_window_until != 0 && now >= eee->nat_fc_window_until )
     {
-        /* The supernode has proven it knows how to reach us from its
-         * auxiliary port, yet the most recent probe never came back: only the
-         * exact ip:port we talk to is admitted. A supernode that has never
-         * probed us at all is simply old code, whose silence must not be read
-         * as a restriction, so we stay at unknown in that case. */
+        /* The supernode fired a probe round (helper socket x3 plus, when it
+         * has a brother, the brother's main socket x3) and announced it over
+         * the one path that is certainly open — a packet from the exact
+         * supernode endpoint we talk to. The window has closed with neither
+         * a stranger-IP packet nor a stranger-port packet getting through, so
+         * only the exact ip:port we contact is admitted. An old supernode that
+         * never sends the notification leaves nat_notify_at at 0, so we stay
+         * at unknown rather than blaming a restriction on missing features. */
         eee->nat_type = N2N_NAT_PORT_RESTRICTED;
     }
 }
@@ -1779,7 +1785,11 @@ static void edge_nat_tick( n2n_edge_t * eee, time_t now )
 
     edge_nat_verdict( eee, now );
 
+    /* A pending probe request must go out right away: the stranger window is
+     * only a few seconds long, waiting for the 30s report period would close
+     * it before the brother supernode ever gets asked to probe. */
     if ( eee->nat_type != eee->nat_reported ||
+         eee->nat_probe_req > 0 ||
          now - eee->nat_last_report >= N2N_NAT_REPORT_INTERVAL )
         edge_nat_send_report( eee, now );
 }
@@ -4194,6 +4204,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                                     sock_to_cstr(sb2, &eee->nat_samples[i2].mapped));
             }
 
+            if (eee->nat_fc_window_until != 0 && now < eee->nat_fc_window_until)
+                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
+                                    ">   stranger window: open (%ds left)\n",
+                                    (int)(eee->nat_fc_window_until - now));
             if (eee->nat_fc_evid != 0)
                 msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                                     ">   unsolicited-inbound %ds ago\n",
@@ -4202,6 +4216,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                 msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                                     ">   stranger-port-inbound %ds ago\n",
                                     (int)(now - eee->nat_addr_evid));
+            if (eee->nat_notify_at != 0)
+                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
+                                    ">   supernode probe round %ds ago\n",
+                                    (int)(now - eee->nat_notify_at));
 
             msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                                 ">   relay willing: %u, relaying for: %u peer(s)\n",
@@ -5799,15 +5817,17 @@ process_n2n_packet:
 
                         /* Start NAT detection from the first real observation of
                          * our own public address (recorded above, on every ACK).
-                         * The burst of sn2 samples and the helper-port probe
-                         * request both wait for that first sighting. */
+                         * Open the stranger window first: sn2 probes us from its
+                         * main socket while we have never sent it anything, then
+                         * the burst of sn2 samples starts when the window ends. */
                         if ( eee->nat_first_sample == 0 && ra.sock.family == AF_INET &&
                              sender.family == AF_INET )
                         {
-                            eee->nat_first_sample = now;
-                            eee->nat_burst_left   = 3;
-                            eee->nat_next_sample  = now;
-                            eee->nat_probe_req    = 3;
+                            eee->nat_first_sample    = now;
+                            eee->nat_fc_window_until = now + N2N_NAT_FC_WINDOW;
+                            eee->nat_burst_left      = 3;
+                            eee->nat_next_sample     = eee->nat_fc_window_until;
+                            eee->nat_probe_req       = 1;
                         }
 
                         eee->register_lifetime = ra.lifetime;
@@ -5860,23 +5880,38 @@ process_n2n_packet:
         }
         else if(msg_type == n2n_nat_probe)
         {
-            /* The supernode probed us from its auxiliary socket: same address
-             * as the registration socket, different port. Reaching us at all
-             * means our NAT admits a source it never opened a mapping for,
-             * which edge_nat_classify has already recorded. Echo the cookie
-             * back so a silent drop stays distinguishable from a reply. */
+            /* Two meanings share this packet type:
+             *  - from the EXACT supernode endpoint we register with: the
+             *    notification that a probe round was fired. It rides the one
+             *    path that is certainly open, so receiving it proves the
+             *    helper/brother probes were actually sent; it is not a probe
+             *    itself, so no echo.
+             *  - from anything else: a real probe — the supernode's helper
+             *    socket (known IP, stranger port -> addr evidence already
+             *    recorded by edge_nat_classify) or the brother supernode's
+             *    main socket (stranger IP -> full-cone evidence). Echo its
+             *    cookie so a silent drop stays distinguishable from a reply. */
             n2n_NAT_PROBE_t np;
 
             decode_NAT_PROBE( &np, &cmn, udp_buf, &rem, &idx );
 
-            memcpy( eee->nat_echo_cookie, np.cookie, N2N_COOKIE_SIZE );
-            eee->nat_echo_valid   = 1;
-            eee->nat_probe_seen_at = now;
+            if ( sender.family == AF_INET &&
+                 sock_equal( &sender, &eee->supernode ) == 0 )
+            {
+                eee->nat_notify_at = now;
+                traceEvent( TRACE_INFO, "Rx NAT probe notification from supernode" );
+            }
+            else
+            {
+                memcpy( eee->nat_echo_cookie, np.cookie, N2N_COOKIE_SIZE );
+                eee->nat_echo_valid    = 1;
+                eee->nat_probe_seen_at = now;
 
-            traceEvent( TRACE_INFO, "Rx NAT_PROBE from %s",
-                        sock_to_cstr(sockbuf1, &sender) );
+                traceEvent( TRACE_INFO, "Rx NAT_PROBE from %s",
+                            sock_to_cstr(sockbuf1, &sender) );
 
-            edge_nat_send_report( eee, now );
+                edge_nat_send_report( eee, now );
+            }
         }
         else if(msg_type == n2n_deregister)
         {
