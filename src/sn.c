@@ -3603,17 +3603,16 @@ static int process_udp( n2n_sn_t * sss,
                      use_request_ip, use_requested_ip );
 
         /* Edge metadata changed while staying in the table (==2 NAT type
-         * changed, ==3 address changed: "n" refresh / CGNAT re-map): push a
+         * changed, ==3 address changed: CGNAT re-map): push a
          * fresh PEER_INFO so peers stop pointing at the abandoned endpoint. */
         if ( is_new_edge == 2 || is_new_edge == 3 )
             push_nat_to_community( sss,
                                    find_peer_by_mac(sss->edges, reg.edgeMac),
                                    cmn.community );
 
-        /* New (or re-mapped) edge — or one that asked for a manual NAT
-         * re-probe (N2N_AFLAGS_NAT_REPROBE, mgmt "n"): give the brother SN a
-         * one-shot chance to full-cone-probe it as a never-contacted source. */
-        if ( is_new_edge || (reg.aflags & N2N_AFLAGS_NAT_REPROBE) )
+        /* New (or re-mapped) edge: give the brother SN a one-shot chance to
+         * full-cone-probe it as a never-contacted source. */
+        if ( is_new_edge )
             send_fc_probe_request( sss, reg.edgeMac, &(ack.sock), now );
 
         /* Bounce-round notice ("N2NN", 4 raw bytes) from OUR MAIN socket: the

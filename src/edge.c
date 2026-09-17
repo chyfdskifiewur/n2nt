@@ -79,9 +79,12 @@
 
 /* NAT detection timing: the brother's N2NF probes only count this long after
  * a mapping appears, and a reflection observation older than the TTL says
- * nothing about the live mapping. */
+ * nothing about the live mapping. Two observations may only be compared as a
+ * pair when they were taken this close together: mapping behaviour can only
+ * be read from two samples of the SAME, still-live mapping. */
 #define N2N_FC_WINDOW_SECS              8
 #define N2N_NAT_SEEN_TTL                120
+#define N2N_NAT_PAIR_SECS               5
 
 /* Portable temporary buffer macros - avoids C99 compound literals which
  * cause issues on older ARM compilers (GCC 4.x / ARMv5). */
@@ -395,6 +398,7 @@ static int edge_init(n2n_edge_t * eee)
     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
     eee->nat_seen_sn1_at = 0;
     eee->nat_seen_sn2_at = 0;
+    eee->nat_sn2_contact_at = 0;
     eee->nat_probe_time = n2n_now(); /* anchor to start-of-run, not t=0: a slow startup (DNS, retries) must not let the 60s periodic fire before the mapping is live */
     eee->nat_probe_pending = 0;
     eee->nat_bounce_seen = 0;
@@ -402,7 +406,6 @@ static int edge_init(n2n_edge_t * eee)
     eee->fc_window_until = n2n_now() + N2N_FC_WINDOW_SECS; /* the brother's N2NF probes only land in the first seconds of a mapping */
     eee->nat_probe_notified = 0;
     eee->fc_arm_time = n2n_now(); /* quick probe fires 12s after start; anchoring keeps the stranger window open until the brother's N2NF probes land */
-    eee->nat_reprobe = 0;
     eee->sn_query_index = 1;
     eee->sn_backup_index = 1;
     eee->sn_af = AF_UNSPEC;
@@ -1437,15 +1440,6 @@ static void send_register_super( n2n_edge_t * eee,
         /* Report the NAT type measured via reflection + bounce test so the
          * supernode can show it per edge in its mgmt list. */
         reg.aflags |= N2N_NAT_AFLAGS( eee->nat_type );
-
-        /* One-shot manual NAT re-probe (mgmt "n"): ask the SN to re-trigger
-         * the brother's N2NF probe even though this registration is not a
-         * new/remapped edge. */
-        if ( eee->nat_reprobe )
-        {
-            reg.aflags |= N2N_AFLAGS_NAT_REPROBE;
-            eee->nat_reprobe = 0;
-        }
     }
 
     /* Relay stance advertised to SN for community-relay selection:
@@ -1521,6 +1515,12 @@ static void send_register_super( n2n_edge_t * eee,
         edge_send_to_sn(eee, pktbuf, idx);
     else
         sendto_sock( sock_for_dest(eee, supernode), pktbuf, idx, supernode );
+
+    /* Remember the first contact with the sn2 query channel: the full-cone
+     * test (an "N2NF" probe from sn2) is only valid while sn2 is a source
+     * this edge has never sent to. */
+    if ( supernode == &(eee->sn_query) && eee->nat_sn2_contact_at == 0 )
+        eee->nat_sn2_contact_at = n2n_now();
 
     /* Also register via alternate address family so supernode knows both our addresses.
      * WS mode only uses a single WS connection, skip alt family registration.
@@ -2725,6 +2725,7 @@ static void nat_classify( n2n_edge_t * eee )
     uint8_t new_type;
     int pub1, pub2, seen1, seen2;
     time_t now = n2n_now();
+    n2n_sock_str_t sockbuf1, sockbuf2;
 
     /* Only observations of the CURRENT mapping count: one older than the TTL
      * (or from before the last re-map) may describe a dead mapping. */
@@ -2748,11 +2749,46 @@ static void nat_classify( n2n_edge_t * eee )
         new_type = N2N_NAT_FULL_CONE;
     else if ( pub1 && pub2 )
     {
-        /* Two public observations: compare the mappings toward two
-         * different destinations. */
+        /* Two public observations: mapping behaviour can only be read from a
+         * PAIR - two samples of the same, still-live mapping, taken back to
+         * back toward two different destinations. Comparing samples taken
+         * apart straddles a re-mapped NAT (which then looks symmetric), and
+         * two echoes from one single destination carry no information at all
+         * (that observation is stored twice, once per channel). */
+        /* Two different destinations are the precondition for the whole test;
+         * while the query channel IS the current supernode there is only one
+         * vantage point and no comparison is possible. */
+        int distinct = ( eee->sn_query.family == AF_INET &&
+                         eee->supernode.family != 0 &&
+                         sock_equal( &eee->sn_query, &eee->supernode ) != 0 );
+        long pair_dt = (long)( eee->nat_seen_sn1_at - eee->nat_seen_sn2_at );
+        if ( pair_dt < 0 )
+            pair_dt = -pair_dt;
+
+        if ( !distinct || pair_dt > N2N_NAT_PAIR_SECS )
+        {
+            if ( distinct )
+            {
+                /* No valid pair yet: measure again instead of guessing. Refresh
+                 * whichever observation is the stale side so the next two
+                 * samples form a pair; any verdict already held is deliberately
+                 * kept until they do. */
+                if ( eee->nat_seen_sn1_at <= eee->nat_seen_sn2_at )
+                    send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+                else
+                    eee->fc_arm_time = now - 12; /* arm the quick sn2 probe */
+            }
+            return;
+        }
+
         if ( memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
              eee->nat_seen_sn1.port != eee->nat_seen_sn2.port )
+        {
+            traceEvent( TRACE_NORMAL, "NAT mapping differs: sn1 sees %s, sn2 sees %s",
+                        sock_to_cstr( sockbuf1, &eee->nat_seen_sn1 ),
+                        sock_to_cstr( sockbuf2, &eee->nat_seen_sn2 ) );
             new_type = N2N_NAT_SYMMETRIC;
+        }
         else if ( eee->nat_bounce_seen )
             new_type = N2N_NAT_RESTRICTED;
         else if ( eee->nat_probe_notified != 0 && now > eee->fc_window_until )
@@ -2777,11 +2813,11 @@ static void nat_classify( n2n_edge_t * eee )
     else
         new_type = N2N_NAT_UNKNOWN; /* in-LAN observation proves nothing */
 
-    /* A partial observation set (e.g. right after the fixed-port restore of
-     * an "n" refresh, while only one mapping's echo has returned) derives
-     * UNKNOWN — never let that erase a verdict the edge already holds. A
-     * genuine mapping change already reset nat_type to UNKNOWN itself before
-     * re-classification, so real transitions are unaffected. */
+    /* A partial observation set (e.g. right after a mapping change, while only
+     * one mapping's echo has returned) derives UNKNOWN — never let that erase a
+     * verdict the edge already holds. A genuine mapping change already reset
+     * nat_type to UNKNOWN itself before re-classification, so real transitions
+     * are unaffected. */
     if ( new_type == N2N_NAT_UNKNOWN && eee->nat_type != N2N_NAT_UNKNOWN )
         return;
 
@@ -2875,16 +2911,20 @@ static void handle_nat_notify( n2n_edge_t * eee, const n2n_sock_t * sender )
 }
 
 /* Full-cone probe ("N2NF", 4 raw bytes) from the sn2 query channel.
- * Counts only while the current mapping is young (fc_window_until): sn2 is
- * then a never-contacted source, so delivery proves the NAT filter admits
- * ANY source -> full cone. The probe must come from sn2's MAIN socket (the
- * very address we would contact) — a helper port on the same host is not the
- * never-contacted source, and neither is a brother sharing sn1's public IP,
- * which our registrations have already whitelisted. */
+ * Counts only while the current mapping is young (fc_window_until) AND while
+ * sn2 is still a source this edge has never sent to: delivery then proves the
+ * NAT filter admits ANY source -> full cone. The probe must come from sn2's
+ * MAIN socket (the very address we would contact) — a helper port on the same
+ * host is not the never-contacted source, and neither is a brother sharing
+ * sn1's public IP, which our registrations have already whitelisted. Once we
+ * have sent to sn2, a delivered probe only shows the filter admits a
+ * destination we already contacted, so it is no evidence at all. */
 static void handle_nat_fc( n2n_edge_t * eee, const n2n_sock_t * sender )
 {
     if ( eee->fc_window_until == 0 || n2n_now() > eee->fc_window_until )
         return; /* current mapping is no stranger any more */
+    if ( eee->nat_sn2_contact_at != 0 )
+        return; /* sn2 is not a never-contacted source: probe proves nothing */
     if ( sender->family != AF_INET || nat_addr_private( sender->addr.v4 ) )
         return;
     if ( eee->sn_query.family != AF_INET ||
@@ -2970,7 +3010,7 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
      * second destination (nat_classify). Skipped while failover/ask_backup
      * is active and when sn_query IS the current supernode (its ACK already
      * provides the second observation). Two triggers share one action: quick
-     * (12s after fc_arm_time, which startup/remap/mgmt "n" re-arm — by then
+     * (12s after fc_arm_time, which startup/remap re-arm — by then
      * the stranger window has elapsed, so sn2's N2NF probes have had their
      * say) and periodic (60s safety net keeping the observations within their
      * TTL). Never fires inside the stranger window: a probe there would
@@ -4111,8 +4151,6 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                                 "  -       Decrease verbosity of logging\n"
                                 "  b       Toggle bypass on/off\n"
                                 "  f       Sync peers with supernode\n"
-                                "  n       Re-run NAT type detection\n"
-                                "          (briefly drops the network link, use with care)\n"
                                 "  <enter> Display statistics\n\n");
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
@@ -4160,71 +4198,6 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             eee->last_register_req = n2n_now();
             msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                                 "> peer sync started...\n");
-            sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
-                   (struct sockaddr*) &sender_sock, i);
-            return;
-        }
-
-        if (recvlen >= 1 && 0 == memcmp(udp_buf, "n", 1)) {
-            msg_len = 0;
-            /* A second observation point (the sn2 query channel) is needed:
-             * without it there is nothing to compare against. */
-            if ( eee->sn_query.family == 0 ) {
-                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
-                                    "> no query channel yet (brother not learned)\n");
-                sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
-                       (struct sockaddr*) &sender_sock, i);
-                return;
-            }
-            /* Rebind a fresh random local port: the NAT mapping is brand-new
-             * and its source whitelist is empty again, so the brother's N2NF
-             * probe is a true stranger and the coming classification is
-             * accurate by construction. Everything after this is handled by
-             * the automatic remap path: the first REGISTER_ACK shows a
-             * changed my_public_sock, which wipes the old verdict, re-arms
-             * the stranger window and re-runs the full detection. */
-            eee->nat_suppress_remap = 0; /* drop any leftover flag from a previous revert */
-            closesocket(eee->udp_sock);   eee->udp_sock  = -1;
-            if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
-            if (setup_sockets(eee, 0 /* random port */) < 0) {
-                eee->nat_revert_at = 0;
-                /* Try to bring the main socket back before giving up. */
-                if (eee->local_port != 0)
-                    setup_sockets(eee, (int)eee->local_port);
-                else
-                    setup_sockets(eee, 0);
-                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
-                                    "> socket rebind failed, NAT refresh aborted\n");
-                sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
-                       (struct sockaddr*) &sender_sock, i);
-                return;
-            }
-            /* sn1 registration fires at once: the NAT_REPROBE bit asks the SN
-             * to re-trigger the brother's N2NF probe while the fresh-mapping
-             * stranger window is still open. Arm that window here rather than
-             * waiting for the ACK: the brother's probes are launched the
-             * moment the SN handles this registration, i.e. before the ACK
-             * makes it back. */
-            eee->fc_window_until = n2n_now() + N2N_FC_WINDOW_SECS;
-            eee->nat_probe_notified = 0;
-            if ( eee->supernode.family != 0 )
-            {
-                eee->nat_reprobe = 1; /* one-shot, consumed by send_register_super */
-                send_register_super( eee, &(eee->supernode), 1, 0, NULL );
-            }
-            if (eee->local_port != 0) {
-                /* Fixed-port mode: stay on the random port until the probe window
-                 * (bounce + N2NF + quick probe) is done, then the main loop rebinds
-                 * the configured port. The random-mapping verdict is kept — NAT type
-                 * is a property of the NAT device, not of the port probed on. */
-                eee->nat_revert_at = n2n_now() + 15;
-                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
-                                    "> NAT refresh: probing on a fresh random port, fixed port restored in ~15s\n");
-            } else {
-                eee->nat_revert_at = 0;
-                msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
-                                    "> NAT refresh: probing on a fresh random port\n");
-            }
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
             return;
@@ -5907,65 +5880,48 @@ process_n2n_packet:
                             /* Store our public address as seen by supernode, log if it changed. */
                             n2n_sock_t old_pub = eee->my_public_sock;
                             eee->my_public_sock = ra.sock;
-                            int suppress_ack = 0; /* fixed-port restore: keep verdict, skip observations */
                             if (old_pub.family != 0 &&
                                 sock_equal(&old_pub, &eee->my_public_sock) != 0)
                             {
                                 traceEvent(TRACE_NORMAL, "Our public address changed to %s",
                                            sock_to_cstr(sockbuf1, &eee->my_public_sock));
-                                if (eee->nat_suppress_remap) {
-                                    /* Fixed-port restore of an "n" refresh: the verdict
-                                     * already measured on the random mapping stands —
-                                     * just adopt the new public address. */
-                                    eee->nat_suppress_remap = 0;
-                                    suppress_ack = 1;
-                                    traceEvent(TRACE_DEBUG, "NAT refresh: fixed-port restore keeps the fresh NAT verdict");
-                                }
-                                else
-                                {
-                                    /* Fresh mapping: whitelist empty again — restart
-                                     * classification; old observations are dead. */
-                                    eee->nat_type = N2N_NAT_UNKNOWN;
-                                    memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
-                                    memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
-                                    eee->nat_seen_sn1_at = 0;
-                                    eee->nat_seen_sn2_at = 0;
-                                    eee->nat_bounce_seen = 0;
-                                    eee->fc_seen = 0;
-                                    /* The new mapping is a stranger again: the
-                                     * brother's N2NF probes count in the next
-                                     * seconds, and a bounce round must be
-                                     * announced for this mapping too. */
-                                    eee->fc_window_until = now + N2N_FC_WINDOW_SECS;
-                                    eee->nat_probe_notified = 0;
-                                    /* Re-arm a quick probe 12s out: a QUERY_ONLY sn2
-                                     * probe firing right at the remap would slam the
-                                     * fresh stranger window before the brother's N2NF
-                                     * probes land; fc_arm_time schedules one instead. */
-                                    eee->nat_probe_time = now;
-                                    eee->fc_arm_time = now;
-                                }
+                                /* Fresh mapping: whitelist empty again — restart
+                                 * classification; old observations are dead. */
+                                eee->nat_type = N2N_NAT_UNKNOWN;
+                                memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
+                                memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
+                                eee->nat_seen_sn1_at = 0;
+                                eee->nat_seen_sn2_at = 0;
+                                eee->nat_bounce_seen = 0;
+                                eee->fc_seen = 0;
+                                /* The new mapping is a stranger again: the
+                                 * brother's N2NF probes count in the next
+                                 * seconds, and a bounce round must be
+                                 * announced for this mapping too. */
+                                eee->fc_window_until = now + N2N_FC_WINDOW_SECS;
+                                eee->nat_probe_notified = 0;
+                                /* Re-arm a quick probe 12s out: a QUERY_ONLY sn2
+                                 * probe firing right at the remap would slam the
+                                 * fresh stranger window before the brother's N2NF
+                                 * probes land; fc_arm_time schedules one instead. */
+                                eee->nat_probe_time = now;
+                                eee->fc_arm_time = now;
                             }
 
                             /* First observation for classification: which sn answered
                              * (by sender, not sn_idx — ask_backup leaves sn_idx 0 while
-                             * sn2 replies). The suppressed restore ACK is skipped: its
-                             * fixed-mapping echo must not mix with random-mapping
-                             * observations (that would look symmetric). */
-                            if ( !suppress_ack )
+                             * sn2 replies). */
+                            if ( sock_equal( &sender, &eee->sn_query ) == 0 )
                             {
-                                if ( sock_equal( &sender, &eee->sn_query ) == 0 )
-                                {
-                                    eee->nat_seen_sn2 = ra.sock;
-                                    eee->nat_seen_sn2_at = now;
-                                    nat_classify( eee );
-                                }
-                                else
-                                {
-                                    eee->nat_seen_sn1 = ra.sock;
-                                    eee->nat_seen_sn1_at = now;
-                                    nat_classify( eee );
-                                }
+                                eee->nat_seen_sn2 = ra.sock;
+                                eee->nat_seen_sn2_at = now;
+                                nat_classify( eee );
+                            }
+                            else
+                            {
+                                eee->nat_seen_sn1 = ra.sock;
+                                eee->nat_seen_sn1_at = now;
+                                nat_classify( eee );
                             }
                         }
 
@@ -7655,43 +7611,6 @@ static int run_loop(n2n_edge_t * eee )
         fd_set socket_mask;
         struct timeval wait_time;
         time_t nowTime;
-
-        /* Fixed-port refresh: after the random-port probe window elapses,
-         * rebind the configured port. Classification already completed on the
-         * random mapping; the one-shot suppression below keeps that verdict
-         * when the first ACK arrives on the restored port. */
-        if (eee->nat_revert_at != 0 && n2n_now() >= eee->nat_revert_at) {
-            eee->nat_revert_at = 0;
-            closesocket(eee->udp_sock);  eee->udp_sock = -1;
-            if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
-            /* Keep the random-mapping verdict but drop its observations:
-             * they belong to the dead mapping and would mix with fresh
-             * fixed-mapping echoes into a bogus "symmetric". */
-            memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
-            memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
-            eee->nat_seen_sn1_at = 0;
-            eee->nat_seen_sn2_at = 0;
-            eee->nat_bounce_seen = 0;
-            /* Re-collect observations quickly (12s) so sn1/sn2 agree again. */
-            eee->nat_probe_time = n2n_now();
-            eee->fc_arm_time = n2n_now();
-            eee->fc_window_until = n2n_now() + N2N_FC_WINDOW_SECS;
-            eee->nat_probe_notified = 0;
-            eee->nat_suppress_remap = 1; /* first ACK updates my_public_sock only, keeps the verdict */
-            if (setup_sockets(eee, (int)eee->local_port) < 0)
-                traceEvent(TRACE_ERROR, "NAT refresh: rebind to fixed port %u failed",
-                           (unsigned int)eee->local_port);
-            else {
-                traceEvent(TRACE_NORMAL, "NAT refresh: local port restored to %u",
-                           (unsigned int)eee->local_port);
-                /* Re-register at once so the SN (and, via the SN's address-change
-                 * push, every peer) learns the restored fixed-port endpoint instead
-                 * of the abandoned random one. */
-                send_register_super( eee, &(eee->supernode), 1, 0, NULL );
-                eee->sn_wait = 1;
-                eee->last_register_req = n2n_now();
-            }
-        }
 
         FD_ZERO(&socket_mask);
         FD_SET(eee->udp_sock, &socket_mask);

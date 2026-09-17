@@ -591,6 +591,9 @@ struct n2n_edge
     n2n_sock_t          nat_seen_sn2;   /* edge addr observed by sn2 (family=0 if none) */
     time_t              nat_seen_sn1_at; /* when sn1's observation was taken (0 = none) */
     time_t              nat_seen_sn2_at; /* when sn2's observation was taken (0 = none) */
+    time_t              nat_sn2_contact_at; /* first time we sent anything to the sn2 query
+                                           channel (0 = never). The full-cone test needs sn2
+                                           to be a source this edge has never sent to. */
     time_t              nat_probe_time; /* last periodic NAT probe tick */
     uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
     uint8_t             nat_bounce_seen;   /* a public helper-port bounce arrived */
@@ -603,12 +606,6 @@ struct n2n_edge
                                            an armed window gets its quick NAT re-probe
                                            12s later instead of waiting for the 60s
                                            periodic tick */
-    uint8_t             nat_reprobe;    /* one-shot: next sn1 registration asks the SN to
-                                           re-trigger the brother's N2NF probe (mgmt "n") */
-    time_t              nat_revert_at;  /* mgmt "n" in fixed-port mode: rebind the configured
-                                           local port again once this time is reached (0 = none) */
-    uint8_t             nat_suppress_remap; /* one-shot: next ACK-remap only updates
-                                           my_public_sock, keeps the fresh NAT verdict */
 
     n2n_sock_t          own_ipv6;       /* routable global IPv6 (GUA) of this edge,
                                            reported to supernode for IPv6 hole-punching

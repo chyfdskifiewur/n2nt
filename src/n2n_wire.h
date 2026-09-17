@@ -183,9 +183,6 @@ typedef struct n2n_PACKET n2n_PACKET_t;
                                         /* neither set = default "can be" relay (secondary) */
 #define N2N_AFLAGS_QUERY_ONLY     0x0010  /* REGISTER_SUPER is a one-shot query: ACK but do NOT
                                              register/persist this edge as a peer */
-#define N2N_AFLAGS_NAT_REPROBE    0x4000  /* edge asks the sn to re-trigger the brother's full-cone
-                                             "N2NF" probe even though this registration is not a
-                                             new/remapped edge (mgmt "n" re-runs NAT detection) */
 
 struct n2n_REGISTER_SUPER
 {
