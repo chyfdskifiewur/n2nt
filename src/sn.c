@@ -11,7 +11,6 @@
 #include "n2n.h"
 #include "n2n_transforms.h"
 #include "n2n_wire.h"
-#include "random.h"
 #include <fcntl.h>
 
 /* Community-relay announcement gate: only announce the community relay peer
@@ -19,7 +18,7 @@
  * least this many seconds. The first few seconds of hole-punching traffic
  * are expected (punches always start out via the SN) and must not trigger
  * the announcement. */
-#define SN_RELAY_ADVERT_ACTIVE_SECS  5
+#define SN_RELAY_ADVERT_ACTIVE_SECS  3
 
 /* forward declarations - needed by run_loop before their definitions */
 struct n2n_sn;
@@ -708,14 +707,9 @@ struct n2n_sn
      * and each slot holds its own v4/v6 socket + last-seen timestamp. */
     n2n_brother_entry_t    brothers[MAX_BROTHER_SNS];
     SOCKET              mgmt_sock;      /* management socket. */
-    SOCKET              nat_helper_sock;/* Auxiliary socket used only to send NAT probes
-                                         * from a second source port. Same local address
-                                         * as the registration socket, random port, outbound
-                                         * only and never in the select set: an edge seeing
-                                         * a probe from a known IP on a port it never talked
-                                         * to is exactly what identifies an
-                                         * address-restricted (rather than port-restricted)
-                                         * NAT. */
+    SOCKET              bounce_sock;    /* NAT bounce-test helper socket (random
+                                         * source port, outbound-only; replies
+                                         * "N2NB" to edges requesting a bounce). */
     SOCKET              ws_listen_sock; /* TCP listen socket for WebSocket (same as lport). */
 #define N2N_SN_MAX_WS 64
     ws_conn_t           ws_conns[N2N_SN_MAX_WS]; /* WS connection table (edge connected via WS). */
@@ -737,6 +731,12 @@ struct n2n_sn
     char                   backup_addr_text[256]; /* sn2 address (sn1 given via -b) */
     time_t                 last_brother_seen;
     n2n_mac_t              device_mac;       /* local NIC MAC used as SN identity in brother_reg */
+    /* Deferred full-cone probes: N2NF #1 fires on FCP arrival, #2/#3 are
+     * staggered so a re-mapped edge has already re-armed its stranger
+     * window (its own ACK wins the race against probe #1). */
+#define FC_PROBE_MAX 16
+#define FC_PROBE_SPREAD 2   /* seconds between the 3 sends */
+    struct { n2n_sock_t target; time_t due; uint8_t left; } fc_probes[FC_PROBE_MAX];
 };
 
 typedef struct n2n_sn n2n_sn_t;
@@ -977,6 +977,7 @@ static int update_edge( n2n_sn_t * sss,
                         time_t now,
                         const char * version,
                         const char * os_name,
+                        uint8_t nat_type,
                         uint8_t request_ip,
                         uint32_t requested_ip );
 
@@ -1008,7 +1009,7 @@ static int init_sn( n2n_sn_t * sss )
     sss->sock = -1;
     sss->sock6 = -1;
     sss->mgmt_sock = -1;
-    sss->nat_helper_sock = -1;
+    sss->bounce_sock = -1;
     sss->ws_listen_sock = -1;
     {
         int wi;
@@ -1061,11 +1062,11 @@ static void deinit_sn( n2n_sn_t * sss )
     }
     sss->mgmt_sock = -1;
 
-    if ( sss->nat_helper_sock >= 0 )
+    if ( sss->bounce_sock >= 0 )
     {
-        closesocket(sss->nat_helper_sock);
+        closesocket(sss->bounce_sock);
     }
-    sss->nat_helper_sock = -1;
+    sss->bounce_sock = -1;
 
     if ( sss->ws_listen_sock >= 0 )
     {
@@ -1167,12 +1168,14 @@ static int update_edge( n2n_sn_t * sss,
                         time_t now,
                         const char * version,
                         const char * os_name,
+                        uint8_t nat_type,
                         uint8_t request_ip,
                         uint32_t requested_ip )
 {
     macstr_t            mac_buf;
     n2n_sock_str_t      sockbuf;
     struct peer_info *  scan;
+    uint8_t             nat_changed = 0; /* reported NAT type differs from stored */
 
     traceEvent( TRACE_DEBUG, "update_edge for %s %s",
                 macaddr_str( mac_buf, edgeMac ),
@@ -1340,7 +1343,7 @@ static int update_edge( n2n_sn_t * sss,
         } else {
             strcpy(scan->os_name, "unknown");
         }
-        scan->nat_type = N2N_NAT_UNKNOWN;   /* verdict arrives via NAT_REPORT */
+        scan->nat_type = nat_type;
 
         /* insert this guy at the head of the edges list */
         scan->next = sss->edges;
@@ -1383,9 +1386,11 @@ static int update_edge( n2n_sn_t * sss,
         /* Known */
 
         /* Refresh identity/metadata on every registration regardless of
-         * address changes. (The NAT type is not part of this any more: it
-         * arrives in the edge's own n2n_nat_report(14) message and is stored
-         * there.) */
+         * address changes. Repeat registrations carry a stable IP:port
+         * (the edge socket does not move), so the addr_changed guard below
+         * would otherwise skip this block and a NAT type learned later
+         * (after the first, NAT-less registration) would never land on
+         * this edge. */
         if (version) {
             strncpy(scan->version, version, sizeof(scan->version) - 1);
             scan->version[sizeof(scan->version) - 1] = '\0';
@@ -1393,6 +1398,14 @@ static int update_edge( n2n_sn_t * sss,
         if (os_name) {
             strncpy(scan->os_name, os_name, sizeof(scan->os_name) - 1);
             scan->os_name[sizeof(scan->os_name) - 1] = '\0';
+        }
+        if (nat_type) {
+            if (nat_type != scan->nat_type ||
+                (now - scan->last_nat_push) >= 300) { /* re-push same value every 5 min: heals a lost PEER_INFO */
+                nat_changed = 1;
+                scan->last_nat_push = now;
+            }
+            scan->nat_type = nat_type;
         }
 
         /* Update assigned IP if edge requests a different valid IP */
@@ -1533,7 +1546,9 @@ static int update_edge( n2n_sn_t * sss,
     }
 
     scan->last_seen = now;
-    return 0;
+    return nat_changed ? 2 : 0;  /* 2 = unchanged address but NAT type changed:
+                                    peers need a fresh PEER_INFO push;
+                                    3 = known edge, address changed (see above) */
 }
 
 
@@ -2290,294 +2305,127 @@ static int try_broadcast( n2n_sn_t * sss,
     return 0;
 }
 
-/* ================= NAT detection support ==========================
- * The edge measures its own NAT type but cannot test one thing by itself:
- * whether its NAT admits an inbound packet from a source it has never sent to
- * (address-restricted) or refuses anything but the exact ip:port it contacts
- * (port-restricted). That needs a probe from someone else, on a port the edge
- * has no mapping for. See the n2n_nat_probe / n2n_nat_report comments in
- * n2n_wire.h for the wire side and edge_nat_* in edge.c for the verdict.
- * ================================================================= */
+/* ------------------------------------------------------------------ */
+/* Full-cone probe (plan C): the edge's NAT filter whitelist is per
+ * mapping and starts empty. A source the edge has NEVER contacted can
+ * therefore only get through a full-cone NAT. When a brother SN forwards
+ * a brand-new edge mapping ("N2NF" + mac + IPv4 + port, 16 raw bytes),
+ * we fire 3 tiny "N2NF" datagrams at it from our main socket — by
+ * construction a never-contacted source. The edge accepts the probe only
+ * from its sn2 query channel IP and only before its first packet there. */
 
-static const char * sn_nat_type_name( uint8_t t )
+/* N2NF full-cone probe request from the brother SN (16 raw bytes, not n2n):
+ * sender must be a live brother (IP-level match). Fire 3 UDP packets at the
+ * forwarded edge mapping from a source the edge never contacted; the first
+ * arrives now, #2/#3 are staggered via fc_probes_tick in the main loop so a
+ * just-remapped edge's re-armed "stranger window" is hit by the later ones. */
+static void handle_fc_probe_request( n2n_sn_t *sss,
+                                     const struct sockaddr *sender_sock,
+                                     const uint8_t *udp_buf,
+                                     time_t now )
 {
-    switch ( t )
-    {
-    case N2N_NAT_FULL_CONE:       return "full-cone";
-    case N2N_NAT_ADDR_RESTRICTED: return "addr-restr";
-    case N2N_NAT_PORT_RESTRICTED: return "port-restr";
-    case N2N_NAT_SYMMETRIC:       return "symmetric";
-    default:                      return "unknown";
-    }
-}
+    n2n_sock_str_t sockbuf;
+    n2n_sock_t sender_n2n, target;
+    static const uint8_t msg[4] = { 'N', '2', 'N', 'F' };
+    static const uint8_t zero[6] = { 0 };
+    int i, from_brother = 0;
 
-/* Ask up to two other edges of the same community to fire NAT_PROBEs at this
- * peer from their own communication sockets. Nothing new is bound: the source
- * is a socket that already carries n2n traffic and is explicitly forwarded
- * wherever UPnP installed a mapping, which is what makes an arrival
- * trustworthy. Only arrival carries meaning — a candidate that has already
- * exchanged traffic with the target yields no full-cone proof, so two with
- * distinct addresses are tried and the brother supernode (a stranger by
- * construction) remains the primary test.
- * Silence is never read as a restriction on this path: there is no
- * notification channel here, so a probe that never arrives simply proves
- * nothing. */
-static void sn_nat_ask_edges( n2n_sn_t * sss, struct peer_info * target, time_t now,
-                              const n2n_cookie_t cookie )
-{
-    struct peer_info *  scan;
-    n2n_sock_t          used[2];
-    int                 used_n = 0, asked = 0;
-
-    for ( scan = sss->edges; scan && asked < 2; scan = scan->next )
-    {
-        uint8_t                 reqbuf[N2N_SN_PKTBUF_SIZE];
-        size_t                  reqx = 0;
-        n2n_common_t            reqcmn;
-        n2n_NAT_PROBE_REQ_t     req;
-        int                     j, dup = 0;
-
-        if ( scan == target )
-            continue;
-        if ( 0 != memcmp( scan->community_name, target->community_name, N2N_COMMUNITY_SIZE ) )
-            continue;
-        if ( scan->sock.family != AF_INET || scan->sock.port == 0 )
-            continue;
-        if ( scan->last_seen == 0 || now - scan->last_seen > 120 )
-            continue;
-        /* Peers sharing the target's public address are deliberately NOT
-         * excluded: they still probe from their own external port, which is a
-         * usable signal, and a coarser verdict in that case is accepted rather
-         * than dropping half the community's candidates. What it cannot give is
-         * a full-cone proof. */
-
-        for ( j = 0; j < used_n; j++ )
-        {
-            if ( 0 == memcmp( used[j].addr.v4, scan->sock.addr.v4, IPV4_SIZE ) )
-                dup = 1;
+    if ( sss->last_brother_seen == 0 || now - sss->last_brother_seen > 180 )
+        return;
+    sock_from_sender( &sender_n2n, sender_sock );
+    if ( sender_n2n.family != AF_INET )
+        return;
+    for ( i = 0; i < MAX_BROTHER_SNS; i++ ) {
+        n2n_brother_entry_t *b = &sss->brothers[i];
+        if ( memcmp( b->mac, zero, 6 ) == 0 ) continue;
+        if ( b->sock.family == AF_INET &&
+             memcmp( b->sock.addr.v4, sender_n2n.addr.v4, IPV4_SIZE ) == 0 ) {
+            from_brother = 1;
+            break;
         }
-        if ( dup )
-            continue;
-
-        memset( &reqcmn, 0, sizeof(reqcmn) );
-        reqcmn.ttl = N2N_DEFAULT_TTL;
-        reqcmn.pc  = n2n_nat_probe_req;
-        memcpy( reqcmn.community, target->community_name, N2N_COMMUNITY_SIZE );
-
-        memset( &req, 0, sizeof(req) );
-        memcpy( req.cookie, cookie, N2N_COOKIE_SIZE );
-        memcpy( req.target_mac, target->mac_addr, N2N_MAC_SIZE );
-        req.target_sock = target->sock;
-        memcpy( req.community, target->community_name, N2N_COMMUNITY_SIZE );
-
-        encode_NAT_PROBE_REQ( reqbuf, &reqx, &reqcmn, &req );
-        sendto_sock( sss, &scan->sock, reqbuf, reqx );
-
-        used[used_n++] = scan->sock;
-        asked++;
     }
-}
-
-/* Fire one NAT probe round at an edge, four ways at once:
- *  1. helper socket x3: same address as the main socket, a random source port
- *     the edge's NAT has no mapping for (stranger-port inbound, the
- *     address- vs port-restricted test);
- *  2. MAIN socket x1: a notification on the path that is certainly open. It
- *     proves the round was actually fired even when the edge's NAT drops the
- *     other probes, so "nothing arrived" can be read as a restriction instead
- *     of an old/quiet supernode;
- *  3. when a brother supernode is configured (-b), it is asked over the
- *     brother_reg channel to fire the same cookie from ITS main socket: a
- *     stranger IP on a port already proven to carry supernode traffic, which
- *     is the reliable full-cone test;
- *  4. up to two other edges of the community, from their own communication
- *     sockets — the full-cone test when there is no brother supernode.
- * The edge echoes the cookie back in its NAT_REPORT as soon as a real probe
- * (1, 3 or 4) reaches it, and a NAT_PROBE_REQ the supernode itself sends
- * carries the same cookie. */
-static void sn_nat_probe_send( n2n_sn_t * sss, struct peer_info * peer, time_t now )
-{
-    uint8_t             buf[N2N_SN_PKTBUF_SIZE];
-    size_t              idx = 0;
-    n2n_common_t        cmn;
-    n2n_NAT_PROBE_t     probe;
-    struct sockaddr_in  dst;
-    int                 k;
-
-    if ( peer->sock.family != AF_INET || peer->sock.port == 0 )
+    if ( !from_brother )
         return;
 
-    memset( &cmn, 0, sizeof(cmn) );
-    cmn.ttl = N2N_DEFAULT_TTL;
-    cmn.pc  = n2n_nat_probe;
-    memcpy( cmn.community, peer->community_name, N2N_COMMUNITY_SIZE );
+    target.family = AF_INET;
+    memcpy( target.addr.v4, udp_buf + 10, IPV4_SIZE );
+    target.port = ( (uint16_t)udp_buf[14] << 8 ) | udp_buf[15];
+    if ( is_private_ipv4( target.addr.v4 ) )
+        return;   /* a probe must cross a NAT, never go to a private address */
 
-    random_bytes( NULL, probe.cookie, N2N_COOKIE_SIZE );
-
-    encode_NAT_PROBE( buf, &idx, &cmn, &probe );
-
-    memset( &dst, 0, sizeof(dst) );
-    dst.sin_family = AF_INET;
-    dst.sin_port   = htons( peer->sock.port );
-    memcpy( &(dst.sin_addr), peer->sock.addr.v4, IPV4_SIZE );
-
-    /* 1. helper socket: known IP, stranger port. */
-    for ( k = 0; k < N2N_NAT_PROBE_REPEAT; k++ )
-    {
-        if ( sss->nat_helper_sock >= 0 )
-            sendto( sss->nat_helper_sock, buf, idx, 0, (struct sockaddr*)&dst, sizeof(dst) );
+    sendto_sock( sss, &target, msg, sizeof(msg) );
+    for ( i = 0; i < FC_PROBE_MAX; i++ ) {
+        if ( sss->fc_probes[i].left > 0 ) continue;
+        sss->fc_probes[i].target = target;
+        sss->fc_probes[i].due    = now + FC_PROBE_SPREAD;
+        sss->fc_probes[i].left   = 2;
+        break;
     }
+    traceEvent( TRACE_INFO, "FC probe: N2NF x3 -> %s",
+                sock_to_cstr( sockbuf, &target ) );
+}
 
-    /* 2. Main socket notification, exact endpoint the edge registers with. */
-    sendto_sock( sss, &peer->sock, buf, idx );
+/* Fire the staggered N2NF probes (#2/#3). The main loop wakes every 100ms,
+ * far finer than FC_PROBE_SPREAD. */
+static void fc_probes_tick( n2n_sn_t * sss, time_t now )
+{
+    static const uint8_t msg[4] = { 'N', '2', 'N', 'F' };
 
-    /* 3. Ask the brother supernode to fire from its main socket. The address is
-     * normally cached already by the startup brother_reg, but resolve on the
-     * spot if that has not run yet, so an edge registering within the first
-     * second still gets the full-cone test. */
-    if ( sss->backup_addr_text[0] != '\0' )
+    for ( int i = 0; i < FC_PROBE_MAX; i++ )
     {
-        n2n_sock_t              bs;
-        uint8_t                 reqbuf[N2N_SN_PKTBUF_SIZE];
-        size_t                  reqx = 0;
-        n2n_common_t            reqcmn;
-        n2n_NAT_PROBE_REQ_t     req;
+        if ( sss->fc_probes[i].left == 0 || now < sss->fc_probes[i].due )
+            continue;
+        sendto_sock( sss, &sss->fc_probes[i].target, msg, sizeof(msg) );
+        sss->fc_probes[i].left--;
+        sss->fc_probes[i].due = now + FC_PROBE_SPREAD;
+    }
+}
 
+/* Forward a brand-new edge mapping to the brother SN(s) so THEY probe it as
+ * the never-contacted source: live brothers[] first, fallback to the resolved
+ * -b address (asymmetric -b configs). */
+static void send_fc_probe_request( n2n_sn_t *sss,
+                                   const n2n_mac_t edgeMac,
+                                   const n2n_sock_t *edge_sock,
+                                   time_t now )
+{
+    uint8_t pkt[16];
+    int j, sent = 0;
+    macstr_t mac_buf;
+
+    if ( edge_sock->family != AF_INET ) return; /* NAT test is IPv4-only */
+
+    memcpy( pkt, "N2NF", 4 );
+    memcpy( pkt + 4, edgeMac, N2N_MAC_SIZE );
+    memcpy( pkt + 10, edge_sock->addr.v4, IPV4_SIZE );
+    pkt[14] = ( edge_sock->port >> 8 ) & 0xFF;
+    pkt[15] = edge_sock->port & 0xFF;
+
+    for ( j = 0; j < MAX_BROTHER_SNS; j++ ) {
+        n2n_brother_entry_t *b = &sss->brothers[j];
+        time_t seen = b->seen > b->seen6 ? b->seen : b->seen6;
+        if ( b->sock.family == AF_INET && seen != 0 && now - seen <= 180 ) {
+            sendto_sock( sss, &b->sock, pkt, sizeof(pkt) );
+            sent = 1;
+        }
+    }
+    if ( !sent && sss->backup_addr_text[0] != '\0' ) {
+        n2n_sock_t bs;
         if ( resolve_brother_addr( sss->backup_addr_text, &bs ) == 0 &&
-             bs.family == AF_INET )
-        {
-            memset( &reqcmn, 0, sizeof(reqcmn) );
-            reqcmn.ttl = N2N_DEFAULT_TTL;
-            reqcmn.pc  = n2n_nat_probe_req;
-            /* Pseudo-community: tells the receiving supernode this is a brother
-             * request, to be answered from its main socket. */
-            memcpy( reqcmn.community, "brother_reg", 11 );
-
-            memset( &req, 0, sizeof(req) );
-            memcpy( req.cookie, probe.cookie, N2N_COOKIE_SIZE );
-            memcpy( req.target_mac, peer->mac_addr, N2N_MAC_SIZE );
-            req.target_sock = peer->sock;
-            memcpy( req.community, peer->community_name, N2N_COMMUNITY_SIZE );
-
-            encode_NAT_PROBE_REQ( reqbuf, &reqx, &reqcmn, &req );
-            sendto_sock( sss, &bs, reqbuf, reqx );
+             bs.family == AF_INET ) {
+            sendto_sock( sss, &bs, pkt, sizeof(pkt) );
+            sent = 1;
         }
     }
-
-    /* 4. Other edges of the community, from their own communication sockets. */
-    sn_nat_ask_edges( sss, peer, now, probe.cookie );
-
-    memcpy( peer->nat_probe_cookie, probe.cookie, N2N_COOKIE_SIZE );
-    peer->nat_probe_pending = 1;
-    peer->nat_probe_pass    = 0;
-    peer->nat_probe_at      = now;
+    if ( sent )
+        traceEvent( TRACE_DEBUG, "FC probe request forwarded for %s",
+                    macaddr_str( mac_buf, edgeMac ) );
 }
 
-/* Supernode-side NAT upkeep. A probe that ran out of time means neither the
- * helper socket, the brother's main socket nor a community edge got anything
- * back, so the timestamp is kept and only the pending flag is dropped: the
- * (pending == 0, pass == 0, at != 0) combination is what tells the rest of the
- * supernode that this NAT refuses a stranger port. */
-static void sn_nat_tick( n2n_sn_t * sss, time_t now )
-{
-    macstr_t            mac_buf;
-    struct peer_info *  scan;
-
-    for ( scan = sss->edges; scan; scan = scan->next )
-    {
-        if ( scan->nat_probe_pending && now - scan->nat_probe_at > N2N_NAT_PROBE_TIMEOUT )
-        {
-            scan->nat_probe_pending = 0;
-            scan->nat_probe_pass    = 0;
-            traceEvent( TRACE_INFO, "Nat probe to %s timed out",
-                        macaddr_str( mac_buf, scan->mac_addr ) );
-        }
-    }
-}
-
-/* sn2 side of the full-cone test: a brother sn1 asks us to probe one of its
- * edges from THIS supernode's main socket. sn1 only asks during the edge's
- * stranger window, so the edge has never sent us anything — a packet from our
- * main socket reaching it proves its NAT admits any source address.
- *
- * Stateless by design: fire a few copies straight away and let sn1 follow the
- * cookie echo. The sender must be a brother registered within 180s, matched on
- * IP; the backup token was already enforced when that registration arrived, so
- * it does not need to ride along here. */
-static int sn_handle_brother_nat_req( n2n_sn_t * sss, const struct sockaddr * sender_sock,
-                                      const n2n_common_t * cmn,
-                                      const uint8_t * udp_buf,
-                                      size_t * rem, size_t * idx, time_t now )
-{
-    n2n_sock_t              sender;
-    n2n_NAT_PROBE_REQ_t     req;
-    n2n_common_t            outcmn;
-    n2n_NAT_PROBE_t         probe;
-    uint8_t                 outbuf[N2N_SN_PKTBUF_SIZE];
-    size_t                  outx = 0;
-    macstr_t                mac_buf;
-    n2n_sock_str_t          sockbuf;
-    int                     trusted = 0, j, k;
-
-    sock_from_sender( &sender, sender_sock );
-    if ( sender.family != AF_INET )
-        return 0;
-
-    if ( sss->last_brother_seen != 0 && now - sss->last_brother_seen <= 180 )
-    {
-        for ( j = 0; j < MAX_BROTHER_SNS; j++ )
-        {
-            n2n_brother_entry_t * b = &sss->brothers[j];
-            if ( b->seen != 0 && now - b->seen <= 180 &&
-                 b->sock.family == AF_INET &&
-                 0 == memcmp( b->sock.addr.v4, sender.addr.v4, IPV4_SIZE ) )
-            {
-                trusted = 1;
-                break;
-            }
-        }
-    }
-
-    if ( !trusted )
-    {
-        traceEvent( TRACE_WARNING, "Brother nat probe request from unregistered %s, ignored",
-                    sock_to_cstr( sockbuf, &sender ) );
-        return 0;
-    }
-
-    if ( 0 == decode_NAT_PROBE_REQ( &req, cmn, udp_buf, rem, idx ) )
-        return 0;       /* truncated or malformed */
-
-    if ( req.target_sock.family != AF_INET || req.target_sock.port == 0 )
-        return 0;
-
-    if ( is_private_ipv4( req.target_sock.addr.v4 ) )
-        return 0;       /* probes only cross a NAT; never send to private addresses */
-
-    memset( &outcmn, 0, sizeof(outcmn) );
-    outcmn.ttl = N2N_DEFAULT_TTL;
-    outcmn.pc  = n2n_nat_probe;
-    memcpy( outcmn.community, req.community, N2N_COMMUNITY_SIZE );
-    memcpy( probe.cookie, req.cookie, N2N_COOKIE_SIZE );
-
-    encode_NAT_PROBE( outbuf, &outx, &outcmn, &probe );
-
-    /* From the main socket — the port already carrying all supernode traffic. */
-    for ( k = 0; k < N2N_NAT_PROBE_REPEAT; k++ )
-        sendto_sock( sss, &req.target_sock, outbuf, outx );
-
-    traceEvent( TRACE_INFO, "Brother nat probe fired at edge %s on %s",
-                macaddr_str( mac_buf, req.target_mac ),
-                sock_to_cstr( sockbuf, &req.target_sock ) );
-
-    return 0;
-}
-
-/* push_nat_to_community: an edge's reported NAT type changed (update_edge
- * returned 2) while its address stayed the same — nobody else would learn
- * it (PEER_INFO pushes otherwise fire only on new/addr-changed edges).
- * Send one PEER_INFO about the changed edge to every other community
- * member so their mgmt "nat" column stays fresh. */
+/* An edge's NAT type changed while its address stayed put (update_edge
+ * returned 2): PEER_INFO pushes fire only on new/addr-changed edges, so send
+ * one PEER_INFO about the changed edge to every other community member to
+ * keep their mgmt "nat" column fresh (also heals a lost earlier push). */
 static void push_nat_to_community( n2n_sn_t *sss,
                                    struct peer_info *changed,
                                    const n2n_community_t community )
@@ -2591,53 +2439,41 @@ static void push_nat_to_community( n2n_sn_t *sss,
 
     if ( !changed ) return;
 
-    memset(&pi_cmn, 0, sizeof(pi_cmn));
-    memset(&pi, 0, sizeof(pi));
+    memset( &pi_cmn, 0, sizeof(pi_cmn) );
+    memset( &pi, 0, sizeof(pi) );
     pi_cmn.ttl   = N2N_DEFAULT_TTL;
     pi_cmn.pc    = n2n_peer_info;
     pi_cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
-    memcpy(pi_cmn.community, community, sizeof(n2n_community_t));
+    memcpy( pi_cmn.community, community, sizeof(n2n_community_t) );
 
-    memcpy(pi.mac, changed->mac_addr, N2N_MAC_SIZE);
-    /* Always put IPv4 in sockets[0] if available */
-    if (changed->sock.family == AF_INET)
-        pi.sockets[0] = changed->sock;
-    else if (changed->sock6.family == AF_INET6)
-        pi.sockets[0] = changed->sock6;
-    if (changed->num_sockets > 1 &&
-        changed->sockets[1].family != 0 &&
-        changed->sockets[1].port != 0)
-    {
+    memcpy( pi.mac, changed->mac_addr, N2N_MAC_SIZE );
+    pi.sockets[0] = ( changed->sock.family == AF_INET )
+                    ? changed->sock : changed->sock6;
+    if ( changed->num_sockets > 1 && changed->sockets[1].family != 0 &&
+         changed->sockets[1].port != 0 ) {
         pi.aflags = N2N_AFLAGS_LOCAL_SOCKET;
         pi.sockets[1] = changed->sockets[1];
-    } else {
-        pi.aflags = 0;
     }
-    /* Include IPv6 address if available */
-    if (changed->sock6.family == AF_INET6) {
+    if ( changed->sock6.family == AF_INET6 ) {
         pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
         pi.sock6 = changed->sock6;
-    } else {
-        memset(&pi.sock6, 0, sizeof(n2n_sock_t));
     }
-    if (changed->same_lan_as_sn) {
+    if ( changed->same_lan_as_sn )
         pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
-    }
-    strncpy(pi.version, changed->version, sizeof(pi.version) - 1);
-    strncpy(pi.os_name, changed->os_name, sizeof(pi.os_name) - 1);
+    strncpy( pi.version, changed->version, sizeof(pi.version) - 1 );
+    strncpy( pi.os_name, changed->os_name, sizeof(pi.os_name) - 1 );
     pi.assigned_ip = changed->assigned_ip;
-    pi.aflags |= N2N_NAT_AFLAGS(changed->nat_type);
+    pi.aflags |= N2N_NAT_AFLAGS( changed->nat_type );
     pix = 0;
-    encode_PEER_INFO(pibuf, &pix, &pi_cmn, &pi);
+    encode_PEER_INFO( pibuf, &pix, &pi_cmn, &pi );
 
-    for ( p = sss->edges; p; p = p->next )
-    {
+    for ( p = sss->edges; p; p = p->next ) {
         if ( p == changed ) continue;
-        if ( memcmp(p->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
+        if ( memcmp( p->community_name, community, sizeof(n2n_community_t) ) != 0 ) continue;
         sn_send_to_peer( sss, p, pibuf, pix );
     }
-    traceEvent(TRACE_DEBUG, "pushed NAT change of %s to community",
-               macaddr_str(mac_buf, changed->mac_addr));
+    traceEvent( TRACE_DEBUG, "pushed NAT change of %s to community",
+                macaddr_str( mac_buf, changed->mac_addr ) );
 }
 
 /* ---- community relay helpers (mini-SN) -----------------------------------
@@ -2649,75 +2485,52 @@ static void push_nat_to_community( n2n_sn_t *sss,
  * "else -> back to SN" path.
  * ------------------------------------------------------------------------ */
 
-/* A peer is relay-capable only if its extern addr is a public IPv4 and its
- * NAT type is relay-eligible (N2N_NAT_RELAY_CAPABLE). Private addrs would
- * make A/B unreachable. */
+/* Peer is relay-capable only with a relay-eligible cone NAT and a public
+ * IPv4 endpoint (a private addr would make members unreachable). */
 static int is_relay_capable( const struct peer_info * peer )
 {
-    if (!peer) return 0;
-    if (!N2N_NAT_RELAY_CAPABLE(peer->nat_type)) return 0;
-    if (peer->sock.family != AF_INET) return 0;
-    return !is_private_ipv4(peer->sock.addr.v4);
+    return peer && N2N_NAT_RELAY_CAPABLE( peer->nat_type ) &&
+           peer->sock.family == AF_INET &&
+           !is_private_ipv4( peer->sock.addr.v4 );
 }
 
-/* Pick the community's relay among the registered edges. Excludes a given MAC
- * (e.g. the registering party) so the relay never relays for itself. A -Z 3
- * (force) member is always used as-is and never filtered by NAT/public state
- * -- if it cannot relay, the edge's 5s relay_proven fallback routes back
- * through the SN. When several forcing members exist, exactly one is chosen at
- * random and given a single chance (no rotation) -- this is an edge case and
- * is intentionally rough. Only when nobody forces does the normal priority
- * apply: willing (2) over default (1); a refusing peer (-Z 0) is never picked,
- * and when relay is globally off (force_only) nobody forces means no relay at
- * all. Newest peer first (edges list is latest-first). Returns NULL if none
- * eligible. */
+/* Pick the community's relay among the registered edges (newest first).
+ * The excluded MAC (the registering party) is skipped so a peer never
+ * relays for itself. Priority: a -Z 3 forcing member wins as-is, without
+ * any NAT/public check (if it cannot relay, the edges' 5s relay_proven
+ * fallback routes back through the SN); when nobody forces, a willing (-Z 2)
+ * beats a default (-Z 1), and a refusing peer (-Z 0) is never picked. With
+ * several forcing members the first (newest) one gets a single chance --
+ * intentionally rough, this is an edge case. When relay is globally off
+ * (force_only) and nobody forces, no relay at all. Returns NULL if none. */
 static struct peer_info * find_community_relay( n2n_sn_t *sss,
                                                 const n2n_community_t community,
                                                 const n2n_mac_t exclude_mac,
                                                 int force_only )
 {
     struct peer_info * scan;
-    struct peer_info * forcers[32];
-    int n = 0;
+    struct peer_info * forcer = NULL;
+    struct peer_info * best_willing = NULL; /* willing==2 */
+    struct peer_info * best_default = NULL; /* willing==1 */
 
     for ( scan = sss->edges; scan; scan = scan->next )
     {
-        if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
-        if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
-        if ( scan->relay_willing == 3 )
-        {
-            if ( n < 32 ) forcers[n++] = scan; /* never state-checked */
-        }
+        if ( memcmp( scan->mac_addr, exclude_mac, N2N_MAC_SIZE ) == 0 ) continue;
+        if ( memcmp( scan->community_name, community, sizeof(n2n_community_t) ) != 0 ) continue;
+        if ( scan->relay_willing == 3 ) { if ( !forcer ) forcer = scan; continue; }
+        if ( force_only ) continue;                       /* off and nobody forces */
+        if ( scan->relay_willing == 0 ) continue;         /* refusing: never pick */
+        if ( !is_relay_capable( scan ) ) continue;
+        if ( scan->relay_willing == 2 ) { if ( !best_willing ) best_willing = scan; }
+        else if ( !best_default ) best_default = scan;
     }
-    if ( n > 0 )
-    {
-        /* Random single pick among the forcing members -- one chance. */
-        unsigned long seed = (unsigned long)time(NULL) ^ (unsigned long)&forcers[0];
-        seed = seed * 2654435761u;
-        seed += (unsigned long)&scan; /* vary with layout across calls */
-        return forcers[ seed % n ];
-    }
-
-    {
-        struct peer_info * best_willing = NULL;  /* willing==2 */
-        struct peer_info * best_default = NULL;  /* willing==1 */
-        for ( scan = sss->edges; scan; scan = scan->next )
-        {
-            if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
-            if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
-            if ( !is_relay_capable(scan) ) continue;
-            if ( scan->relay_willing == 0 ) continue;      /* refusing: never pick */
-            if ( force_only ) continue;                    /* globally off, nobody forces: no relay */
-            if ( scan->relay_willing == 2 ) { if (!best_willing) best_willing = scan; }
-            else if ( !best_default ) best_default = scan;
-        }
-        if ( best_willing ) return best_willing;
-        return best_default;
-    }
+    if ( forcer ) return forcer;
+    if ( best_willing ) return best_willing;
+    return best_default;
 }
 
 /* Send one PEER_INFO telling <dest> that <relay> is the community's relay
- * peer. The RELAY flag makes the receiving edge register to it and fall back
+ * peer: the RELAY flag makes the receiving edge register to it and fall back
  * to it when direct punching fails. */
 static void advertise_relay_to( n2n_sn_t *sss,
                                 const n2n_common_t * cmn,
@@ -2731,85 +2544,76 @@ static void advertise_relay_to( n2n_sn_t *sss,
 
     if ( !dest || !relay ) return;
 
-    memset(&pi_cmn, 0, sizeof(pi_cmn));
-    memset(&pi, 0, sizeof(pi));
+    memset( &pi_cmn, 0, sizeof(pi_cmn) );
+    memset( &pi, 0, sizeof(pi) );
     pi_cmn.ttl   = N2N_DEFAULT_TTL;
     pi_cmn.pc    = n2n_peer_info;
     pi_cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
-    memcpy(pi_cmn.community, cmn->community, sizeof(n2n_community_t));
+    memcpy( pi_cmn.community, cmn->community, sizeof(n2n_community_t) );
 
-    memcpy(pi.mac, relay->mac_addr, N2N_MAC_SIZE);
-    pi.aflags = N2N_AFLAGS_RELAY; /* this peer is the relay, not a punch target */
-    if (relay->sock.family == AF_INET)
-        pi.sockets[0] = relay->sock;
-    else if (relay->sock6.family == AF_INET6)
-        pi.sockets[0] = relay->sock6;
-    if (relay->sock6.family == AF_INET6) {
+    memcpy( pi.mac, relay->mac_addr, N2N_MAC_SIZE );
+    pi.aflags = N2N_AFLAGS_RELAY;   /* relay peer, not a punch target */
+    pi.sockets[0] = ( relay->sock.family == AF_INET )
+                    ? relay->sock : relay->sock6;
+    if ( relay->sock6.family == AF_INET6 ) {
         pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
         pi.sock6 = relay->sock6;
     }
-    strncpy(pi.version, relay->version, sizeof(pi.version) - 1);
-    strncpy(pi.os_name, relay->os_name, sizeof(pi.os_name) - 1);
-    pi.aflags |= N2N_NAT_AFLAGS(relay->nat_type);
+    strncpy( pi.version, relay->version, sizeof(pi.version) - 1 );
+    strncpy( pi.os_name, relay->os_name, sizeof(pi.os_name) - 1 );
+    pi.aflags |= N2N_NAT_AFLAGS( relay->nat_type );
 
     encode_PEER_INFO( pibuf, &pix, &pi_cmn, &pi );
     sn_send_to_peer( sss, dest, pibuf, pix );
 }
 
-/* When the supernode actually relays unicast traffic between <req_mac> and
- * <tgt_mac> ("communication attempt / failed direct"), advertise the community
- * relay peer to both so they start registering to it and route through it.
- * Throttled to ~once per 15s per requester so heavy flows don't flood PEER_INFO. */
+/* When the supernode relays unicast traffic between <req_mac> and <tgt_mac>
+ * (punching has failed), advertise the community relay peer to both so they
+ * register to it and route through it. Whole-relay switch: sn -Z 0 means stay
+ * on the plain SN relay UNLESS a member forces with edge -Z 3 (turns the
+ * group relay back on, used as-is; if it cannot relay, the edge's 5s
+ * relay_proven fallback routes back through the SN). Throttled per requester. */
 static void advertise_relay_on_pair( n2n_sn_t *sss,
                                      const n2n_common_t * cmn,
                                      const n2n_mac_t req_mac,
                                      const n2n_mac_t tgt_mac )
 {
-    int force_only;
-    /* Whole-relay feature switch: when the admin disabled community relay
-     * advertisement (sn -Z 0), stay on plain SN relay UNLESS a member forces
-     * (edge -Z 3) -- a forcing member turns the group relay back on and is then
-     * used as-is (SN never checks its NAT/public state); if it cannot relay,
-     * the edge's 5s relay_proven fallback routes back through the SN. */
-    force_only = !sss->relay_advert_enabled;
-
+    time_t now = time( NULL );
     struct peer_info * req = find_peer_by_mac( sss->edges, req_mac );
+    struct peer_info * tgt, * relay;
+    int force_only = !sss->relay_advert_enabled;
+
     if ( !req ) return;
 
-    time_t now = time(NULL);
-
-    /* Sustained-traffic gate: every member punches through this supernode
-     * for the first few seconds, and that initial burst must not trigger
-     * the community-relay announcement. Once a member's unicast data has
-     * been relayed here continuously for SN_RELAY_ADVERT_ACTIVE_SECS its
-     * hole-punching has apparently not succeeded — only then announce. */
+    /* Announcing during the first SN_RELAY_ADVERT_ACTIVE_SECS of a member's
+     * SN-relayed traffic would fire on the normal pre-punch burst; only once
+     * the data has bounced here continuously for that long is the punch
+     * considered failed. Also cap the announcement rate. */
     if ( req->sn_fwd_first == 0 )
         req->sn_fwd_first = now;
     if ( (now - req->sn_fwd_first) < SN_RELAY_ADVERT_ACTIVE_SECS )
         return;
+    if ( (now - req->relay_adv_time) < 15 )
+        return;
 
-    if ( (now - req->relay_adv_time) < 15 ) return; /* throttled */
-
-    /* The relay must be a proper third peer: neither the sender nor the target. */
-    struct peer_info * relay = find_community_relay( sss, cmn->community, req_mac, force_only );
-    if ( !relay || (memcmp(relay->mac_addr, tgt_mac, N2N_MAC_SIZE) == 0) )
-        return; /* no good peer (incl. globally-off with no forcing member) -> plain SN */
+    /* The relay must be a proper third peer: neither requester nor target. */
+    relay = find_community_relay( sss, cmn->community, req_mac, force_only );
+    if ( !relay || memcmp( relay->mac_addr, tgt_mac, N2N_MAC_SIZE ) == 0 )
+        return;   /* none eligible (incl. globally off with no forcing member) */
     req->relay_adv_time = now;
 
-    struct peer_info * tgt = find_peer_by_mac( sss->edges, tgt_mac );
     advertise_relay_to( sss, cmn, req, relay );
-    if ( tgt )
-    {
-        /* Same sustained-traffic gate on the target side: if its own punching
-         * is still in its first seconds (barely relayed through here), do not
-         * burden it with the announcement yet. */
+
+    tgt = find_peer_by_mac( sss->edges, tgt_mac );
+    if ( tgt ) {
+        /* Same sustained-traffic gate on the target side. */
         if ( tgt->sn_fwd_first == 0 )
             tgt->sn_fwd_first = now;
         if ( (now - tgt->sn_fwd_first) >= SN_RELAY_ADVERT_ACTIVE_SECS )
             advertise_relay_to( sss, cmn, tgt, relay );
     }
-    /* Notify the relay itself (PEER_INFO RELAY naming its own MAC) so it
-     * switches on forwarding without self-judging eligibility. Idempotent. */
+    /* Tell the relay itself (PEER_INFO naming its own MAC) to switch on
+     * forwarding without self-judging eligibility. Idempotent. */
     advertise_relay_to( sss, cmn, relay, relay );
 }
 
@@ -2836,10 +2640,12 @@ static int process_udp( n2n_sn_t * sss,
 
     traceEvent( TRACE_DEBUG, "process_udp(%lu)", udp_size );
 
-    /* The 16-byte "N2NF" brother request is gone: it was an unauthenticated raw
-     * datagram whose source could not be attributed to any community. Brother
-     * probe requests now travel as a proper n2n_nat_probe_req(15) message on the
-     * "brother_reg" pseudo-community, handled in the dispatch below. */
+    /* Full-cone probe request from a brother SN: 16 raw bytes, not n2n. */
+    if ( udp_size == 16 && memcmp( udp_buf, "N2NF", 4 ) == 0 )
+    {
+        handle_fc_probe_request( sss, sender_sock, udp_buf, now );
+        return 0;
+    }
 
     /* Use decode_common() to determine the kind of packet then process it:
      *
@@ -3086,9 +2892,8 @@ static int process_udp( n2n_sn_t * sss,
 
         if ( unicast )
         {
-            /* Relay: the supernode relaying the first member-to-member data
-             * frame is the signal to start registering to the relay peer
-             * (concurrent with the on-going punch). */
+            /* SN relaying the first member data = the signal to start using
+             * the community relay peer (concurrent with the ongoing punch). */
             if ( sender_peer )
                 advertise_relay_on_pair( sss, &cmn, sender_peer->mac_addr, compact_dstMac );
             try_forward( sss, &cmn, compact_dstMac, rec_buf, encx );
@@ -3224,9 +3029,8 @@ static int process_udp( n2n_sn_t * sss,
         /* Common section to forward the final product. */
         if ( unicast )
         {
-            /* Relay: the supernode relaying member-to-member data is a clear
-             * sign direct failed; push the community relay peer so the members
-             * can switch to it. */
+            /* SN relaying member data = direct failed; push the community
+             * relay peer so the members can switch to it. */
             advertise_relay_on_pair( sss, &cmn, pkt.srcMac, pkt.dstMac );
             try_forward( sss, &cmn, pkt.dstMac, rec_buf, encx );
         }
@@ -3263,9 +3067,8 @@ static int process_udp( n2n_sn_t * sss,
 
         if ( unicast )
         {
-        /* Relay: one member wants another -> tell both about the community
-         * relay peer so they can register to it and use it once direct
-         * punching fails. */
+        /* One member wants another: tell both about the community relay peer
+         * so they can register to it once direct punching fails. */
         advertise_relay_on_pair( sss, &cmn, reg.srcMac, reg.dstMac );
 
         traceEvent( TRACE_DEBUG, "Rx REGISTER %s -> %s %s",
@@ -3307,70 +3110,6 @@ static int process_udp( n2n_sn_t * sss,
             traceEvent( TRACE_ERROR, "Rx REGISTER with multicast destination" );
         }
 
-    }
-    else if ( msg_type == n2n_nat_probe_req &&
-              memcmp(cmn.community, "brother_reg", 11) == 0 )
-    {
-        /* A brother supernode asking us to probe one of its edges from our
-         * main socket. The pseudo-community is what marks it as such — a real
-         * community name here would mean "an edge should probe", which is not
-         * our job to relay. */
-        return sn_handle_brother_nat_req( sss, sender_sock, &cmn, udp_buf, &rem, &idx, now );
-    }
-    else if ( msg_type == n2n_nat_report )
-    {
-        /* An edge's NAT verdict, the echo of a helper-port probe and a request
-         * for one. The report carries no MAC on purpose: it comes from the very
-         * socket the edge registered with, so the sender address identifies it. */
-        n2n_NAT_REPORT_t    rep;
-        struct peer_info *  peer;
-        n2n_sock_t          sender;
-
-        decode_NAT_REPORT( &rep, &cmn, udp_buf, &rem, &idx );
-        sock_from_sender( &sender, sender_sock );
-
-        peer = find_peer_by_sock( sss->edges, sender_sock );
-        if ( !peer || 0 != memcmp( peer->community_name, cmn.community, sizeof(n2n_community_t) ) )
-        {
-            traceEvent( TRACE_DEBUG, "NAT report from unregistered %s",
-                        sock_to_cstr( sockbuf, &sender ) );
-            return 0;
-        }
-
-        if ( peer->nat_type != rep.nat_type )
-        {
-            traceEvent( TRACE_INFO, "Nat type of %s is now %s",
-                        macaddr_str( mac_buf, peer->mac_addr ),
-                        sn_nat_type_name( rep.nat_type ) );
-            /* Tell the rest of the community, so every edge's mgmt display and
-             * the relay eligibility view stay current without waiting for the
-             * next registration. */
-            push_nat_to_community( sss, peer, cmn.community );
-        }
-
-        peer->nat_type      = rep.nat_type;
-        /* Same value the REGISTER_SUPER aflag carries; accepting it here too
-         * means a lost registration cannot stall a relay-stance change. */
-        peer->relay_willing = rep.relay_willing;
-        peer->nat_report_at = now;
-
-        if ( peer->nat_probe_pending &&
-             0 == memcmp( rep.nat_echo, peer->nat_probe_cookie, N2N_COOKIE_SIZE ) )
-        {
-            /* A probe got through: this NAT takes a source it has never sent
-             * to, so it is not port-restricted. */
-            peer->nat_probe_pending = 0;
-            peer->nat_probe_pass    = 1;
-            peer->nat_probe_at      = now;
-            traceEvent( TRACE_INFO, "Nat probe to %s answered",
-                        macaddr_str( mac_buf, peer->mac_addr ) );
-        }
-
-        if ( rep.nat_probe_req && !peer->nat_probe_pending &&
-             ( peer->nat_probe_at == 0 || now - peer->nat_probe_at >= N2N_NAT_PROBE_TIMEOUT ) )
-        {
-            sn_nat_probe_send( sss, peer, now );
-        }
     }
     else if ( msg_type == MSG_TYPE_REGISTER_ACK )
     {
@@ -3539,12 +3278,18 @@ static int process_udp( n2n_sn_t * sss,
 
         decode_REGISTER_SUPER( &reg, &cmn, udp_buf, &rem, &idx );
 
-        /* The per-registration bounce request that used to be answered here is
-         * gone. The edge no longer asks for it in REGISTER_SUPER at all: it
-         * signals "probe me" in the nat_probe_req field of its own
-         * n2n_nat_report(14), and this supernode answers with a full probe
-         * round (sn_nat_probe_send) rather than a bare helper-socket datagram.
-         */
+        /* NAT bounce test: the edge asks us to reply from the helper socket
+         * (different source port) so it can tell restricted (IP-gated, any
+         * port allowed) from port-restricted NATs. Purely outbound, 4-byte
+         * magic, no state; sender's IP is re-checked by the edge. */
+        if ( (reg.aflags & N2N_AFLAGS_NAT_BOUNCE) &&
+             sender_sock->sa_family == AF_INET &&
+             sss->bounce_sock >= 0 )
+        {
+            static const uint8_t bmsg[4] = { 'N', '2', 'N', 'B' };
+            sendto( sss->bounce_sock, bmsg, sizeof(bmsg), 0,
+                    sender_sock, sender_sock_len );
+        }
 
         /* Brother SN detection: sn1 -> sn2 periodic registration, carries sn1's current address. */
         int is_brother_reg = (memcmp(cmn.community, "brother_reg", 11) == 0);
@@ -3854,48 +3599,45 @@ static int process_udp( n2n_sn_t * sss,
                      ((reg.aflags & N2N_AFLAGS_IPV6_SOCKET) && reg.own_ipv6.family == AF_INET6)
                          ? &reg.own_ipv6 : NULL,
                      now, NULL, NULL,
+                     N2N_NAT_FROM_AFLAGS(reg.aflags),
                      use_request_ip, use_requested_ip );
 
-        /* Known edge whose address changed (mgmt "n" refresh, CGNAT re-map):
-         * give the rest of the community the fresh PEER_INFO. Without this push
-         * every peer keeps pointing at the abandoned endpoint — the SN would
-         * show the edge while nobody can reach it. (A NAT type change is pushed
-         * separately, from the NAT_REPORT handler.) */
-        if ( is_new_edge == 3 )
+        /* Edge metadata changed while staying in the table (==2 NAT type
+         * changed, ==3 address changed: CGNAT re-map): push a
+         * fresh PEER_INFO so peers stop pointing at the abandoned endpoint. */
+        if ( is_new_edge == 2 || is_new_edge == 3 )
             push_nat_to_community( sss,
                                    find_peer_by_mac(sss->edges, reg.edgeMac),
                                    cmn.community );
 
-        /* Brand-new or re-mapped edge: fire one NAT probe round at the fresh
-         * mapping. The stranger window the edge opens on a remap is exactly
-         * what this has to land in, and the edge can only start measuring once
-         * its own nat_probe_req makes it here — so doing it now, on the
-         * registration that carries the new endpoint, is the earliest possible
-         * moment. */
+        /* New (or re-mapped) edge: give the brother SN a one-shot chance to
+         * full-cone-probe it as a never-contacted source. */
         if ( is_new_edge )
+            send_fc_probe_request( sss, reg.edgeMac, &(ack.sock), now );
+
+        /* Bounce-round notice ("N2NN", 4 raw bytes) from OUR MAIN socket: the
+         * same IP as the helper-socket bounce but the real port. The edge
+         * reads "cone mapping and no bounce" as port-restricted only after
+         * this notice, so a sn that never sends it leaves the edge at
+         * "unknown" instead of guessing. Sent here, after the bounce and the
+         * brother's N2NF request, so the round is fully under way. */
+        if ( (reg.aflags & N2N_AFLAGS_NAT_BOUNCE) && !query_only &&
+             ack.sock.family == AF_INET && sss->bounce_sock >= 0 )
         {
-            struct peer_info * n_edge = find_peer_by_mac( sss->edges, reg.edgeMac );
-            if ( n_edge )
-                sn_nat_probe_send( sss, n_edge, now );
+            static const uint8_t nmsg[4] = { 'N', '2', 'N', 'N' };
+            sendto_sock( sss, &(ack.sock), nmsg, sizeof(nmsg) );
         }
 
-        /* Remember the edge's relay stance so find_community_relay can prefer
-         * willing/force / skip refusing candidates. Default (neither bit)=1;
-         * force (3) is the relay even if relay is globally off. */
-        if (!query_only)
+        /* Record the edge's relay stance for find_community_relay: force=3
+         * (relay even when the group relay is off), willing=2, default=1,
+         * refuse=0 (never picked). */
+        if ( !query_only )
         {
             struct peer_info *w_edge = find_peer_by_mac( sss->edges, reg.edgeMac );
             if ( w_edge )
-            {
-                if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_FORCE )
-                    w_edge->relay_willing = 3;
-                else if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_NO )
-                    w_edge->relay_willing = 0;
-                else if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_YES )
-                    w_edge->relay_willing = 2;
-                else
-                    w_edge->relay_willing = 1;
-            }
+                w_edge->relay_willing = ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_FORCE ) ? 3 :
+                                        ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_NO   ) ? 0 :
+                                        ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_YES  ) ? 2 : 1;
         }
 
         /* Set assigned IP in ACK */
@@ -4196,16 +3938,12 @@ int main( int argc, char * const argv[] )
              * holding large per-socket memory pools. */
             { int snd = 256 * 1024;
               setsockopt(sss.sock, SOL_SOCKET, SO_SNDBUF, (const char*)&snd, sizeof(snd)); }
-            /* NAT probe helper socket: same local address as the main socket,
-             * random source port, outbound only. Nothing listens on it (the
-             * edge never connects to it; the supernode only sends NAT_PROBEs
-             * out and any reply rides the conntrack entry back on the main
-             * socket), which is why it stays out of the select set. A probe
-             * arriving from this port is what tells an address-restricted NAT
-             * from a port-restricted one. */
-            sss.nat_helper_sock = open_socket(0 /* any port */, 1 /*bind ANY*/ );
-            if (sss.nat_helper_sock == -1) {
-                traceEvent( TRACE_WARNING, "NAT prober socket failed, NAT detection is degraded" );
+            /* NAT bounce-test helper socket: random source port, no firewall
+             * inbound needed (the edge never connects to it; the sn only
+             * sends "N2NB" out and replies ride the conntrack entry). */
+            sss.bounce_sock = open_socket(0 /* any port */, 1 /*bind ANY*/ );
+            if (sss.bounce_sock == -1) {
+                traceEvent( TRACE_WARNING, "NAT bounce socket failed; bounce tests disabled" );
             }
         } else {
             traceEvent( TRACE_WARNING, "IPv4 socket failed, continuing without IPv4" );
@@ -4565,10 +4303,8 @@ static int run_loop( n2n_sn_t * sss )
             }
         }
 
-        /* Supernode-side NAT upkeep: drop a probe round whose budget expired so
-         * the (pending == 0, pass == 0, at != 0) state left behind reads as
-         * "this NAT refuses a stranger port". */
-        sn_nat_tick( sss, now );
+        /* Deferred full-cone N2NF probes (#2/#3, staggered). */
+        fc_probes_tick( sss, now );
 
         /* sn1 -> sn2 brother_reg, every 31s. */
         if (sss->backup_addr_text[0])
