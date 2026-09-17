@@ -242,6 +242,15 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
                           (t) == N2N_NAT_PORT_RESTRICT ? "port-restr" : \
                           (t) == N2N_NAT_SYMMETRIC ? "symmetric" : "unknown" )
 
+/* NAT measurement timing (n2n6+ model). */
+#define N2N_NAT_SAMPLE_SLOTS        4    /* observations of our own public address */
+#define N2N_NAT_SAMPLE_TTL          120  /* a vantage observation stays fresh this long */
+#define N2N_NAT_SENT_SLOTS          32   /* recent send destinations, for inbound classification */
+#define N2N_NAT_SAMPLE_INTERVAL     60   /* routine sn2 sample period */
+#define N2N_NAT_FC_WINDOW           8    /* after a fresh mapping: stay silent towards sn2
+                                            for this long while its main socket probes us as
+                                            a stranger, then start sampling */
+
 /* NAT type <-> aflags bits: REGISTER_SUPER carries the edge's own type,
  * PEER_INFO carries a peer's type to edges for mgmt display. */
 #define N2N_NAT_AFLAGS(t) ( (t) == N2N_NAT_FULL_CONE ? N2N_AFLAGS_NAT_FULL_CONE : \
@@ -584,30 +593,33 @@ struct n2n_edge
 
     n2n_sock_t          my_public_sock;
 
-    /* NAT type detection: dual-sn reflection (mapping compare) plus the sn
-     * bounce test (helper socket, different source port) for cone sub-types. */
-    uint8_t             nat_type;       /* N2N_NAT_* */
-    n2n_sock_t          nat_seen_sn1;   /* edge addr observed by sn1 (family=0 if none) */
-    n2n_sock_t          nat_seen_sn2;   /* edge addr observed by sn2 (family=0 if none) */
-    time_t              nat_seen_sn1_at; /* when sn1's observation was taken (0 = none) */
-    time_t              nat_seen_sn2_at; /* when sn2's observation was taken (0 = none) */
-    uint16_t            nat_local_sn1_port; /* local UDP port the sn1 echo left from */
-    uint16_t            nat_local_sn2_port; /* local UDP port the sn2 echo left from */
-    time_t              nat_sn2_contact_at; /* first time we sent anything to the sn2 query
-                                           channel (0 = never). The full-cone test needs sn2
-                                           to be a source this edge has never sent to. */
-    time_t              nat_probe_time; /* last periodic NAT probe tick */
-    uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
-    uint8_t             nat_bounce_seen;   /* a public helper-port bounce arrived */
-    uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
-    time_t              fc_window_until; /* stranger window closes here: the brother's
-                                           N2NF probes count only before this instant */
-    time_t              nat_probe_notified; /* sn1 told us a bounce round was launched
-                                           (0 = never); a "no bounce" verdict needs it */
-    time_t              fc_arm_time;    /* when the stranger window was last (re-)armed:
-                                           an armed window gets its quick NAT re-probe
-                                           12s later instead of waiting for the 60s
-                                           periodic tick */
+    /* NAT type detection (n2n6+ model): two vantage points observe our public
+     * mapping (dual-sn compare -> symmetric), inbound datagrams prove filter
+     * behaviour (stranger IP -> full-cone, known IP + stranger port ->
+     * addr-restr), the sn's bounce-round notice turns post-window silence
+     * into a port-restr verdict. Evidence lives until the mapping changes. */
+    uint8_t             nat_type;       /* last verdict, N2N_NAT_* */
+    uint8_t             nat_reported;   /* verdict last pushed to the supernode */
+    uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the sn2 sample probe */
+    struct {                               /* vantage points that saw our public address */
+        n2n_sock_t      vantage;
+        n2n_sock_t      mapped;
+        time_t          when;
+    }                   nat_samples[N2N_NAT_SAMPLE_SLOTS];
+    uint8_t             nat_sample_next;   /* ring write index */
+    struct {                               /* destinations we sent to recently */
+        n2n_sock_t      sock;
+        time_t          when;
+    }                   nat_sent[N2N_NAT_SENT_SLOTS];
+    uint8_t             nat_sent_next;
+    time_t              nat_fc_evid;       /* last unsolicited inbound, from an IP we never sent to */
+    time_t              nat_addr_evid;     /* last inbound from a known IP on a stranger port */
+    time_t              nat_notify_at;     /* sn announced a probe round: silence then means filtered */
+    time_t              nat_fc_window_until; /* stay silent towards sn2 until this time so its
+                                                main-socket probe arrives as a stranger */
+    time_t              nat_first_sample;  /* first sn1 observation; drives the settling burst */
+    int                 nat_burst_left;    /* remaining samples of that burst */
+    time_t              nat_next_sample;   /* when the next routine sn2 sample is due */
 
     n2n_sock_t          own_ipv6;       /* routable global IPv6 (GUA) of this edge,
                                            reported to supernode for IPv6 hole-punching
