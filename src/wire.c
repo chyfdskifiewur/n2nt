@@ -811,6 +811,94 @@ size_t decode_PROBE_ACK( n2n_PROBE_ACK_t * ack,
 }
 
 
+size_t encode_NAT_PROBE( uint8_t * base,
+                         size_t * idx,
+                         const n2n_common_t * common,
+                         const n2n_NAT_PROBE_t * pkt )
+{
+    size_t retval=0;
+    retval += encode_common( base, idx, common );
+    retval += encode_buf( base, idx, pkt->cookie, N2N_COOKIE_SIZE );
+    return retval;
+}
+
+size_t decode_NAT_PROBE( n2n_NAT_PROBE_t * pkt,
+                         const n2n_common_t * cmn,
+                         const uint8_t * base,
+                         size_t * rem,
+                         size_t * idx )
+{
+    size_t retval=0;
+    memset( pkt, 0, sizeof(n2n_NAT_PROBE_t) );
+    retval += decode_buf( pkt->cookie, N2N_COOKIE_SIZE, base, rem, idx );
+    return retval;
+}
+
+size_t encode_NAT_REPORT( uint8_t * base,
+                          size_t * idx,
+                          const n2n_common_t * common,
+                          const n2n_NAT_REPORT_t * pkt )
+{
+    size_t retval=0;
+    retval += encode_common( base, idx, common );
+    retval += encode_uint8( base, idx, pkt->nat_type );
+    retval += encode_uint8( base, idx, pkt->relay_willing );
+    retval += encode_uint8( base, idx, pkt->nat_probe_req );
+    retval += encode_buf( base, idx, pkt->nat_echo, N2N_COOKIE_SIZE );
+    return retval;
+}
+
+size_t decode_NAT_REPORT( n2n_NAT_REPORT_t * pkt,
+                          const n2n_common_t * cmn,
+                          const uint8_t * base,
+                          size_t * rem,
+                          size_t * idx )
+{
+    size_t retval=0;
+    memset( pkt, 0, sizeof(n2n_NAT_REPORT_t) );
+    retval += decode_uint8( &pkt->nat_type, base, rem, idx );
+    retval += decode_uint8( &pkt->relay_willing, base, rem, idx );
+    retval += decode_uint8( &pkt->nat_probe_req, base, rem, idx );
+    retval += decode_buf( pkt->nat_echo, N2N_COOKIE_SIZE, base, rem, idx );
+    return retval;
+}
+
+size_t encode_NAT_PROBE_REQ( uint8_t * base,
+                             size_t * idx,
+                             const n2n_common_t * common,
+                             const n2n_NAT_PROBE_REQ_t * pkt )
+{
+    size_t retval=0;
+    retval += encode_common( base, idx, common );
+    retval += encode_buf( base, idx, pkt->cookie, N2N_COOKIE_SIZE );
+    retval += encode_mac( base, idx, pkt->target_mac );
+    retval += encode_sock( base, idx, &pkt->target_sock );
+    retval += encode_buf( base, idx, pkt->community, N2N_COMMUNITY_SIZE );
+    return retval;
+}
+
+size_t decode_NAT_PROBE_REQ( n2n_NAT_PROBE_REQ_t * pkt,
+                             const n2n_common_t * cmn,
+                             const uint8_t * base,
+                             size_t * rem,
+                             size_t * idx )
+{
+    size_t retval=0;
+    /* Fixed layout: cookie + mac + IPv4 sock (family/port/addr) + community.
+     * Reject anything shorter instead of letting decode_sock read past the end
+     * of the datagram. */
+    if ( *rem < N2N_COOKIE_SIZE + N2N_MAC_SIZE + 2 + 2 + IPV4_SIZE + N2N_COMMUNITY_SIZE )
+        return 0;
+
+    memset( pkt, 0, sizeof(n2n_NAT_PROBE_REQ_t) );
+    retval += decode_buf( pkt->cookie, N2N_COOKIE_SIZE, base, rem, idx );
+    retval += decode_mac( pkt->target_mac, base, rem, idx );
+    retval += decode_sock( &pkt->target_sock, base, rem, idx );
+    retval += decode_buf( pkt->community, N2N_COMMUNITY_SIZE, base, rem, idx );
+    return retval;
+}
+
+
 size_t encode_PEER_INFO( uint8_t * base, size_t * idx,
                          const n2n_common_t * common,
                          const n2n_PEER_INFO_t * pkt )
