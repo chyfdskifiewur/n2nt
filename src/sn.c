@@ -1340,7 +1340,7 @@ static int update_edge( n2n_sn_t * sss,
         } else {
             strcpy(scan->os_name, "unknown");
         }
-        scan->nat_type = nat_type;
+        scan->nat_type = N2N_NAT_UNKNOWN;   /* verdict arrives via NAT_REPORT */
 
         /* insert this guy at the head of the edges list */
         scan->next = sss->edges;
@@ -3324,14 +3324,16 @@ static int process_udp( n2n_sn_t * sss,
          * socket the edge registered with, so the sender address identifies it. */
         n2n_NAT_REPORT_t    rep;
         struct peer_info *  peer;
+        n2n_sock_t          sender;
 
         decode_NAT_REPORT( &rep, &cmn, udp_buf, &rem, &idx );
+        sock_from_sender( &sender, sender_sock );
 
         peer = find_peer_by_sock( sss->edges, sender_sock );
         if ( !peer || 0 != memcmp( peer->community_name, cmn.community, sizeof(n2n_community_t) ) )
         {
             traceEvent( TRACE_DEBUG, "NAT report from unregistered %s",
-                        sock_to_cstr( sockbuf, sender_sock ) );
+                        sock_to_cstr( sockbuf, &sender ) );
             return 0;
         }
 
