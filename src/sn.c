@@ -1125,9 +1125,10 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
             inet_ntop(AF_INET6, b->sock6.addr.v6, v6_str, sizeof(v6_str));
             snprintf(v6_part, sizeof(v6_part), "[%s]:%u", v6_str, b->sock6.port);
         }
-        /* Heartbeat age: v4 first, v6 fallback; left-aligned to the "os"
-         * column of the header. (have_v4 || have_v6 is guaranteed above,
-         * so the slot always has a last-seen timestamp.) */
+        /* Heartbeat age: v4 first, v6 fallback; right-aligned so it ends at
+         * the last column of the header. (sizeof includes the NUL, hence -5
+         * = NUL + newline + 3 chars of "NNs".) have_v4 || have_v6 is
+         * guaranteed above, so the slot always has a last-seen timestamp. */
         time_t last = b->seen ? b->seen : b->seen6;
         size_t line_start = written;
         written += snprintf(buf + written, bufsz - written,
@@ -1135,7 +1136,7 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
                             counter,
                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
                             v4_part, v6_part);
-        int pad = (int)sizeof(mgmt_header) - 4 - (int)(written - line_start);
+        int pad = (int)sizeof(mgmt_header) - 5 - (int)(written - line_start);
         if (pad < 1) pad = 1;
         written += snprintf(buf + written, bufsz - written,
                             "%*s%lds\n", pad, "", (long)(now - last));
