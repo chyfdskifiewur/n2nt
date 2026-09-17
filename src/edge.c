@@ -398,6 +398,8 @@ static int edge_init(n2n_edge_t * eee)
     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
     eee->nat_seen_sn1_at = 0;
     eee->nat_seen_sn2_at = 0;
+    eee->nat_local_sn1_port = 0;
+    eee->nat_local_sn2_port = 0;
     eee->nat_sn2_contact_at = 0;
     eee->nat_probe_time = n2n_now(); /* anchor to start-of-run, not t=0: a slow startup (DNS, retries) must not let the 60s periodic fire before the mapping is live */
     eee->nat_probe_pending = 0;
@@ -2719,6 +2721,21 @@ static int nat_addr_private( const uint8_t * a ) /* network-order IPv4 */
            ( a[0] == 192 && a[1] == 168 );
 }
 
+/* Local port of the main IPv4 socket, recorded with every NAT observation:
+ * two echoes may only be compared when they left from the same local
+ * endpoint, otherwise the comparison reads the difference of two source
+ * ports as a difference of NAT mappings. */
+static uint16_t udp_local_port( n2n_edge_t * eee )
+{
+    struct sockaddr_in ls;
+    socklen_t llen = sizeof(ls);
+
+    if ( eee->udp_sock == -1 ||
+         getsockname( eee->udp_sock, (struct sockaddr*)&ls, &llen ) != 0 )
+        return 0;
+    return ntohs( ls.sin_port );
+}
+
 static void nat_classify( n2n_edge_t * eee )
 {
     const char *old, *new;
@@ -2762,12 +2779,17 @@ static void nat_classify( n2n_edge_t * eee )
                          eee->supernode.family != 0 &&
                          sock_equal( &eee->sn_query, &eee->supernode ) != 0 );
         long pair_dt = (long)( eee->nat_seen_sn1_at - eee->nat_seen_sn2_at );
+        /* Both echoes must have left from the same local endpoint, otherwise
+         * their difference is a difference of source ports, not of mappings. */
+        int same_local = ( eee->nat_local_sn1_port == 0 ||
+                           eee->nat_local_sn2_port == 0 ||
+                           eee->nat_local_sn1_port == eee->nat_local_sn2_port );
         if ( pair_dt < 0 )
             pair_dt = -pair_dt;
 
-        if ( !distinct || pair_dt > N2N_NAT_PAIR_SECS )
+        if ( !distinct || !same_local || pair_dt > N2N_NAT_PAIR_SECS )
         {
-            if ( distinct )
+            if ( distinct && same_local )
             {
                 /* No valid pair yet: measure again instead of guessing. Refresh
                  * whichever observation is the stale side so the next two
@@ -2784,8 +2806,10 @@ static void nat_classify( n2n_edge_t * eee )
         if ( memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
              eee->nat_seen_sn1.port != eee->nat_seen_sn2.port )
         {
-            traceEvent( TRACE_NORMAL, "NAT mapping differs: sn1 sees %s, sn2 sees %s",
+            traceEvent( TRACE_NORMAL, "NAT mapping differs: local %u -> sn1 sees %s, local %u -> sn2 sees %s",
+                        (unsigned)eee->nat_local_sn1_port,
                         sock_to_cstr( sockbuf1, &eee->nat_seen_sn1 ),
+                        (unsigned)eee->nat_local_sn2_port,
                         sock_to_cstr( sockbuf2, &eee->nat_seen_sn2 ) );
             new_type = N2N_NAT_SYMMETRIC;
         }
@@ -5568,6 +5592,7 @@ process_n2n_packet:
                         {
                             eee->nat_seen_sn2 = ra.sock;
                             eee->nat_seen_sn2_at = now;
+                            eee->nat_local_sn2_port = udp_local_port( eee );
                             nat_classify( eee );
                         }
 
@@ -5892,6 +5917,8 @@ process_n2n_packet:
                                 memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
                                 eee->nat_seen_sn1_at = 0;
                                 eee->nat_seen_sn2_at = 0;
+                                eee->nat_local_sn1_port = 0;
+                                eee->nat_local_sn2_port = 0;
                                 eee->nat_bounce_seen = 0;
                                 eee->fc_seen = 0;
                                 /* The new mapping is a stranger again: the
@@ -5915,12 +5942,14 @@ process_n2n_packet:
                             {
                                 eee->nat_seen_sn2 = ra.sock;
                                 eee->nat_seen_sn2_at = now;
+                                eee->nat_local_sn2_port = udp_local_port( eee );
                                 nat_classify( eee );
                             }
                             else
                             {
                                 eee->nat_seen_sn1 = ra.sock;
                                 eee->nat_seen_sn1_at = now;
+                                eee->nat_local_sn1_port = udp_local_port( eee );
                                 nat_classify( eee );
                             }
                         }

@@ -591,6 +591,8 @@ struct n2n_edge
     n2n_sock_t          nat_seen_sn2;   /* edge addr observed by sn2 (family=0 if none) */
     time_t              nat_seen_sn1_at; /* when sn1's observation was taken (0 = none) */
     time_t              nat_seen_sn2_at; /* when sn2's observation was taken (0 = none) */
+    uint16_t            nat_local_sn1_port; /* local UDP port the sn1 echo left from */
+    uint16_t            nat_local_sn2_port; /* local UDP port the sn2 echo left from */
     time_t              nat_sn2_contact_at; /* first time we sent anything to the sn2 query
                                            channel (0 = never). The full-cone test needs sn2
                                            to be a source this edge has never sent to. */
