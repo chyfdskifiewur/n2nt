@@ -2812,18 +2812,28 @@ static void nat_classify( n2n_edge_t * eee )
                         sock_to_cstr( sockbuf2, &eee->nat_seen_sn2 ) );
             new_type = N2N_NAT_SYMMETRIC;
         }
-        else if ( eee->nat_bounce_seen )
-            new_type = N2N_NAT_RESTRICTED;
-        else if ( eee->nat_probe_notified != 0 && now > eee->fc_window_until )
-            /* Cone mapping, a bounce round really ran (the sn announced it
-             * from its real port) and no bounce came back within the window
-             * -> the helper port is filtered: port-restricted. */
-            new_type = N2N_NAT_PORT_RESTRICT;
         else
-            /* Either the round has not been announced yet (older sn: it never
-             * announces one, and guessing here would report a healthy cone
-             * NAT as port-restricted) or its answers are still in flight. */
-            new_type = N2N_NAT_UNKNOWN;
+        {
+            /* Same mapping toward both destinations: cone family. Which
+             * filter it runs is what the sn's helper-port round showed. */
+            traceEvent( TRACE_INFO, "NAT mapping agrees: local %u -> sn1 sees %s -> sn2 sees %s (bounce %d, notified %d)",
+                        (unsigned)eee->nat_local_sn1_port,
+                        sock_to_cstr( sockbuf1, &eee->nat_seen_sn1 ),
+                        sock_to_cstr( sockbuf2, &eee->nat_seen_sn2 ),
+                        eee->nat_bounce_seen, eee->nat_probe_notified );
+            if ( eee->nat_bounce_seen )
+                new_type = N2N_NAT_RESTRICTED;
+            else if ( eee->nat_probe_notified != 0 && now > eee->fc_window_until )
+                /* Cone mapping, a bounce round really ran (the sn announced it
+                 * from its real port) and no bounce came back within the window
+                 * -> the helper port is filtered: port-restricted. */
+                new_type = N2N_NAT_PORT_RESTRICT;
+            else
+                /* Either the round has not been announced yet (older sn: it never
+                 * announces one, and guessing here would report a healthy cone
+                 * NAT as port-restricted) or its answers are still in flight. */
+                new_type = N2N_NAT_UNKNOWN;
+        }
     }
     else if ( eee->nat_bounce_seen )
     {
