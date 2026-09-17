@@ -2806,10 +2806,9 @@ static void nat_classify( n2n_edge_t * eee )
         if ( memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
              eee->nat_seen_sn1.port != eee->nat_seen_sn2.port )
         {
-            traceEvent( TRACE_NORMAL, "NAT mapping differs: local %u -> sn1 sees %s, local %u -> sn2 sees %s",
+            traceEvent( TRACE_INFO, "NAT mapping differs: local %u -> sn1 sees %s -> sn2 sees %s",
                         (unsigned)eee->nat_local_sn1_port,
                         sock_to_cstr( sockbuf1, &eee->nat_seen_sn1 ),
-                        (unsigned)eee->nat_local_sn2_port,
                         sock_to_cstr( sockbuf2, &eee->nat_seen_sn2 ) );
             new_type = N2N_NAT_SYMMETRIC;
         }
