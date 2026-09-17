@@ -2835,6 +2835,36 @@ static void nat_classify( n2n_edge_t * eee )
         send_register_super( eee, &(eee->sn_query), 1, 0, NULL );
 }
 
+/* A packet from a helper source port got through: we never used that port
+ * as a destination, so the NAT filter is not port-restricted. Shared by the
+ * sn1 bounce and the sn2 helper-port probe.
+ * A frozen verdict is never re-measured, with one exception: a
+ * port-restricted label written while no helper delivery had ever arrived
+ * said "unproven", not "proven port-restricted" (the bounce packet can
+ * simply have been lost). Re-running the classifier on the evidence already
+ * collected can then only make the verdict more specific, and it sends no
+ * packet. Nothing else can move after the freeze. */
+static void nat_note_helper_port( n2n_edge_t * eee )
+{
+    if ( eee->nat_bounce_seen )
+        return;
+
+    eee->nat_bounce_seen = 1;
+
+    if ( !eee->nat_final )
+    {
+        nat_classify( eee );
+        return;
+    }
+
+    if ( eee->nat_type != N2N_NAT_PORT_RESTRICT )
+        return;
+
+    eee->nat_final = 0;
+    nat_classify( eee );
+    eee->nat_final = 1;
+}
+
 /* Bounce reply from a sn's helper socket arrived. Only public sources
  * count: a bounce from an in-LAN sn never crosses the NAT. The helper's
  * source port is random, so match by IP against the configured sns. */
@@ -2849,11 +2879,7 @@ static void handle_nat_bounce( n2n_edge_t * eee, const n2n_sock_t * sender )
            memcmp( sender->addr.v4, eee->sn_query.addr.v4, IPV4_SIZE ) != 0 ) )
         return;
 
-    if ( !eee->nat_bounce_seen )
-    {
-        eee->nat_bounce_seen = 1;
-        nat_classify( eee );
-    }
+    nat_note_helper_port( eee );
 }
 
 /* Full-cone probe ("N2NF", 4 raw bytes) from the sn2 query channel.
@@ -2878,9 +2904,8 @@ static void handle_nat_fc( n2n_edge_t * eee, const n2n_sock_t * sender )
     {
         if ( sender->port != eee->sn_query.port && !eee->nat_bounce_seen )
         {
-            eee->nat_bounce_seen = 1;
             traceEvent( TRACE_INFO, "NAT helper-port probe accepted (not port-restricted)" );
-            nat_classify( eee );
+            nat_note_helper_port( eee );
         }
         return;
     }
@@ -2966,10 +2991,15 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
      * changes, so the answer never wobbles afterwards; sn2 is left untouched
      * from here on until sn1 fails. Skipped while failover/ask_backup is
      * active (those paths contact sn2 anyway) and when sn_query IS the current
-     * supernode (its registration ACK already gives the second observation). */
+     * supernode (its registration ACK already gives the second observation).
+     * It is also spent only once the first observation (Test I) exists: on a
+     * slow start the single second observation must not be burned before the
+     * edge has seen any mapping at all, or nothing is measured and the
+     * verdict gets frozen at "unknown". */
     if ( eee->sn_num >= 2 && !eee->use_ws && eee->sn_idx == 0 &&
          !eee->sn_ask_backup && !eee->sn_all_failed &&
          eee->sn_query.family != 0 &&
+         eee->nat_seen_sn1.family == AF_INET &&
          sock_equal( &(eee->sn_query), &(eee->supernode) ) != 0 &&
          !eee->nat_final )
     {
