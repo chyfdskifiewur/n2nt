@@ -242,15 +242,6 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
                           (t) == N2N_NAT_PORT_RESTRICT ? "port-restr" : \
                           (t) == N2N_NAT_SYMMETRIC ? "symmetric" : "unknown" )
 
-/* NAT measurement timing (n2n6+ model). */
-#define N2N_NAT_SAMPLE_SLOTS        4    /* observations of our own public address */
-#define N2N_NAT_SAMPLE_TTL          120  /* a vantage observation stays fresh this long */
-#define N2N_NAT_SENT_SLOTS          32   /* recent send destinations, for inbound classification */
-#define N2N_NAT_SAMPLE_INTERVAL     60   /* routine sn2 sample period */
-#define N2N_NAT_FC_WINDOW           8    /* after a fresh mapping: stay silent towards sn2
-                                            for this long while its main socket probes us as
-                                            a stranger, then start sampling */
-
 /* NAT type <-> aflags bits: REGISTER_SUPER carries the edge's own type,
  * PEER_INFO carries a peer's type to edges for mgmt display. */
 #define N2N_NAT_AFLAGS(t) ( (t) == N2N_NAT_FULL_CONE ? N2N_AFLAGS_NAT_FULL_CONE : \
@@ -538,31 +529,43 @@ struct n2n_edge
     n2n_sock_t          cached_dst_sock;
     time_t              cached_dst_time;
 
-    /* Relay client: community relay peer (mini-SN). Set when the SN advertises
-     * the relay (PEER_INFO with N2N_AFLAGS_RELAY): the edge registers itself to
-     * the relay, dual-sends relay+SN until a frame returns through the relay
-     * (relay_proven), then single-sends. Cleared once a direct P2P path exists. */
-    n2n_mac_t           relay_mac;      /* the relay peer's MAC */
-    n2n_sock_t          relay_sock;     /* the relay's forwarding endpoint */
-    uint8_t             relay_valid;    /* 1 = relay installed */
-    time_t              relay_last_reg; /* last REGISTER sent to the relay (3s heartbeat) */
-    time_t              relay_proven;   /* last frame received THROUGH the relay; 0=never */
-    time_t              relay_last_ack; /* last relay REGISTER_ACK; 0=never. Liveness, not traffic. */
+    /* Relay client: community relay peer (mini-SN). Set when SN advertises the
+     * relay (PEER_INFO with N2N_AFLAGS_RELAY). While active, the edge registers
+     * to it so it learns our socket, and packets whose direct path is not up
+     * are dual-sent to the relay and the supernode until a frame returns
+     * through the relay (relay_proven), then sent to the relay only. Cleared
+     * once a direct P2P link is established (no more relaying needed). */
+    n2n_mac_t           relay_mac;
+    n2n_sock_t          relay_sock;
+    uint8_t             relay_valid;
+    time_t              relay_last_reg;
+    time_t              relay_proven;       /* last time a frame was received THROUGH the relay; 0=never */
+    time_t              relay_last_ack;     /* last time the relay answered our REGISTER (heartbeat ACK);
+                                               0 = never / not installed. Health signal, decoupled from
+                                               data traffic like the supernode failover logic */
 
-    /* Relay server: 1 = this edge IS the relay (mini-SN): it forwards PACKETs
-     * addressed to peers that registered to it (directly reachable, NAT1). */
+    /* Relay server: when set, this edge acts as the relay and forwards
+     * PACKETs addressed to a peer that registered to it (mini-SN). Only a
+     * "good" peer (NAT1 + public address) self-enables this. NAT2 relays are
+     * left for the "else -> back to SN" fallback and are not implemented. */
     uint8_t             relay_mode;
 
-    /* Members registered to this relay for forwarding: a dedicated table,
-     * independent of the P2P peer tables so the relay path survives churn. */
+    /* Relay server member table (mini-SN). Unlike known_peers/pending_peers
+     * (the P2P tables this edge punches on), the relay keeps a dedicated list
+     * of peers that registered to it for forwarding; these are reachable
+     * directly (NAT1) so their socket comes from the actual REGISTER transport
+     * source. This mirrors how the SN maintains its edge list, and is
+     * independent of P2P cleanup so the relay path survives peer-table churn. */
     struct peer_info *  relay_peers;
 
-    /* Relay client state: no ACK for RELAY_ACK_SECS -> dead relay, fall back
-     * to the SN and retry every relay_probe_next. relay_proven drives the
-     * send-side single/dual decision. */
-    time_t              relay_probe_next;   /* when to retry a dead relay */
-    uint8_t             relay_giveup;       /* 1 = relay dead, stay on SN until retry */
-    uint8_t             relay_willing;      /* relay stance advertised to SN: 0/1/2/3 */
+    /* Relay client state: relay_last_ack is refreshed by the relay's REGISTER_ACK
+     * (our 3s heartbeat) and drives liveness: no ACK for RELAY_ACK_SECS means
+     * the relay is dead and we fall back to the supernode, retrying it every
+     * relay_probe_next period. relay_proven tracks frames received THROUGH the
+     * relay and controls send-side single/dual sending. */
+    time_t              relay_probe_next;       /* when to retry a dead relay */
+    uint8_t             relay_giveup;           /* 1=relay deemed dead, stay on SN until retry */
+    uint8_t             relay_willing;          /* advertised to SN for relay selection: 0/1/2/3 */
 
     struct peer_info *  known_peers;
     struct peer_info *  pending_peers;
@@ -593,33 +596,28 @@ struct n2n_edge
 
     n2n_sock_t          my_public_sock;
 
-    /* NAT type detection (n2n6+ model): two vantage points observe our public
-     * mapping (dual-sn compare -> symmetric), inbound datagrams prove filter
-     * behaviour (stranger IP -> full-cone, known IP + stranger port ->
-     * addr-restr), the sn's bounce-round notice turns post-window silence
-     * into a port-restr verdict. Evidence lives until the mapping changes. */
-    uint8_t             nat_type;       /* last verdict, N2N_NAT_* */
-    uint8_t             nat_reported;   /* verdict last pushed to the supernode */
-    uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the sn2 sample probe */
-    struct {                               /* vantage points that saw our public address */
-        n2n_sock_t      vantage;
-        n2n_sock_t      mapped;
-        time_t          when;
-    }                   nat_samples[N2N_NAT_SAMPLE_SLOTS];
-    uint8_t             nat_sample_next;   /* ring write index */
-    struct {                               /* destinations we sent to recently */
-        n2n_sock_t      sock;
-        time_t          when;
-    }                   nat_sent[N2N_NAT_SENT_SLOTS];
-    uint8_t             nat_sent_next;
-    time_t              nat_fc_evid;       /* last unsolicited inbound, from an IP we never sent to */
-    time_t              nat_addr_evid;     /* last inbound from a known IP on a stranger port */
-    time_t              nat_notify_at;     /* sn announced a probe round: silence then means filtered */
-    time_t              nat_fc_window_until; /* stay silent towards sn2 until this time so its
-                                                main-socket probe arrives as a stranger */
-    time_t              nat_first_sample;  /* first sn1 observation; drives the settling burst */
-    int                 nat_burst_left;    /* remaining samples of that burst */
-    time_t              nat_next_sample;   /* when the next routine sn2 sample is due */
+    /* NAT type detection: dual-sn reflection (mapping compare) plus the sn
+     * bounce test (helper socket, different source port) for cone sub-types. */
+    uint8_t             nat_type;       /* N2N_NAT_* */
+    n2n_sock_t          nat_seen_sn1;   /* edge addr observed by sn1 (family=0 if none) */
+    n2n_sock_t          nat_seen_sn2;   /* edge addr observed by sn2 (family=0 if none) */
+    time_t              nat_probe_time; /* last one-shot symmetric check attempt */
+    uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
+    uint8_t             nat_bounce_seen;   /* a public helper-port bounce arrived */
+    uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
+    uint8_t             fc_window;      /* 1 until the first packet is sent to sn2 */
+    time_t              fc_arm_time;    /* when the stranger window was last (re-)armed:
+                                           the one-shot symmetric check is spent 12s
+                                           later, once the window has served its purpose */
+    uint8_t             nat_sym_tries;  /* attempts spent on the one-shot symmetric check */
+    uint8_t             nat_final;      /* 1: verdict frozen, sn2 is a stranger no more
+                                           (cleared on restart / mapping change only) */
+    uint8_t             nat_reprobe;    /* one-shot: next sn1 registration asks the SN to
+                                           re-trigger the brother's N2NF probe (mgmt "n") */
+    time_t              nat_revert_at;  /* mgmt "n" in fixed-port mode: rebind the configured
+                                           local port again once this time is reached (0 = none) */
+    uint8_t             nat_suppress_remap; /* one-shot: next ACK-remap only updates
+                                           my_public_sock, keeps the fresh NAT verdict */
 
     n2n_sock_t          own_ipv6;       /* routable global IPv6 (GUA) of this edge,
                                            reported to supernode for IPv6 hole-punching

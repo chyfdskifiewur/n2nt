@@ -168,21 +168,30 @@ typedef struct n2n_PACKET n2n_PACKET_t;
 /* Linked with n2n_register_super in n2n_pc_t. Only from edge to supernode. */
 #define N2N_AFLAGS_LOCAL_SOCKET   0x0001  /* local_sock field is valid */
 #define N2N_AFLAGS_NAT_SYMMETRIC  0x0040  /* edge reports symmetric NAT (dual-sn reflection) */
-#define N2N_AFLAGS_NAT_BOUNCE     0x0080  /* edge asks this sn for a NAT bounce test: reply
-                                             from the helper socket with 4-byte magic "N2NB" */
-#define N2N_AFLAGS_NAT_FULL_CONE  0x0100  /* edge reports full-cone NAT (proved by an "N2NF"
-                                             probe from the brother sn, a never-contacted source) */
+#define N2N_AFLAGS_NAT_BOUNCE     0x0080  /* edge asks this sn for a NAT bounce test:
+                                             sn replies from an extra helper socket
+                                             (different source port, outbound-only)
+                                             with the 4-byte magic "N2NB" */
+#define N2N_AFLAGS_NAT_FULL_CONE  0x0100  /* edge reports full-cone NAT
+                                             (proved by an "N2NF" probe from the
+                                             brother sn, a never-contacted source) */
 #define N2N_AFLAGS_NAT_RESTRICTED 0x0200  /* edge reports address-restricted cone NAT */
 #define N2N_AFLAGS_NAT_PORT_RESTRICT 0x0400 /* edge reports port-restricted NAT */
 #define N2N_AFLAGS_FORCE_PEER_INFO 0x0008  /* force supernode to push all peer info */
 #define N2N_AFLAGS_RELAY_WILLING_NO  0x0800 /* edge refuses to act as the relay (SN never picks it) */
 #define N2N_AFLAGS_RELAY_WILLING_YES 0x1000 /* edge is willing to act as the relay (SN prefers it) */
-#define N2N_AFLAGS_RELAY_WILLING_FORCE 0x2000 /* edge forces to be the relay even if the SN turned
-                                             community relay off (sn -Z 0): re-enables the group
-                                             relay and uses only the forcing member */
+#define N2N_AFLAGS_RELAY_WILLING_FORCE 0x2000 /* edge forces to be the relay even if the SN
+                                             turned community relay off (sn -Z 0): re-enables
+                                             the group relay and uses only the forcing member */
                                         /* neither set = default "can be" relay (secondary) */
-#define N2N_AFLAGS_QUERY_ONLY     0x0010  /* REGISTER_SUPER is a one-shot query: ACK but do NOT
-                                             register/persist this edge as a peer */
+#define N2N_AFLAGS_QUERY_ONLY     0x0010  /* REGISTER_SUPER is a one-shot query
+                                             (e.g. ask sn2 for sn1's current address):
+                                             supernode replies with an ACK but does
+                                             NOT register/persist this edge as a peer */
+#define N2N_AFLAGS_NAT_REPROBE    0x4000  /* edge asks the supernode to re-trigger the
+                                             brother's full-cone "N2NF" probe even though
+                                             this registration is not a new/remapped edge
+                                             (mgmt "n" command re-runs NAT detection) */
 
 struct n2n_REGISTER_SUPER
 {
