@@ -2857,18 +2857,33 @@ static void handle_nat_bounce( n2n_edge_t * eee, const n2n_sock_t * sender )
 }
 
 /* Full-cone probe ("N2NF", 4 raw bytes) from the sn2 query channel.
- * Counts only while the edge has NEVER sent anything to sn2 in this
- * mapping lifetime (fc_window): sn2 is then a never-contacted source, so
- * delivery proves the NAT filter admits ANY source -> full cone. Public
- * sources only, matched by IP against the sn2 query channel. */
+ * Counts as full cone only while the edge has NEVER sent anything to sn2
+ * in this mapping lifetime (fc_window): sn2's address is then a
+ * never-contacted source, so delivery proves the NAT filter admits ANY
+ * source. After that first contact the same packet proves nothing (a cone
+ * NAT and a port-restricted one both admit our own destination), but a
+ * probe from a source port we never used as a destination still rules out
+ * a port-restricted NAT. That is weak evidence only: it never upgrades the
+ * verdict to full cone and never erases what was measured before.
+ * Public sources only, matched by IP against the sn2 query channel. */
 static void handle_nat_fc( n2n_edge_t * eee, const n2n_sock_t * sender )
 {
-    if ( !eee->fc_window ) return; /* sn2 contacted before: no stranger anymore */
     if ( sender->family != AF_INET || nat_addr_private( sender->addr.v4 ) )
         return;
     if ( eee->sn_query.family != AF_INET ||
          memcmp( sender->addr.v4, eee->sn_query.addr.v4, IPV4_SIZE ) != 0 )
         return;
+
+    if ( !eee->fc_window )
+    {
+        if ( sender->port != eee->sn_query.port && !eee->nat_bounce_seen )
+        {
+            eee->nat_bounce_seen = 1;
+            traceEvent( TRACE_INFO, "NAT helper-port probe accepted (not port-restricted)" );
+            nat_classify( eee );
+        }
+        return;
+    }
 
     if ( !eee->fc_seen )
     {

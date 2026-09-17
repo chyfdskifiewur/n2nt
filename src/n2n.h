@@ -603,7 +603,7 @@ struct n2n_edge
     n2n_sock_t          nat_seen_sn2;   /* edge addr observed by sn2 (family=0 if none) */
     time_t              nat_probe_time; /* last one-shot symmetric check attempt */
     uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
-    uint8_t             nat_bounce_seen;   /* a public helper-port bounce arrived */
+    uint8_t             nat_bounce_seen;   /* a helper-port delivery got through: not port-restricted */
     uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
     uint8_t             fc_window;      /* 1 until the first packet is sent to sn2 */
     time_t              fc_arm_time;    /* when the stranger window was last (re-)armed:

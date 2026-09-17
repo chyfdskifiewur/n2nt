@@ -2311,9 +2311,12 @@ static int try_broadcast( n2n_sn_t * sss,
  * mapping and starts empty. A source the edge has NEVER contacted can
  * therefore only get through a full-cone NAT. When a brother SN forwards
  * a brand-new edge mapping ("N2NF" + mac + IPv4 + port, 16 raw bytes),
- * we fire 3 tiny "N2NF" datagrams at it from our main socket — by
- * construction a never-contacted source. The edge accepts the probe only
- * from its sn2 query channel IP and only before its first packet there. */
+ * we fire tiny "N2NF" datagrams at it — by construction never-contacted
+ * sources. The edge accepts the probe only from its sn2 query channel IP,
+ * and reads it as full cone only while it has not contacted that channel.
+ * One probe leaves from the bounce helper socket instead (same IP, a
+ * source port the edge never uses as a destination): that one still rules
+ * out a port-restricted NAT after the edge has contacted the channel. */
 
 /* Fire the probe at a forwarded edge mapping. Sender must match a live
  * brother entry (IP level) so only the paired SN can trigger it. */
@@ -2359,6 +2362,23 @@ static void handle_fc_probe_request( n2n_sn_t *sss,
      * re-mapped edge the ACK that re-arms its stranger window beats probe
      * #1 — the later probes are the ones that land in the open window. */
     sendto_sock( sss, &target, msg, sizeof(msg) );
+
+    /* One extra probe from the bounce helper socket: same IP, but a source
+     * port the edge has never used as a destination. While the edge has not
+     * contacted us it proves full cone just like the probes above; once it
+     * has (that port is then whitelisted), a delivery still proves the
+     * filter is not port-restricted. */
+    if ( sss->bounce_sock >= 0 )
+    {
+        struct sockaddr_in tgt;
+        memset( &tgt, 0, sizeof(tgt) );
+        tgt.sin_family = AF_INET;
+        tgt.sin_port   = htons( target.port );
+        memcpy( &(tgt.sin_addr), target.addr.v4, IPV4_SIZE );
+        sendto( sss->bounce_sock, msg, sizeof(msg), 0,
+                (const struct sockaddr *)&tgt, sizeof(tgt) );
+    }
+
     for ( int i = 0; i < FC_PROBE_MAX; i++ )
     {
         if ( sss->fc_probes[i].left > 0 ) continue;
@@ -2368,7 +2388,7 @@ static void handle_fc_probe_request( n2n_sn_t *sss,
         break;
     }
 
-    traceEvent( TRACE_INFO, "FC probe: N2NF x3 -> %s",
+    traceEvent( TRACE_INFO, "FC probe: N2NF x3 + helper -> %s",
                 sock_to_cstr( sockbuf, &target ) );
 }
 
