@@ -444,12 +444,23 @@ typedef char n2n_sn_name_t[N2N_EDGE_SN_HOST_SIZE];
 
 #define MAX_BROTHER_SNS         16
 
+/* Direction of a brother-SN relationship. Probing never crosses it:
+ *   ROLE_MY_BIG    - this SN registered ME as its [-b] little brother
+ *                    (it sent brother_reg here). It is one of my "big
+ *                    brothers"; I may adopt/probe its edges when asked.
+ *   ROLE_MY_LITTLE - this SN is MY [-b] configured little brother (sn2).
+ *                    Only it may be asked to run full-cone probes for my
+ *                    edges; I never probe its edges. */
+#define N2N_BROTHER_ROLE_MY_BIG      1
+#define N2N_BROTHER_ROLE_MY_LITTLE   2
+
 typedef struct {
     n2n_sock_t   sock;         /* current socket of this brother SN (IPv4 or IPv6, whichever arrives first) */
     n2n_sock_t   sock6;        /* IPv6 socket of this brother SN (optional, family=0 if not seen on v6) */
     time_t       seen;         /* last registration time (0 = never, not counted in num_brothers) */
     time_t       seen6;        /* last v6 registration time */
     n2n_mac_t    mac;          /* MAC of the brother SN (all-zero = invalid) */
+    uint8_t      role;         /* N2N_BROTHER_ROLE_* : direction of the relationship */
 } n2n_brother_entry_t;
 
 #ifndef N2N_PATHNAME_MAXLEN

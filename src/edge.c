@@ -396,11 +396,7 @@ static int edge_init(n2n_edge_t * eee)
     eee->fc_arm_time = n2n_now(); /* the one-shot symmetric check fires 12s after start; anchoring keeps the stranger window open until the brother's N2NF probes land */
     eee->nat_sym_tries = 0;
     eee->nat_final = 0;
-    /* Every run asks the SN once for the brother's N2NF full-cone probe (the
-     * same one-shot path as mgmt "n"). Restarting the edge alone must re-arm
-     * NAT1: the SN's is_new_edge gate misses it (same MAC, and with a stable
-     * UPnP mapping even the same public addr). */
-    eee->nat_reprobe = 1;
+    eee->nat_reprobe = 0;
     eee->sn_query_index = 1;
     eee->sn_backup_index = 1;
     eee->sn_af = AF_UNSPEC;
@@ -5996,14 +5992,6 @@ process_n2n_packet:
                                      * before the brother's N2NF probes land. */
                                     eee->nat_probe_time = now;
                                     eee->fc_arm_time = now;
-                                    /* Re-ask the SN for the brother's N2NF on
-                                     * an immediate registration: the mapping
-                                     * was recreated (stranger window open
-                                     * again), and the periodic registration
-                                     * could come after the 12s symmetric check
-                                     * has already contacted sn2. */
-                                    eee->nat_reprobe = 1;
-                                    send_register_super( eee, &(eee->supernode), 1, 0, NULL );
                                 }
                             }
 
