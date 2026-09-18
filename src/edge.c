@@ -377,6 +377,7 @@ static int edge_init(n2n_edge_t * eee)
     eee->sn_ask_backup = 0;
     memset(eee->sn1_current_addr, 0, sizeof(eee->sn1_current_addr));
     memset(eee->sn1_mac, 0, sizeof(eee->sn1_mac));
+    memset(&eee->sn1_v4, 0, sizeof(eee->sn1_v4));
     memset(&eee->sn1_v6, 0, sizeof(eee->sn1_v6));
     memset(eee->sn_ack_backup, 0, sizeof(eee->sn_ack_backup));
     eee->sn_ak_parsed = 0;
@@ -1327,11 +1328,16 @@ static void cache_sn1_addr( n2n_edge_t * eee,
     {
         snprintf( eee->sn1_current_addr,
                   sizeof(eee->sn1_current_addr), "%s", addr_buf );
-        if ( bin->family == AF_INET &&
-             strncmp( eee->sn_ip_array[0], addr_buf,
-                      sizeof(eee->sn_ip_array[0]) ) != 0 )
-            snprintf( eee->sn_ip_array[0],
-                      sizeof(eee->sn_ip_array[0]), "%s", addr_buf );
+        if ( bin->family == AF_INET )
+        {
+            /* Keep the display copy of sn1's real v4 in sync (ask_backup
+             * brother match), so -Q shows the true address after failover. */
+            eee->sn1_v4 = *bin;
+            if ( strncmp( eee->sn_ip_array[0], addr_buf,
+                          sizeof(eee->sn_ip_array[0]) ) != 0 )
+                snprintf( eee->sn_ip_array[0],
+                          sizeof(eee->sn_ip_array[0]), "%s", addr_buf );
+        }
     }
 }
 
@@ -4560,6 +4566,11 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             /* ACK-learned brother: show the masked display copy instead */
             if ( sn_is_ack_brother(eee, sn_i) && eee->sn_bak_masked[0] )
                 sn_host = eee->sn_bak_masked;
+            /* SN1 row: prefer the resolved/learnt real IPv4 over the -l
+             * hostname, so -Q shows the address actually in use. */
+            n2n_sock_str_t v4buf;
+            if ( sn_i == 0 && eee->sn1_v4.family == AF_INET )
+                sn_host = sock_to_cstr( v4buf, &eee->sn1_v4 );
             char host[N2N_SOCKBUF_SIZE + 1] = "";
             if (sn_i == 0 && eee->sn1_v6.family == AF_INET6)
             {
@@ -7390,6 +7401,11 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         sleep(5);
 #endif
     }
+
+    /* Remember sn1's resolved v4 so -Q shows the real address (not the
+     * -l hostname) from startup, before any ask_backup has happened. */
+    if ( eee.supernode.family == AF_INET )
+        eee.sn1_v4 = eee.supernode;
 
     /* Failover target: the user-configured second -l, when present. The query
      * channel stays on the sn1-official backup (index 1 once the sn1 ACK

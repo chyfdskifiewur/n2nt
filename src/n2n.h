@@ -582,6 +582,7 @@ struct n2n_edge
     uint8_t             sn_ask_backup;
     char                sn1_current_addr[N2N_SOCKBUF_SIZE]; /* Authoritative sn1 address (DNS preferred). */
     n2n_mac_t           sn1_mac;        /* MAC of the SN the edge is currently registered with. */
+    n2n_sock_t          sn1_v4;         /* sn1's resolved IPv4 address (DNS of -l or ask_backup). */
     n2n_sock_t          sn1_v6;         /* sn1's IPv6 address (as reported by sn1 in the ACK). */
     uint8_t             sn_ack_backup[N2N_EDGE_NUM_SUPERNODES]; /* indices whose entry came from the sn1 ACK (backup). */
     uint8_t             sn_ak_parsed;   /* sn1's ACK backup string parsed (learnt or already present) */
