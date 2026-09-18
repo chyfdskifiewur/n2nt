@@ -300,6 +300,7 @@ struct peer_info {
     time_t              relay_adv_time;    /* sn: last time this edge was advertised as the relay (throttle) */
     time_t              sn_fwd_first;      /* sn: first time this edge's unicast data was relayed via SN (0=never); gates community-relay announcement */
     uint8_t             relay_willing;     /* sn: edge's relay stance: 0=refuse,1=default,2=willing,3=force */
+    time_t              relay_adv_live;    /* sn: last time this peer was advertised AS the community relay (0=never) */
     /* Compact packet protocol support (version 0xE5 header) */
     uint8_t             compact_capable;   /* 1=understands compact format, 0=legacy/unknown */
     uint16_t            transform_id;      /* transform ID learned from PACKET headers (for SN legacy conversion) */

@@ -4540,11 +4540,15 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
 
             disp++;
 
-            /* Left column: sequential label (1..); '*' marks the active one. */
+            /* Left column: the active one shows '*' INSTEAD of the number (same
+             * style as the P2P_with relay '*'); others their sequential
+             * label. Each string carries its own width (" *" / "%2u") so
+             * the column aligns exactly like the edge list above. */
             char marker[8];
-            snprintf(marker, sizeof(marker), "%u%c",
-                     (unsigned)disp,
-                     (sn_i == eee->sn_idx) ? '*' : ' ');
+            if ( sn_i == eee->sn_idx )
+                snprintf(marker, sizeof(marker), " *");
+            else
+                snprintf(marker, sizeof(marker), "%2u", (unsigned)disp);
             const char *conn_str = (eee->supernode.family == AF_INET6) ? "IPv6" : "IPv4";
             const char *tok_str = (eee->token_configured && eee->sn_tokens[sn_i].toksize > 0) ? "Pass" : "NoTok";
             const char *b_marker = "";
@@ -4614,17 +4618,25 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
              * marker 2, mac 17, host 49, "supp:" 14, "conn:" 9, tok 5, +B. */
             char sup_field[20];
             char conn_field[16];
-            /* "supp" is a single shared value learned from the latest ACK:
-             * it only describes sn1. For the ACK-learned brother show '-' */
-            if ( eee->sn_ack_backup[sn_i] )
+            char tok_row[8];
+            /* "supp" is learned from the latest ACK and only describes sn1.
+             * For the ACK-learned brother the row carries no real data of its
+             * own: it was never configured via -l, never registered to, so its
+             * conn/token values (copied from the active socket / per-SN config)
+             * would be fabricated. Dash them all, same as the MAC/host. */
+            if ( eee->sn_ack_backup[sn_i] ) {
                 snprintf(sup_field, sizeof(sup_field), "supp:-");
-            else
+                snprintf(conn_field, sizeof(conn_field), "conn:-");
+                snprintf(tok_row, sizeof(tok_row), "-");
+            } else {
                 snprintf(sup_field, sizeof(sup_field), "supp:%s", sn_support);
-            snprintf(conn_field, sizeof(conn_field), "conn:%s", conn_str);
+                snprintf(conn_field, sizeof(conn_field), "conn:%s", conn_str);
+                snprintf(tok_row, sizeof(tok_row), "%s", tok_str);
+            }
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %-2.2s  %-17.17s  %-49.49s  %-14.14s  %-9.9s  %-5.5s  %s\n",
+                               " %s  %-17.17s  %-49.49s  %-14.14s  %-9.9s  %-5.5s  %s\n",
                                marker, mac_str, sn_host, sup_field,
-                               conn_field, tok_str, b_marker);
+                               conn_field, tok_row, b_marker);
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
         }

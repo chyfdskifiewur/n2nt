@@ -1137,15 +1137,12 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
          * have_v4 || have_v6 is guaranteed above, so the slot always has a
          * last-seen timestamp.) */
         time_t last = b->seen ? b->seen : b->seen6;
-        const char *role_tag = "?";
-        if (b->role == N2N_BROTHER_ROLE_MY_BIG) role_tag = "big";
-        else if (b->role == N2N_BROTHER_ROLE_MY_LITTLE) role_tag = "lit";
         size_t line_start = written;
         written += snprintf(buf + written, bufsz - written,
-                            "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s %s",
+                            "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s",
                             counter,
                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                            v4_part, v6_part, role_tag);
+                            v4_part, v6_part);
         int pad = (int)sizeof(mgmt_header) - 5 - (int)(written - line_start);
         if (pad < 1) pad = 1;
         written += snprintf(buf + written, bufsz - written,
@@ -2022,9 +2019,27 @@ static int process_mgmt( n2n_sn_t * sss,
         r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
         if (r <= 0) return -1;
 
+        /* A peer once advertised as the community relay keeps its '*' forever
+         * (last state preserved). Pre-scan whether any peer in this community
+         * has ever been used: only then does a forced relay (-Z 3) stay hidden
+         * behind the actually-used one. */
+        int community_has_sticky = 0;
+        {
+            struct peer_info *scan = sss->edges;
+            while (scan) {
+                if (memcmp(scan->community_name, communities[i], sizeof(n2n_community_t)) == 0 &&
+                    scan->relay_adv_live != 0) {
+                    community_has_sticky = 1;
+                    break;
+                }
+                scan = scan->next;
+            }
+        }
+
         /* Output all edges belonging to this community directly from the original list */
         struct peer_info *edge = sss->edges;
         int id = 1;
+        int force_shown = 0; /* at most one forced relay gets '*' */
         while (edge) {
             if (memcmp(edge->community_name, communities[i], sizeof(n2n_community_t)) != 0) {
                 edge = edge->next;
@@ -2094,9 +2109,25 @@ static int process_mgmt( n2n_sn_t * sss,
                         }
                     }
                 }
+                /* ' *' marks the community relay: either actually used (sticky, once
+                 * set it never clears) or, when nothing has been used yet,
+                 * the member that forces relaying (-Z 3). Same 2-char width
+                 * as %2u to keep the column aligned. */
+                const char *seq = " *";
+                char seqnum[8];
+                int is_live_relay = (edge->relay_adv_live != 0) ||
+                                    (edge->relay_willing == 3 && !community_has_sticky && !force_shown);
+                if ( is_live_relay )
+                    force_shown = 1;
+                else
+                {
+                    snprintf(seqnum, sizeof(seqnum), "%2u", id);
+                    seq = seqnum;
+                }
+                id++;
                 ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                                   "  %2u  %-17s  %-15s  %-47s  %-7s  %-7s  %s\n",
-                                   id++, macaddr_str(mac_buf, edge->mac_addr), virt_ip,
+                                   "  %2s  %-17s  %-15s  %-47s  %-7s  %-7s  %s\n",
+                                   seq, macaddr_str(mac_buf, edge->mac_addr), virt_ip,
                                    wan, version, os_name,
                                    N2N_NAT_NAME(edge->nat_type));
             }
@@ -2713,6 +2744,7 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
     }
     /* Notify the relay itself (PEER_INFO RELAY naming its own MAC) so it
      * switches on forwarding without self-judging eligibility. Idempotent. */
+    relay->relay_adv_live = now; /* mark as "in use" for mgmt display */
     advertise_relay_to( sss, cmn, relay, relay );
 }
 
