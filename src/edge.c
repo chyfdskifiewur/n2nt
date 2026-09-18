@@ -2810,7 +2810,7 @@ static void nat_classify( n2n_edge_t * eee )
     new = N2N_NAT_NAME( new_type );
     eee->nat_type = new_type;
 
-    traceEvent( TRACE_NORMAL, "NAT type: %s -> %s", old, new );
+    traceEvent( TRACE_NORMAL, "NAT type (RFC 3489): %s -> %s", old, new );
 
     /* Push the freshly classified NAT type to the SN right away so its
      * relay-eligibility decision (who is qualified to relay for the group)
@@ -4565,7 +4565,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             {
                 n2n_sock_str_t v6buf;
                 const char *v6s = sock_to_cstr(v6buf, &eee->sn1_v6); /* "[...]:port" */
-                if (strlen(sn_host) + 1 + strlen(v6s) <= 50)
+                /* Column is 49 chars wide (%-49.49s below): budget the full
+                 * v4/v6 string against 49, not 50, or the trailing port
+                 * digit gets truncated by the print width. */
+                if (strlen(sn_host) + 1 + strlen(v6s) <= 49)
                 {
                     snprintf(host, sizeof(host), "%s/%s", sn_host, v6s);
                 }
@@ -4578,8 +4581,8 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                     size_t addr_len = 0;
                     while (v6s[1 + addr_len] && v6s[1 + addr_len] != ']') addr_len++;
                     size_t tail = 1 /* / */ + 1 /* [ */ + 2 /* ] : */ + port_len;
-                    size_t avail = (strlen(sn_host) + tail < 50)
-                             ? 50 - strlen(sn_host) - tail : 1;
+                    size_t avail = (strlen(sn_host) + tail < 49)
+                             ? 49 - strlen(sn_host) - tail : 1;
                     size_t keep = (avail >= 1) ? avail - 1 : 0;  /* room for '*' */
                     if (keep > addr_len) keep = addr_len;
                     size_t off = strlen(sn_host);
@@ -5631,8 +5634,11 @@ process_n2n_packet:
                         eee->last_sup = now;
                         if ( ra.sn_bak.family != 0 )
                         {
-                            cache_sn1_addr( eee, ra.sn_bak_str, ra.sn_bak_str_len,
-                                            &ra.sn_bak );
+                            /* sn_bak_str is the ANSWERING sn's own -b text,
+                             * not an sn1 address: never let it rewrite
+                             * sn_ip_array[0]. Only the brother-matched sock
+                             * (ra.sn_bak) is a genuine sn1 address. */
+                            cache_sn1_addr( eee, NULL, 0, &ra.sn_bak );
                             if ( mac_nonzero( ra.sn1_mac ) )
                                 memcpy( eee->sn1_mac, ra.sn1_mac, N2N_MAC_SIZE );
                             if ( ra.sn_bak_v6.family == AF_INET6 )
@@ -5722,8 +5728,10 @@ process_n2n_packet:
                                 eee->sn_idx = 0;
                                 eee->sn_ask_backup = 0;
                                 eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
-                                cache_sn1_addr( eee, ra.sn_bak_str,
-                                                ra.sn_bak_str_len, &ra.sn_bak );
+                                /* sn_bak_str is the answering sn's own -b
+                                 * text, not an sn1 address: use the brother-
+                                 * matched binary sock instead. */
+                                cache_sn1_addr( eee, NULL, 0, &ra.sn_bak );
                                 sock_to_cstr( sockbuf1, &ra.sn_bak );
                                 if ( strcmp(eee->sn1_current_addr, sockbuf1) == 0 )
                                     traceEvent(TRACE_WARNING,
