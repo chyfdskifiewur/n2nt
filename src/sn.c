@@ -3694,11 +3694,15 @@ static int process_udp( n2n_sn_t * sss,
                                    find_peer_by_mac(sss->edges, reg.edgeMac),
                                    cmn.community );
 
-        /* Brand-new (or re-mapped) edge — or an edge that explicitly asked for a
-         * manual NAT re-probe (mgmt "n", N2N_AFLAGS_NAT_REPROBE): one-shot
+        /* Brand-new edge (update_edge == 1) or known edge whose public address
+         * changed (== 3: its NAT mapping was recreated, so the stranger window
+         * is open again) — or an edge that explicitly asked for a manual NAT
+         * re-probe (mgmt "n" / edge restart, N2N_AFLAGS_NAT_REPROBE): one-shot
          * chance for the brother SN to full-cone-probe it as a
-         * never-contacted source. */
-        if ( is_new_edge || (reg.aflags & N2N_AFLAGS_NAT_REPROBE) )
+         * never-contacted source. (is_new_edge == 2, NAT type changed with an
+         * unchanged address, does NOT re-probe: the mapping never changed, so
+         * an out-of-window probe would buy nothing.) */
+        if ( is_new_edge == 1 || is_new_edge == 3 || (reg.aflags & N2N_AFLAGS_NAT_REPROBE) )
             send_fc_probe_request( sss, reg.edgeMac, &(ack.sock), now );
 
         /* Remember the edge's relay stance so find_community_relay can prefer
