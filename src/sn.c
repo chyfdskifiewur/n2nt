@@ -3476,8 +3476,8 @@ static int process_udp( n2n_sn_t * sss,
                  * the source port made the edge re-register to a dead
                  * 8.148.244.159:<random> and lose touch with sn1. */
                 be->adv_sock = sender_n2n;
-                be->adv_sock.addr.v4.sin_port =
-                    htons( backup_text_port( sss->backup_addr_text ) );
+                { uint16_t bport = backup_text_port( sss->backup_addr_text );
+                  if ( bport ) be->adv_sock.port = bport; }
                 be->adv_sock6.family = 0;
             }
             else if ( sender_n2n.family == AF_INET6 )
@@ -3486,8 +3486,8 @@ static int process_udp( n2n_sn_t * sss,
                 be->seen6 = now;
                 be->adv_sock.family = 0;
                 be->adv_sock6 = sender_n2n;
-                be->adv_sock6.addr.v6.sin6_port =
-                    htons( backup_text_port( sss->backup_addr_text ) );
+                { uint16_t bport = backup_text_port( sss->backup_addr_text );
+                  if ( bport ) be->adv_sock6.port = bport; }
             }
             sss->last_brother_seen = now;
 
