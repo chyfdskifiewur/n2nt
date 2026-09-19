@@ -25,6 +25,7 @@ struct n2n_sn;
 static int resolve_brother_addr(const char *text, n2n_sock_t *out);
 static void send_brother_reg(struct n2n_sn *sss, time_t now);
 static size_t brother_list_format(struct n2n_sn *sss, time_t now, char *buf, size_t bufsz);
+static uint16_t backup_text_port( const char *text );
 
 /* Resolve our [-b] little-brother address (sn2) with caching.
  * Returns 0 on success, -1 if -b is unconfigured or resolution failed. */
@@ -3467,11 +3468,26 @@ static int process_udp( n2n_sn_t * sss,
             {
                 be->sock = sender_n2n;
                 be->seen = now;
+                /* adv_* = the address we ADVERTISE to ask_backup lookups.
+                 * IP is the live source, but the port MUST come from our own
+                 * [-b] config: an SN keeps its configured listen port across
+                 * rebinds while its UDP source port can be any ephemeral
+                 * value (and a NAT in front rewrites it regardless). Using
+                 * the source port made the edge re-register to a dead
+                 * 8.148.244.159:<random> and lose touch with sn1. */
+                be->adv_sock = sender_n2n;
+                be->adv_sock.addr.v4.sin_port =
+                    htons( backup_text_port( sss->backup_addr_text ) );
+                be->adv_sock6.family = 0;
             }
             else if ( sender_n2n.family == AF_INET6 )
             {
                 be->sock6 = sender_n2n;
                 be->seen6 = now;
+                be->adv_sock.family = 0;
+                be->adv_sock6 = sender_n2n;
+                be->adv_sock6.addr.v6.sin6_port =
+                    htons( backup_text_port( sss->backup_addr_text ) );
             }
             sss->last_brother_seen = now;
 
@@ -3670,16 +3686,25 @@ static int process_udp( n2n_sn_t * sss,
                 }
                 if (!match) continue;
 
-                if (bb->sock.family != 0)
+                if (bb->adv_sock.family != 0)
                 {
-                    ack.sn_bak = bb->sock;
+                    ack.sn_bak = bb->adv_sock;
                     /* num_sn gates the on-wire encoding of sn_bak in
                      * REGISTER_SUPER_ACK. Without setting it here the
                      * matched brother address is filled in memory but
                      * never sent, and the edge sees an empty answer. */
                     ack.num_sn = 1;
                 }
-                if (bb->sock6.family == AF_INET6) ack.sn_bak_v6 = bb->sock6;
+                else if (bb->sock.family != 0)
+                {
+                    /* No [-b] port available to rebuild the advertised addr
+                     * (should not happen for a registering brother); fall
+                     * back to the raw source socket. */
+                    ack.sn_bak = bb->sock;
+                    ack.num_sn = 1;
+                }
+                if (bb->adv_sock6.family == AF_INET6) ack.sn_bak_v6 = bb->adv_sock6;
+                else if (bb->sock6.family == AF_INET6) ack.sn_bak_v6 = bb->sock6;
                 memcpy(ack.sn1_mac, bb->mac, N2N_MAC_SIZE);
                 traceEvent(TRACE_INFO, "ask_backup: sn1 %s MAC %s",
                            sock_to_cstr(sockbuf, &ack.sn_bak),
@@ -4444,22 +4469,6 @@ static int run_loop( n2n_sn_t * sss )
             traceEvent( TRACE_DEBUG, "timeout" );
         }
 
-        /* Log edges that are about to expire before they are freed: an edge
-         * that stops registering (crash, hang, NAT rebound) otherwise just
-         * vanishes from the mgmt list with no trace in the log. Idle threshold
-         * is the same REGISTRATION_TIMEOUT (150s) used by
-         * purge_expired_registrations in n2n.c. */
-        {
-            struct peer_info *scan;
-            for (scan = sss->edges; scan; scan = scan->next) {
-                if ((now - scan->last_seen) > 150) {
-                    macstr_t mb;
-                    traceEvent(TRACE_NORMAL, "Edge %s idle %lds - purging from edge table",
-                               macaddr_str(mb, scan->mac_addr),
-                               (long)(now - scan->last_seen));
-                }
-            }
-        }
         purge_expired_registrations( &(sss->edges) );
         sn_ws_purge(sss, now);
         if (sss->traffic_stats_enabled) {
@@ -4600,6 +4609,18 @@ static void send_brother_reg(n2n_sn_t *sss, time_t now)
     traceEvent(TRACE_DEBUG, "Sent brother_reg to %s as %02x:%02x:%02x:%02x:%02x:%02x",
                sock_to_cstr(sockbuf, &backup_sock),
                id_mac[0], id_mac[1], id_mac[2], id_mac[3], id_mac[4], id_mac[5]);
+}
+
+/* Extract the port from a "host:port" text; used to rebuild the advertised
+ * brother address. Returns 0 when unparsable. */
+static uint16_t backup_text_port( const char *text )
+{
+    if (!text || !text[0]) return 0;
+    const char *colon = strrchr( text, ':' );
+    if (!colon) return 0;
+    long p = atol( colon + 1 );
+    if ( p <= 0 || p > 65535 ) return 0;
+    return (uint16_t)p;
 }
 
 /* resolve_brother_addr: parse "host:port" into an n2n_sock_t.

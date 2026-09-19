@@ -1312,8 +1312,11 @@ static int sn_is_ack_brother( n2n_edge_t * eee, int slot )
 /** Persist sn1's current address learned from an sn2 ask_backup reply.
  * Prefers the DNS-style string (stable across DNS changes) and falls back
  * to formatting the binary sock when sn2 has no -b. Syncs sn1_current_addr
- * and sn_ip_array[0] so the -Q display, later probes and the failback all
- * follow sn1's newest IP/port instead of the stale -l config. */
+ * so the -Q display, later probes and the failback all follow sn1's newest
+ * IP/port instead of the stale -l config. NOTE: sn_ip_array[0] is left
+ * untouched (still the -l domain name) so check_supernode_domain_and_update
+ * can keep re-resolving the domain every 5 min and correct any bad cache
+ * value (wrong port learned from an ask_backup reply) via DNS. */
 static void cache_sn1_addr( n2n_edge_t * eee,
                             const char *str, uint16_t str_len,
                             const n2n_sock_t *bin )
@@ -1333,10 +1336,6 @@ static void cache_sn1_addr( n2n_edge_t * eee,
             /* Keep the display copy of sn1's real v4 in sync (ask_backup
              * brother match), so -Q shows the true address after failover. */
             eee->sn1_v4 = *bin;
-            if ( strncmp( eee->sn_ip_array[0], addr_buf,
-                          sizeof(eee->sn_ip_array[0]) ) != 0 )
-                snprintf( eee->sn_ip_array[0],
-                          sizeof(eee->sn_ip_array[0]), "%s", addr_buf );
         }
     }
 }
@@ -5300,6 +5299,12 @@ process_n2n_packet:
              * edge carries no eligibility judgment of its own -- the SN decides
              * who qualifies (NAT1/2, public, willing). */
             if (pi.aflags & N2N_AFLAGS_RELAY) {
+                /* WS mode carries the SN conversation over the WebSocket, but a
+                 * community relay is pure UDP (register to it, send data to it,
+                 * receive forwarded frames from it). WS mode is chosen exactly
+                 * when UDP is not usable, so ignore relay assignments
+                 * completely: we neither become a relay nor register to one. */
+                if (eee->use_ws) return 1;
                 if (memcmp(pi.mac, eee->device.mac_addr, N2N_MAC_SIZE) == 0) {
                     eee->relay_mode = 1; /* we are the designated relay */
                     /* The SN names our own MAC: this is our relay assignment,
