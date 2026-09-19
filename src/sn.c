@@ -4444,6 +4444,22 @@ static int run_loop( n2n_sn_t * sss )
             traceEvent( TRACE_DEBUG, "timeout" );
         }
 
+        /* Log edges that are about to expire before they are freed: an edge
+         * that stops registering (crash, hang, NAT rebound) otherwise just
+         * vanishes from the mgmt list with no trace in the log. Idle threshold
+         * is the same REGISTRATION_TIMEOUT (150s) used by
+         * purge_expired_registrations in n2n.c. */
+        {
+            struct peer_info *scan;
+            for (scan = sss->edges; scan; scan = scan->next) {
+                if ((now - scan->last_seen) > 150) {
+                    macstr_t mb;
+                    traceEvent(TRACE_NORMAL, "Edge %s idle %lds - purging from edge table",
+                               macaddr_str(mb, scan->mac_addr),
+                               (long)(now - scan->last_seen));
+                }
+            }
+        }
         purge_expired_registrations( &(sss->edges) );
         sn_ws_purge(sss, now);
         if (sss->traffic_stats_enabled) {

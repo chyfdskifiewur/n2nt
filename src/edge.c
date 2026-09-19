@@ -5302,6 +5302,13 @@ process_n2n_packet:
             if (pi.aflags & N2N_AFLAGS_RELAY) {
                 if (memcmp(pi.mac, eee->device.mac_addr, N2N_MAC_SIZE) == 0) {
                     eee->relay_mode = 1; /* we are the designated relay */
+                    /* The SN names our own MAC: this is our relay assignment,
+                     * not a peer announcement. Never fall through to the generic
+                     * PEER_INFO handling below - it would add ourselves to
+                     * pending_peers, make us REGISTER to our own public address
+                     * and drag the SN into advertising a different peer as the
+                     * relay for us. */
+                    return 1;
                 } else {
                     /* Client view: remember R so we can register to it. Log only
                      * when R actually changes -- SN re-advertises the same relay
