@@ -126,35 +126,63 @@ static uint32_t set_static_ip_address(struct tuntap_dev* device) {
     return rc;
 }
 
+/* Build the forwarding entry that user-specified route r maps to.
+ * Adding and deleting must use an identical entry, so both go through here. */
+static void fill_forward_row(struct tuntap_dev* device, struct route* r, MIB_IPFORWARD_ROW2* route) {
+    InitializeIpForwardEntry(route);
+    memset(route, 0, sizeof(*route));
+    memcpy(&route->InterfaceLuid, &device->luid, sizeof(NET_LUID));
+    if (r->family == AF_INET) {
+        route->DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
+        memcpy(&route->DestinationPrefix.Prefix.Ipv4.sin_addr, r->dest, sizeof(struct in_addr));
+
+        route->NextHop.Ipv6.sin6_family = AF_INET;
+        memcpy(&route->NextHop.Ipv4.sin_addr, r->gateway, sizeof(struct in_addr));
+    } else if (r->family == AF_INET6) {
+        route->DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
+        memcpy(&route->DestinationPrefix.Prefix.Ipv6.sin6_addr, r->dest, sizeof(struct in6_addr));
+
+        route->NextHop.Ipv6.sin6_family = AF_INET6;
+        memcpy(&route->NextHop.Ipv6.sin6_addr, r->gateway, sizeof(struct in6_addr));
+    }
+    route->DestinationPrefix.PrefixLength = r->prefixlen;
+    route->SitePrefixLength = r->prefixlen;
+    route->ValidLifetime = 0xffffffff;
+    route->PreferredLifetime = 0xffffffff;
+}
+
+/* Remove the routes edge installed itself. Routes that were already present
+ * before edge started are left untouched. */
+static void delete_static_routes(struct tuntap_dev* device) {
+    MIB_IPFORWARD_ROW2 route;
+
+    for (int i = 0; i < device->routes_count; i++) {
+        struct route* r = &device->routes[i];
+        if (!r->added)
+            continue;
+        fill_forward_row(device, r, &route);
+        DeleteIpForwardEntry2(&route);
+        r->added = 0;
+    }
+}
+
 static uint32_t set_static_routes(struct tuntap_dev* device) {
     MIB_IPFORWARD_ROW2 route;
     uint32_t rc = 0;
 
+    /* Drop what we installed earlier (e.g. before a restart) so creating the
+     * routes below never collides with our own leftover. */
+    delete_static_routes(device);
+
     for(int i = 0; i < device->routes_count; i++) {
         struct route* r = &device->routes[i];
+        uint32_t one;
 
-        InitializeIpForwardEntry(&route);
-        memset(&route, 0, sizeof(route));
-        memcpy(&route.InterfaceLuid, &device->luid, sizeof(NET_LUID));
-        if (r->family == AF_INET) {
-            route.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
-            memcpy(&route.DestinationPrefix.Prefix.Ipv4.sin_addr, r->dest, sizeof(struct in_addr));
-
-            route.NextHop.Ipv6.sin6_family = AF_INET;
-            memcpy(&route.NextHop.Ipv4.sin_addr, r->gateway, sizeof(struct in_addr));
-        } else if (r->family == AF_INET6) {
-            route.DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
-            memcpy(&route.DestinationPrefix.Prefix.Ipv6.sin6_addr, r->dest, sizeof(struct in6_addr));
-
-            route.NextHop.Ipv6.sin6_family = AF_INET6;
-            memcpy(&route.NextHop.Ipv6.sin6_addr, r->gateway, sizeof(struct in6_addr));
-        }
-        route.DestinationPrefix.PrefixLength = r->prefixlen;
-        route.SitePrefixLength = r->prefixlen;
-        route.ValidLifetime = 0xffffffff;
-        route.PreferredLifetime = 0xffffffff;
-
-        rc |= CreateIpForwardEntry2(&route);
+        fill_forward_row(device, r, &route);
+        one = CreateIpForwardEntry2(&route);
+        if (one == 0)
+            r->added = 1;
+        rc |= one;
     }
 
     return rc;
@@ -552,6 +580,10 @@ ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) 
 /* ************************************************ */
 
 void tuntap_close(struct tuntap_dev *tuntap) {
+    /* Drop the routes edge installed itself, so a later start does not run into
+     * its own leftover. Routes that were there before edge started are kept. */
+    delete_static_routes(tuntap);
+
     if (tuntap->device_name) {
         tuntap->device_name[0] = '\0';
     }
