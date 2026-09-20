@@ -789,6 +789,7 @@ needmore:
          * to wait for next select */
         {
             ssize_t r;
+            int     recv_err = 0;   /* error code captured right after recv() */
             if (c->rx_len >= sizeof(c->rx_buf)) {
                 /* Buffer full but still cannot decode frame: protocol anomaly */
                 traceEvent(TRACE_WARNING,
@@ -803,12 +804,20 @@ needmore:
                 ioctlsocket(c->fd, FIONBIO, &nb);
                 r = recv(c->fd, (char*)c->rx_buf + c->rx_len,
                          sizeof(c->rx_buf) - c->rx_len, 0);
+                /* CRITICAL: capture the error BEFORE restoring blocking mode.
+                 * On Windows a successful Winsock call resets the thread's
+                 * last-error, so the ioctlsocket below would wipe
+                 * WSAEWOULDBLOCK. The EAGAIN check then reads 0, treats a
+                 * routine "no data yet" as fatal and kills the connection
+                 * (this was the Windows-only 5s reconnect loop). */
+                if (r < 0) recv_err = WSAGetLastError();
                 nb = 0;
                 ioctlsocket(c->fd, FIONBIO, &nb);
             }
 #else
             r = recv(c->fd, (char*)c->rx_buf + c->rx_len,
                      sizeof(c->rx_buf) - c->rx_len, MSG_DONTWAIT);
+            if (r < 0) recv_err = errno;
 #endif
             if (r > 0) {
                 c->rx_len += (size_t)r;
@@ -823,7 +832,7 @@ needmore:
                 return -1;
             }
             {
-                int err = WS_ERRNO();
+                int err = recv_err;
                 if (err == WS_EINTR) continue;
                 if (err == WS_EAGAIN || err == WS_ETIMEOUT) return 0;
                 traceEvent(TRACE_WARNING,
