@@ -298,10 +298,7 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
             if (rc != 0) {
                 /* A route that cannot be added (e.g. it already exists) must not
                    prevent the interface from being used at all. */
-                W32_ERROR(rc, error)
-                traceEvent(TRACE_WARNING, "Unable to set device %ls static route: %ls", adaptername, error);
-                W32_ERROR_FREE(error)
-                traceEvent(TRACE_WARNING, "Route not added, continuing with device %ls", adaptername);
+                traceEvent(TRACE_WARNING, "Unable to add static route for device %ls (error %u), continuing", adaptername, rc);
             }
         }
 
@@ -663,11 +660,8 @@ int tuntap_restart( tuntap_dev* device ) {
         rc = set_static_routes(device);
 
         if (rc != 0) {
-            W32_ERROR(rc, error)
-            traceEvent(TRACE_WARNING, "Unable to set device %ls static route: %ls", device->device_name, error);
-            W32_ERROR_FREE(error)
-
-            return -1;
+            /* Same as in tuntap_open: a route conflict is not fatal. */
+            traceEvent(TRACE_WARNING, "Unable to add static route for device %ls (error %u), continuing", device->device_name, rc);
         }
     }
 
