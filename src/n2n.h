@@ -148,7 +148,6 @@ typedef struct route {
     uint8_t dest[IPV6_SIZE];
     uint8_t prefixlen;
     uint8_t gateway[IPV6_SIZE];
-    uint8_t added; /* set once edge has installed this route itself */
 } route;
 
 #define N2N_MAX_TRANSFORMS      16

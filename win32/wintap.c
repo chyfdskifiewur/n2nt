@@ -126,124 +126,38 @@ static uint32_t set_static_ip_address(struct tuntap_dev* device) {
     return rc;
 }
 
-/* Build the forwarding entry that user-specified route r maps to.
- * Adding and deleting must use an identical entry, so both go through here. */
-static void fill_forward_row(struct tuntap_dev* device, struct route* r, MIB_IPFORWARD_ROW2* route) {
-    InitializeIpForwardEntry(route);
-    memset(route, 0, sizeof(*route));
-    memcpy(&route->InterfaceLuid, &device->luid, sizeof(NET_LUID));
-    if (r->family == AF_INET) {
-        route->DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
-        memcpy(&route->DestinationPrefix.Prefix.Ipv4.sin_addr, r->dest, sizeof(struct in_addr));
-
-        route->NextHop.Ipv6.sin6_family = AF_INET;
-        memcpy(&route->NextHop.Ipv4.sin_addr, r->gateway, sizeof(struct in_addr));
-    } else if (r->family == AF_INET6) {
-        route->DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
-        memcpy(&route->DestinationPrefix.Prefix.Ipv6.sin6_addr, r->dest, sizeof(struct in6_addr));
-
-        route->NextHop.Ipv6.sin6_family = AF_INET6;
-        memcpy(&route->NextHop.Ipv6.sin6_addr, r->gateway, sizeof(struct in6_addr));
-    }
-    route->DestinationPrefix.PrefixLength = r->prefixlen;
-    route->SitePrefixLength = r->prefixlen;
-    route->ValidLifetime = 0xffffffff;
-    route->PreferredLifetime = 0xffffffff;
-}
-
-/* Look the route up in the forwarding table of the system. A route that is
- * already there belongs to somebody else, so edge leaves it alone. */
-static int route_already_exists(const struct tuntap_dev* device, const struct route* r) {
-    PMIB_IPFORWARD_TABLE2 table = NULL;
-    int exists = 0;
-
-    if (GetIpForwardTable2((ADDRESS_FAMILY) r->family, &table) != NO_ERROR || !table)
-        return 0;
-
-    for (ULONG i = 0; i < table->NumEntries; i++) {
-        PMIB_IPFORWARD_ROW2 row = &table->Table[i];
-
-        if (memcmp(&row->InterfaceLuid, &device->luid, sizeof(NET_LUID)))
-            continue;
-        if (row->DestinationPrefix.Prefix.si_family != r->family)
-            continue;
-        if (row->DestinationPrefix.PrefixLength != r->prefixlen)
-            continue;
-        if (row->NextHop.si_family != r->family)
-            continue;
-
-        if (r->family == AF_INET) {
-            if (memcmp(&row->DestinationPrefix.Prefix.Ipv4.sin_addr, r->dest, sizeof(struct in_addr)) ||
-                memcmp(&row->NextHop.Ipv4.sin_addr, r->gateway, sizeof(struct in_addr)))
-                continue;
-        } else if (r->family == AF_INET6) {
-            if (memcmp(&row->DestinationPrefix.Prefix.Ipv6.sin6_addr, r->dest, sizeof(struct in6_addr)) ||
-                memcmp(&row->NextHop.Ipv6.sin6_addr, r->gateway, sizeof(struct in6_addr)))
-                continue;
-        } else {
-            continue;
-        }
-
-        exists = 1;
-        break;
-    }
-
-    FreeMibTable(table);
-    return exists;
-}
-
-static void log_route_exists(const struct route* r) {
-    char addr[INET6_ADDRSTRLEN] = "?";
-
-    inet_ntop(r->family, r->dest, addr, sizeof(addr));
-    traceEvent(TRACE_WARNING, "Static route %s/%u already exists, skipping",
-               addr, r->prefixlen);
-}
-
-/* Install the routes edge was asked to add. A route that is already present is
- * skipped, so it is not marked as ours and is not removed on exit. */
 static uint32_t set_static_routes(struct tuntap_dev* device) {
     MIB_IPFORWARD_ROW2 route;
-    uint32_t rc;
+    uint32_t rc = 0;
 
-    for (int i = 0; i < device->routes_count; i++) {
+    for(int i = 0; i < device->routes_count; i++) {
         struct route* r = &device->routes[i];
 
-        if (route_already_exists(device, r)) {
-            log_route_exists(r);
-            continue;
-        }
+        InitializeIpForwardEntry(&route);
+        memset(&route, 0, sizeof(route));
+        memcpy(&route.InterfaceLuid, &device->luid, sizeof(NET_LUID));
+        if (r->family == AF_INET) {
+            route.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
+            memcpy(&route.DestinationPrefix.Prefix.Ipv4.sin_addr, r->dest, sizeof(struct in_addr));
 
-        fill_forward_row(device, r, &route);
-        rc = CreateIpForwardEntry2(&route);
-        if (rc == ERROR_OBJECT_ALREADY_EXISTS) {
-            log_route_exists(r);
-            continue;
-        }
-        if (rc != NO_ERROR)
-            return rc;
+            route.NextHop.Ipv6.sin6_family = AF_INET;
+            memcpy(&route.NextHop.Ipv4.sin_addr, r->gateway, sizeof(struct in_addr));
+        } else if (r->family == AF_INET6) {
+            route.DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
+            memcpy(&route.DestinationPrefix.Prefix.Ipv6.sin6_addr, r->dest, sizeof(struct in6_addr));
 
-        r->added = 1;
+            route.NextHop.Ipv6.sin6_family = AF_INET6;
+            memcpy(&route.NextHop.Ipv6.sin6_addr, r->gateway, sizeof(struct in6_addr));
+        }
+        route.DestinationPrefix.PrefixLength = r->prefixlen;
+        route.SitePrefixLength = r->prefixlen;
+        route.ValidLifetime = 0xffffffff;
+        route.PreferredLifetime = 0xffffffff;
+
+        rc |= CreateIpForwardEntry2(&route);
     }
 
-    return NO_ERROR;
-}
-
-/* Remove the routes edge installed itself. Routes that were already present
- * before edge started are left untouched. */
-static void delete_static_routes(struct tuntap_dev* device) {
-    MIB_IPFORWARD_ROW2 route;
-
-    for (int i = 0; i < device->routes_count; i++) {
-        struct route* r = &device->routes[i];
-
-        if (!r->added)
-            continue;
-
-        fill_forward_row(device, r, &route);
-        DeleteIpForwardEntry2(&route);
-        r->added = 0;
-    }
+    return rc;
 }
 
 int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
@@ -382,10 +296,15 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
         if (device->routes_count > 0) {
             rc = set_static_routes(device);
             if (rc != 0) {
-                /* A route that cannot be added must not keep the interface from
-                   being used at all. */
-                traceEvent(TRACE_WARNING, "Unable to add static route for device %ls (error %u), continuing",
-                           adaptername, (unsigned int) rc);
+                W32_ERROR(rc, error)
+                traceEvent(TRACE_WARNING, "Unable to set device %ls static route: %u", adaptername, error);
+                W32_ERROR_FREE(error)
+                CloseHandle(device->device_handle);
+                device->device_handle = INVALID_HANDLE_VALUE;
+                if (has_target) {
+                    has_target = 0;
+                }
+                continue;
             }
         }
 
@@ -621,16 +540,8 @@ ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) 
     EnterCriticalSection(&tuntap->write_lock);
     int next_tail = (tuntap->write_queue_tail + 1) % N2N_WRITE_QUEUE_SIZE;
     if (next_tail == tuntap->write_queue_head) {
-        static DWORD last_report = 0;
-        DWORD now = GetTickCount();
-
         LeaveCriticalSection(&tuntap->write_lock);
-        /* A storm fills the queue in a burst. One line per dropped packet would
-         * bury the rest of the log, so report at most once a second. */
-        if (now - last_report >= 1000) {
-            last_report = now;
-            traceEvent(TRACE_WARNING, "TAP write queue overflow, dropping packet");
-        }
+        traceEvent(TRACE_WARNING, "TAP write queue overflow, dropping packet");
         return -1;
     }
 
@@ -647,10 +558,6 @@ ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) 
 /* ************************************************ */
 
 void tuntap_close(struct tuntap_dev *tuntap) {
-    /* Drop the routes edge installed itself, so a later start does not run into
-     * its own leftover. Routes that were there before edge started are kept. */
-    delete_static_routes(tuntap);
-
     if (tuntap->device_name) {
         tuntap->device_name[0] = '\0';
     }
@@ -759,9 +666,11 @@ int tuntap_restart( tuntap_dev* device ) {
         rc = set_static_routes(device);
 
         if (rc != 0) {
-            /* Same as in tuntap_open: a route conflict is not fatal. */
-            traceEvent(TRACE_WARNING, "Unable to add static route for device %ls (error %u), continuing",
-                       device->device_name, (unsigned int) rc);
+            W32_ERROR(rc, error)
+            traceEvent(TRACE_WARNING, "Unable to set device %ls static route: %u", device->device_name, error);
+            W32_ERROR_FREE(error)
+
+            return -1;
         }
     }
 
