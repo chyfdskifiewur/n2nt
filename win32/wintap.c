@@ -126,38 +126,124 @@ static uint32_t set_static_ip_address(struct tuntap_dev* device) {
     return rc;
 }
 
+/* Build the forwarding entry that user-specified route r maps to.
+ * Adding and deleting must use an identical entry, so both go through here. */
+static void fill_forward_row(struct tuntap_dev* device, struct route* r, MIB_IPFORWARD_ROW2* route) {
+    InitializeIpForwardEntry(route);
+    memset(route, 0, sizeof(*route));
+    memcpy(&route->InterfaceLuid, &device->luid, sizeof(NET_LUID));
+    if (r->family == AF_INET) {
+        route->DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
+        memcpy(&route->DestinationPrefix.Prefix.Ipv4.sin_addr, r->dest, sizeof(struct in_addr));
+
+        route->NextHop.Ipv6.sin6_family = AF_INET;
+        memcpy(&route->NextHop.Ipv4.sin_addr, r->gateway, sizeof(struct in_addr));
+    } else if (r->family == AF_INET6) {
+        route->DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
+        memcpy(&route->DestinationPrefix.Prefix.Ipv6.sin6_addr, r->dest, sizeof(struct in6_addr));
+
+        route->NextHop.Ipv6.sin6_family = AF_INET6;
+        memcpy(&route->NextHop.Ipv6.sin6_addr, r->gateway, sizeof(struct in6_addr));
+    }
+    route->DestinationPrefix.PrefixLength = r->prefixlen;
+    route->SitePrefixLength = r->prefixlen;
+    route->ValidLifetime = 0xffffffff;
+    route->PreferredLifetime = 0xffffffff;
+}
+
+/* Look the route up in the system forwarding table. A route that is already
+ * there belongs to somebody else, so edge leaves it alone. */
+static int route_already_exists(const struct tuntap_dev* device, const struct route* r) {
+    PMIB_IPFORWARD_TABLE2 table = NULL;
+    int exists = 0;
+
+    if (GetIpForwardTable2((ADDRESS_FAMILY) r->family, &table) != NO_ERROR || !table)
+        return 0;
+
+    for (ULONG i = 0; i < table->NumEntries; i++) {
+        PMIB_IPFORWARD_ROW2 row = &table->Table[i];
+
+        if (memcmp(&row->InterfaceLuid, &device->luid, sizeof(NET_LUID)))
+            continue;
+        if (row->DestinationPrefix.Prefix.si_family != r->family)
+            continue;
+        if (row->DestinationPrefix.PrefixLength != r->prefixlen)
+            continue;
+        if (row->NextHop.si_family != r->family)
+            continue;
+
+        if (r->family == AF_INET) {
+            if (memcmp(&row->DestinationPrefix.Prefix.Ipv4.sin_addr, r->dest, sizeof(struct in_addr)) ||
+                memcmp(&row->NextHop.Ipv4.sin_addr, r->gateway, sizeof(struct in_addr)))
+                continue;
+        } else if (r->family == AF_INET6) {
+            if (memcmp(&row->DestinationPrefix.Prefix.Ipv6.sin6_addr, r->dest, sizeof(struct in6_addr)) ||
+                memcmp(&row->NextHop.Ipv6.sin6_addr, r->gateway, sizeof(struct in6_addr)))
+                continue;
+        } else {
+            continue;
+        }
+
+        exists = 1;
+        break;
+    }
+
+    FreeMibTable(table);
+    return exists;
+}
+
+static void log_route_exists(const struct route* r) {
+    char addr[INET6_ADDRSTRLEN] = "?";
+
+    inet_ntop(r->family, r->dest, addr, sizeof(addr));
+    traceEvent(TRACE_WARNING, "Static route %s/%u already exists, skipping",
+               addr, r->prefixlen);
+}
+
+/* Install the routes edge was asked to add. A route that is already present is
+ * skipped, so it is not marked as ours and is not removed on exit. */
 static uint32_t set_static_routes(struct tuntap_dev* device) {
     MIB_IPFORWARD_ROW2 route;
-    uint32_t rc = 0;
+    uint32_t rc;
 
     for(int i = 0; i < device->routes_count; i++) {
         struct route* r = &device->routes[i];
 
-        InitializeIpForwardEntry(&route);
-        memset(&route, 0, sizeof(route));
-        memcpy(&route.InterfaceLuid, &device->luid, sizeof(NET_LUID));
-        if (r->family == AF_INET) {
-            route.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
-            memcpy(&route.DestinationPrefix.Prefix.Ipv4.sin_addr, r->dest, sizeof(struct in_addr));
-
-            route.NextHop.Ipv6.sin6_family = AF_INET;
-            memcpy(&route.NextHop.Ipv4.sin_addr, r->gateway, sizeof(struct in_addr));
-        } else if (r->family == AF_INET6) {
-            route.DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
-            memcpy(&route.DestinationPrefix.Prefix.Ipv6.sin6_addr, r->dest, sizeof(struct in6_addr));
-
-            route.NextHop.Ipv6.sin6_family = AF_INET6;
-            memcpy(&route.NextHop.Ipv6.sin6_addr, r->gateway, sizeof(struct in6_addr));
+        if (route_already_exists(device, r)) {
+            log_route_exists(r);
+            continue;
         }
-        route.DestinationPrefix.PrefixLength = r->prefixlen;
-        route.SitePrefixLength = r->prefixlen;
-        route.ValidLifetime = 0xffffffff;
-        route.PreferredLifetime = 0xffffffff;
 
-        rc |= CreateIpForwardEntry2(&route);
+        fill_forward_row(device, r, &route);
+        rc = CreateIpForwardEntry2(&route);
+        if (rc == ERROR_OBJECT_ALREADY_EXISTS) {
+            log_route_exists(r);
+            continue;
+        }
+        if (rc != NO_ERROR)
+            return rc;
+
+        r->added = 1;
     }
 
-    return rc;
+    return NO_ERROR;
+}
+
+/* Remove the routes edge installed itself. Routes that were already present
+ * before edge started are left untouched. */
+static void delete_static_routes(struct tuntap_dev* device) {
+    MIB_IPFORWARD_ROW2 route;
+
+    for (int i = 0; i < device->routes_count; i++) {
+        struct route* r = &device->routes[i];
+
+        if (!r->added)
+            continue;
+
+        fill_forward_row(device, r, &route);
+        DeleteIpForwardEntry2(&route);
+        r->added = 0;
+    }
 }
 
 int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
@@ -558,6 +644,10 @@ ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) 
 /* ************************************************ */
 
 void tuntap_close(struct tuntap_dev *tuntap) {
+    /* Hand back the routes edge installed itself. Routes that were already
+     * present before edge started are left untouched. */
+    delete_static_routes(tuntap);
+
     if (tuntap->device_name) {
         tuntap->device_name[0] = '\0';
     }
