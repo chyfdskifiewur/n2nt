@@ -627,7 +627,14 @@ ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) 
     int next_tail = (tuntap->write_queue_tail + 1) % N2N_WRITE_QUEUE_SIZE;
     if (next_tail == tuntap->write_queue_head) {
         LeaveCriticalSection(&tuntap->write_lock);
-        traceEvent(TRACE_WARNING, "TAP write queue overflow, dropping packet");
+        /* A burst of overflow persists while a storm is active, so report at
+         * most once a second instead of once per dropped packet. */
+        static time_t last_overflow_report = 0;
+        time_t now = n2n_now();
+        if (now - last_overflow_report >= 1) {
+            last_overflow_report = now;
+            traceEvent(TRACE_WARNING, "TAP write queue overflow, dropping packet");
+        }
         return -1;
     }
 
