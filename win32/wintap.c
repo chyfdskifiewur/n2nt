@@ -282,7 +282,7 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
 
         if (rc != 0) {
             W32_ERROR(rc, error)
-            traceEvent(TRACE_DEBUG, "Unable to set device %ls IP address: %u", adaptername, error);
+            traceEvent(TRACE_DEBUG, "Unable to set device %ls IP address: %ls", adaptername, error);
             W32_ERROR_FREE(error)
             CloseHandle(device->device_handle);
             device->device_handle = INVALID_HANDLE_VALUE;
@@ -296,15 +296,12 @@ int tuntap_open(struct tuntap_dev *device, struct tuntap_config* config) {
         if (device->routes_count > 0) {
             rc = set_static_routes(device);
             if (rc != 0) {
+                /* A route that cannot be added (e.g. it already exists) must not
+                   prevent the interface from being used at all. */
                 W32_ERROR(rc, error)
-                traceEvent(TRACE_WARNING, "Unable to set device %ls static route: %u", adaptername, error);
+                traceEvent(TRACE_WARNING, "Unable to set device %ls static route: %ls", adaptername, error);
                 W32_ERROR_FREE(error)
-                CloseHandle(device->device_handle);
-                device->device_handle = INVALID_HANDLE_VALUE;
-                if (has_target) {
-                    has_target = 0;
-                }
-                continue;
+                traceEvent(TRACE_WARNING, "Route not added, continuing with device %ls", adaptername);
             }
         }
 
@@ -656,7 +653,7 @@ int tuntap_restart( tuntap_dev* device ) {
 
     if (rc != 0) {
         W32_ERROR(rc, error)
-        traceEvent(TRACE_WARNING, "Unable to set device %ls IP address: %u", device->device_name, error);
+        traceEvent(TRACE_WARNING, "Unable to set device %ls IP address: %ls", device->device_name, error);
         W32_ERROR_FREE(error)
 
         return -1;
@@ -667,7 +664,7 @@ int tuntap_restart( tuntap_dev* device ) {
 
         if (rc != 0) {
             W32_ERROR(rc, error)
-            traceEvent(TRACE_WARNING, "Unable to set device %ls static route: %u", device->device_name, error);
+            traceEvent(TRACE_WARNING, "Unable to set device %ls static route: %ls", device->device_name, error);
             W32_ERROR_FREE(error)
 
             return -1;
