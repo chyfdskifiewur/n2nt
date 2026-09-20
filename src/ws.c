@@ -64,12 +64,9 @@ static void ws_set_block(SOCKET fd) {
 #endif
 }
 
-/* Set SO_RCVTIMEO / SO_SNDTIMEO.
- * CRITICAL cross-platform note: on Windows these socket options expect a DWORD
- * timeout in MILLISECONDS, NOT a struct timeval. Passing a timeval makes Winsock
- * read only the low 4 bytes (tv_sec value) and interpret it as that many
- * milliseconds — e.g. 5s becomes 5ms, so a blocking recv/send over a normal WAN
- * RTT instantly times out (Windows edge WS handshakes failed while Linux worked). */
+/* Set SO_RCVTIMEO / SO_SNDTIMEO. Windows expects a DWORD in milliseconds,
+ * not a struct timeval: passing a timeval makes Winsock read tv_sec as
+ * milliseconds (5s becomes 5ms), so the handshake times out instantly. */
 static void ws_set_timeo(SOCKET fd, int rcv_sec, int snd_sec) {
 #ifdef _WIN32
     DWORD ms;
@@ -688,9 +685,6 @@ ssize_t ws_recv(ws_conn_t *c, void *out, size_t outlen) {
                 if (c->rx_len < 4) goto needmore;
                 payload_len = ((size_t)c->rx_buf[2] << 8) | c->rx_buf[3];
                 if (payload_len > N2N_PKT_BUF_SIZE) {
-                    traceEvent(TRACE_WARNING,
-                               "WS recv: frame too large (%u > %u), closing",
-                               (unsigned)payload_len, (unsigned)N2N_PKT_BUF_SIZE);
                     ws_close(c);
                     return -1;
                 }
@@ -700,8 +694,6 @@ ssize_t ws_recv(ws_conn_t *c, void *out, size_t outlen) {
                 /* Validate: upper 32 bits must be zero (n2n packets fit in 32-bit);
                  * non-zero indicates a malicious/malformed frame. */
                 if (c->rx_buf[2] || c->rx_buf[3] || c->rx_buf[4] || c->rx_buf[5]) {
-                    traceEvent(TRACE_WARNING,
-                               "WS recv: malformed 64-bit length, closing");
                     ws_close(c);
                     return -1;
                 }
@@ -711,9 +703,6 @@ ssize_t ws_recv(ws_conn_t *c, void *out, size_t outlen) {
                               ((size_t)c->rx_buf[9]);
                 /* Reject oversized payloads (n2n packets are <= N2N_PKT_BUF_SIZE) */
                 if (payload_len > N2N_PKT_BUF_SIZE) {
-                    traceEvent(TRACE_WARNING,
-                               "WS recv: frame too large (%u > %u), closing",
-                               (unsigned)payload_len, (unsigned)N2N_PKT_BUF_SIZE);
                     ws_close(c);
                     return -1;
                 }
@@ -757,23 +746,16 @@ ssize_t ws_recv(ws_conn_t *c, void *out, size_t outlen) {
                  * FIN must be set (n2n never sends fragmented messages). */
                 if (opcode == 0x0) {
                     /* Unexpected continuation frame without preceding fragment */
-                    traceEvent(TRACE_WARNING,
-                               "WS recv: unexpected continuation frame, closing");
                     ws_close(c);
                     return -1;
                 }
                 if (!(b0 & 0x80)) {
                     /* Fragmented frame: n2n never fragments, treat as protocol error */
-                    traceEvent(TRACE_WARNING,
-                               "WS recv: fragmented frame, closing");
                     ws_close(c);
                     return -1;
                 }
                 if (payload_len > outlen) {
                     /* Caller's buffer too small for this frame — protocol error */
-                    traceEvent(TRACE_WARNING,
-                               "WS recv: frame %u exceeds caller buffer %u, closing",
-                               (unsigned)payload_len, (unsigned)outlen);
                     ws_close(c);
                     return -1;
                 }
@@ -792,9 +774,6 @@ needmore:
             int     recv_err = 0;   /* error code captured right after recv() */
             if (c->rx_len >= sizeof(c->rx_buf)) {
                 /* Buffer full but still cannot decode frame: protocol anomaly */
-                traceEvent(TRACE_WARNING,
-                           "WS recv: rx buffer full (%u bytes), closing",
-                           (unsigned)c->rx_len);
                 ws_close(c);
                 return -1;
             }
@@ -804,12 +783,10 @@ needmore:
                 ioctlsocket(c->fd, FIONBIO, &nb);
                 r = recv(c->fd, (char*)c->rx_buf + c->rx_len,
                          sizeof(c->rx_buf) - c->rx_len, 0);
-                /* CRITICAL: capture the error BEFORE restoring blocking mode.
-                 * On Windows a successful Winsock call resets the thread's
-                 * last-error, so the ioctlsocket below would wipe
-                 * WSAEWOULDBLOCK. The EAGAIN check then reads 0, treats a
-                 * routine "no data yet" as fatal and kills the connection
-                 * (this was the Windows-only 5s reconnect loop). */
+                /* Capture the error before restoring blocking mode: on Windows
+                 * a successful Winsock call resets the thread's last-error, so
+                 * the ioctlsocket below would wipe WSAEWOULDBLOCK and turn a
+                 * routine "no data yet" into a fatal close. */
                 if (r < 0) recv_err = WSAGetLastError();
                 nb = 0;
                 ioctlsocket(c->fd, FIONBIO, &nb);
@@ -824,22 +801,16 @@ needmore:
                 continue;
             }
             if (r == 0) {
-                /* Peer sent FIN: the remote end closed the TCP connection.
-                 * This is the common case when a proxy or the supernode drops
-                 * an idle/long-lived WS connection. */
+                /* Peer sent FIN: the remote end closed the TCP connection. */
                 traceEvent(TRACE_WARNING, "WS recv: peer closed the connection");
                 ws_close(c);
                 return -1;
             }
-            {
-                int err = recv_err;
-                if (err == WS_EINTR) continue;
-                if (err == WS_EAGAIN || err == WS_ETIMEOUT) return 0;
-                traceEvent(TRACE_WARNING,
-                           "WS recv: socket error %d, closing", err);
-                ws_close(c);
-                return -1;
-            }
+            if (recv_err == WS_EINTR) continue;
+            if (recv_err == WS_EAGAIN || recv_err == WS_ETIMEOUT) return 0;
+            traceEvent(TRACE_WARNING, "WS recv: socket error %d, closing", recv_err);
+            ws_close(c);
+            return -1;
         }
     }
 }

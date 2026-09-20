@@ -3854,6 +3854,14 @@ static int process_udp( n2n_sn_t * sss,
         /* Fill sn_version so edge can display supernode version */
         strncpy(ack.sn_version, n2n_sw_version_full, sizeof(ack.sn_version) - 1);
 
+        /* WS mode: the sender address is the TCP peer (edge's public IP with
+         * its TCP source port), not its UDP NAT mapping. Echoing it back would
+         * make the edge record a bogus public address and mis-classify its NAT
+         * type — two supernodes always report different TCP ports, which reads
+         * as symmetric. WS has no UDP path, so report nothing (family 0). */
+        if (ws_sender)
+            memset(&ack.sock, 0, sizeof(n2n_sock_t));
+
         encode_REGISTER_SUPER_ACK( ackbuf, &encx, &cmn2, &ack );
 
 
