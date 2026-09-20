@@ -1851,6 +1851,61 @@ static void update_peer_address(n2n_edge_t * eee,
                                 const n2n_sock_t * peer,
                                 time_t when);
 
+/* True when a peer address falls inside the TAP's own virtual subnet.
+ *
+ * Such an address can never be a working UDP destination: the local host
+ * routes it into the TAP, the edge reads its own datagram back from the TAP
+ * and, with allow_routing set, feeds it into the tunnel again. The peer
+ * receives nothing, keepalive never succeeds and the traffic loops forever.
+ * Peers that advertise such an address are kept on supernode relay. */
+static int sock_in_tap_subnet( n2n_edge_t * eee, const n2n_sock_t * s )
+{
+    if ( !s )
+        return 0;
+
+    if ( s->family == AF_INET && eee->device.ip_prefixlen > 0 )
+    {
+        uint8_t bits = eee->device.ip_prefixlen;
+        uint32_t mask, addr, tap;
+
+        if ( bits > 32 )
+            return 0;
+
+        memcpy( &addr, s->addr.v4, IPV4_SIZE );  /* both stay in network order */
+        tap = eee->device.ip_addr;
+        mask = htonl( 0xffffffffu << (32 - bits) );
+
+        return ( (addr & mask) == (tap & mask) );
+    }
+
+    if ( s->family == AF_INET6 && eee->device.ip6_prefixlen > 0 )
+    {
+        uint8_t bits = eee->device.ip6_prefixlen;
+        const uint8_t * tap6 = (const uint8_t *) &eee->device.ip6_addr;
+        uint8_t full, rem;
+
+        if ( bits > 128 )
+            return 0;
+
+        full = bits / 8;
+        rem  = bits % 8;
+
+        if ( full > 0 && memcmp( s->addr.v6, tap6, full ) != 0 )
+            return 0;
+
+        if ( rem )
+        {
+            uint8_t m = (uint8_t)(0xff << (8 - rem));
+            if ( (s->addr.v6[full] & m) != (tap6[full] & m) )
+                return 0;
+        }
+
+        return 1;
+    }
+
+    return 0;
+}
+
 /** @brief Check peer liveness and fall back to relay if P2P is dead.
  *
  *  For each peer in known_peers with established P2P (direct_seen > 0):
@@ -1936,9 +1991,11 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
         /* Determine which address to use for keepalive (prefer IPv4 if available) */
         /* Note: each peer only has ONE active address (either IPv4 or IPv6) */
         n2n_sock_t *keepalive_addr = NULL;
-        if ( scan->sock.family == AF_INET && eee->udp_sock != -1 ) {
+        if ( scan->sock.family == AF_INET && eee->udp_sock != -1 &&
+             !sock_in_tap_subnet( eee, &scan->sock ) ) {
             keepalive_addr = &scan->sock;
-        } else if ( scan->sock6.family == AF_INET6 && eee->udp_sock6 != -1 ) {
+        } else if ( scan->sock6.family == AF_INET6 && eee->udp_sock6 != -1 &&
+                    !sock_in_tap_subnet( eee, &scan->sock6 ) ) {
             keepalive_addr = &scan->sock6;
         }
         
@@ -2404,6 +2461,24 @@ void set_peer_operational( n2n_edge_t * eee,
     }
 
     if ( scan ) {
+        /* A peer reporting an address inside our own TAP subnet would send us
+         * into a loop: the host routes that address into the TAP and we read
+         * our own datagram back. Leave the peer in pending_peers so traffic
+         * keeps using the supernode relay instead. */
+        if ( sock_in_tap_subnet( eee, peer ) ) {
+            /* A looping peer re-registers continuously, so report at most once
+             * a second instead of once per REGISTER_ACK. */
+            static time_t last_report = 0;
+            time_t now = n2n_now();
+
+            if ( now - last_report >= 1 ) {
+                last_report = now;
+                traceEvent( TRACE_WARNING, "Peer %s reports P2P address %s inside our TAP subnet, staying on relay",
+                            macaddr_str( mac_buf, mac ), sock_to_cstr( sockbuf, peer ) );
+            }
+            return;
+        }
+
         /* Remove scan from pending_peers. */
         if ( prev ) {
             prev->next = scan->next;
@@ -3195,8 +3270,16 @@ static int find_peer_destination(n2n_edge_t * eee,
              * Use the direct P2P address regardless of direct_seen age.
              * This keeps data and keepalive on the same path. */
             if (scan->sock.family == AF_INET && eee->udp_sock != -1) {
+                if (sock_in_tap_subnet(eee, &scan->sock)) {
+                    traceEvent(TRACE_DEBUG, "find_peer_destination: address inside our TAP subnet, using relay");
+                    break;
+                }
                 memcpy(destination, &scan->sock, sizeof(n2n_sock_t));
             } else if (scan->sock6.family == AF_INET6 && eee->udp_sock6 != -1) {
+                if (sock_in_tap_subnet(eee, &scan->sock6)) {
+                    traceEvent(TRACE_DEBUG, "find_peer_destination: address inside our TAP subnet, using relay");
+                    break;
+                }
                 memcpy(destination, &scan->sock6, sizeof(n2n_sock_t));
             } else {
                 /* No valid direct address available */
