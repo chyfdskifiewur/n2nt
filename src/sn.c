@@ -697,6 +697,20 @@ struct promoted_peer {
     time_t          seen;    /* last probe/registration time (0 = free slot) */
 };
 
+/* Broadcast storm guard. A loop between two router edges multiplies group
+ * frames without bound and every copy is then fanned out to the whole
+ * community. Past the first few copies group frames carry no new information,
+ * so the fan-out of each community is capped per second. Unicast traffic never
+ * passes through here and is not affected. */
+#define SN_BCAST_GUARD_SLOTS   8
+#define SN_BCAST_BUDGET        200  /* group packets per second, per community */
+
+struct sn_bcast_guard {
+    n2n_community_t community_name;
+    uint32_t        window;     /* second the counter below belongs to (0 = free) */
+    uint32_t        count;      /* group packets admitted in that second */
+};
+
 struct n2n_sn
 {
     time_t              start_time;     /* Used to measure uptime. */
@@ -728,6 +742,7 @@ struct n2n_sn
     char                   stats_config_path[256];
     struct community_stats *comm_stats;
     struct rate_limit_rule *rate_rules;
+    struct sn_bcast_guard  bcast_guard[SN_BCAST_GUARD_SLOTS];
     n2n_auth_t             peer_token;     /* token required from edge peers (-E) */
     int                    peer_token_set;
     n2n_auth_t             backup_token;   /* token required from brother SNs (-B) */
@@ -2115,7 +2130,7 @@ static int process_mgmt( n2n_sn_t * sss,
                  * the member that forces relaying (-Z 3). Same 2-char width
                  * as %2u to keep the column aligned. */
                 const char *seq = " *";
-                char seqnum[8];
+                char seqnum[12]; /* "%2u" of an int, plus room for the NUL */
                 int is_live_relay = (edge->relay_adv_live != 0) ||
                                     (edge->relay_willing == 3 && !community_has_sticky && !force_shown);
                 if ( is_live_relay )
@@ -2268,6 +2283,64 @@ static int process_mgmt( n2n_sn_t * sss,
     return 0;
 }
 
+/* Cap the group-frame fan-out of one community. Only ever called for packets
+ * whose destination MAC is a broadcast or multicast address, so unicast is
+ * never delayed or dropped here. Returns 0 when the community is over budget. */
+static int bcast_admit( n2n_sn_t * sss, const n2n_community_t community, time_t now )
+{
+    struct sn_bcast_guard * slot = NULL;
+    struct sn_bcast_guard * spare = NULL;
+    uint32_t sec = (uint32_t) now;
+    int i;
+
+    for (i = 0; i < SN_BCAST_GUARD_SLOTS; i++)
+    {
+        struct sn_bcast_guard * g = &sss->bcast_guard[i];
+
+        if (g->window == 0) {
+            if (!spare)
+                spare = g;
+            continue;
+        }
+        if (memcmp(g->community_name, community, sizeof(n2n_community_t)) == 0) {
+            slot = g;
+            break;
+        }
+    }
+
+    if (!slot)
+    {
+        /* Unknown community: take a free slot, or the least recently active one
+         * when the table is full, so a storm can never escape the cap. */
+        if (!spare)
+        {
+            spare = &sss->bcast_guard[0];
+            for (i = 1; i < SN_BCAST_GUARD_SLOTS; i++)
+                if (sss->bcast_guard[i].window < spare->window)
+                    spare = &sss->bcast_guard[i];
+        }
+        memcpy(spare->community_name, community, sizeof(n2n_community_t));
+        spare->window = sec;
+        spare->count = 0;
+        slot = spare;
+    }
+
+    if (slot->window != sec)
+    {
+        if (slot->count > SN_BCAST_BUDGET)
+            traceEvent(TRACE_WARNING, "Broadcast storm in community %s: %u group packets/s, limiting to %u",
+                       (const char *) community, slot->count, SN_BCAST_BUDGET);
+        slot->window = sec;
+        slot->count = 0;
+    }
+
+    if (slot->count >= SN_BCAST_BUDGET)
+        return 0;
+
+    slot->count++;
+    return 1;
+}
+
 static int try_broadcast( n2n_sn_t * sss,
                           const n2n_common_t * cmn,
                           const n2n_mac_t srcMac,
@@ -2283,6 +2356,11 @@ static int try_broadcast( n2n_sn_t * sss,
     time_t              now = time(NULL);
 
     traceEvent( TRACE_DEBUG, "try_broadcast" );
+
+    /* A loop between two router edges can multiply group frames without bound.
+     * Cap the fan-out here so one community cannot drown the whole supernode. */
+    if (!bcast_admit(sss, cmn->community, now))
+        return 0;
 
     /* Broadcast throttle policy (B1 simple gate): broadcasts never enter the
      * token bucket (a per-member charge would dead-lock them), instead their

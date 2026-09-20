@@ -196,7 +196,7 @@ static void log_route_exists(const struct route* r) {
     char addr[INET6_ADDRSTRLEN] = "?";
 
     inet_ntop(r->family, r->dest, addr, sizeof(addr));
-    traceEvent(TRACE_WARNING, "Static route %s/%u already exists, not added, continuing",
+    traceEvent(TRACE_WARNING, "Static route %s/%u already exists, skipping",
                addr, r->prefixlen);
 }
 
@@ -621,8 +621,16 @@ ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_t len) 
     EnterCriticalSection(&tuntap->write_lock);
     int next_tail = (tuntap->write_queue_tail + 1) % N2N_WRITE_QUEUE_SIZE;
     if (next_tail == tuntap->write_queue_head) {
+        static DWORD last_report = 0;
+        DWORD now = GetTickCount();
+
         LeaveCriticalSection(&tuntap->write_lock);
-        traceEvent(TRACE_WARNING, "TAP write queue overflow, dropping packet");
+        /* A storm fills the queue in a burst. One line per dropped packet would
+         * bury the rest of the log, so report at most once a second. */
+        if (now - last_report >= 1000) {
+            last_report = now;
+            traceEvent(TRACE_WARNING, "TAP write queue overflow, dropping packet");
+        }
         return -1;
     }
 
