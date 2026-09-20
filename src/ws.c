@@ -64,10 +64,26 @@ static void ws_set_block(SOCKET fd) {
 #endif
 }
 
-static void ws_set_timeo(SOCKET fd, int sec) {
-    struct timeval tv; tv.tv_sec = sec; tv.tv_usec = 0;
+/* Set SO_RCVTIMEO / SO_SNDTIMEO.
+ * CRITICAL cross-platform note: on Windows these socket options expect a DWORD
+ * timeout in MILLISECONDS, NOT a struct timeval. Passing a timeval makes Winsock
+ * read only the low 4 bytes (tv_sec value) and interpret it as that many
+ * milliseconds — e.g. 5s becomes 5ms, so a blocking recv/send over a normal WAN
+ * RTT instantly times out (Windows edge WS handshakes failed while Linux worked). */
+static void ws_set_timeo(SOCKET fd, int rcv_sec, int snd_sec) {
+#ifdef _WIN32
+    DWORD ms;
+    ms = (DWORD)rcv_sec * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms, sizeof(ms));
+    ms = (DWORD)snd_sec * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms, sizeof(ms));
+#else
+    struct timeval tv;
+    tv.tv_sec = rcv_sec; tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+    tv.tv_sec = snd_sec; tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
+#endif
 }
 
 /* Aggressive TCP keepalive: prevent NAT timeout (idle 10s probe, 5s interval,
@@ -485,7 +501,7 @@ int ws_connect(ws_conn_t *c, const char *host, const char *host_header, uint16_t
     c->fd = fd;
     /* Handshake phase: blocking + 5 second timeout */
     ws_set_block(fd);
-    ws_set_timeo(fd, 5);
+    ws_set_timeo(fd, 5, 5);
 
     if (ws_client_handshake(fd, host, host_header, port, c) < 0) {
         traceEvent(TRACE_WARNING, "ws_connect: WS handshake to %s:%u failed", host, (unsigned)port);
@@ -496,13 +512,7 @@ int ws_connect(ws_conn_t *c, const char *host, const char *host_header, uint16_t
     /* Data phase: receive timeout 2s; send timeout 3s — ws_send_all blocks but
      * bounded: a full TCP window makes room (smooth throttling), a dead peer
      * triggers EAGAIN after 3s so the main loop never freezes. */
-    {
-        struct timeval tv;
-        tv.tv_sec = 2; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-        tv.tv_sec = 3; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-    }
+    ws_set_timeo(fd, 2, 3);
     /* TCP keepalive + TCP_NODELAY */
     ws_set_keepalive(fd);
 
@@ -525,7 +535,7 @@ int ws_server_accept(ws_conn_t *c, SOCKET listen_fd) {
 
     c->fd = fd;
     ws_set_block(fd);
-    ws_set_timeo(fd, 5);
+    ws_set_timeo(fd, 5, 5);
 
     if (ws_server_handshake(fd, c) < 0) {
         ws_close(c);
@@ -533,13 +543,7 @@ int ws_server_accept(ws_conn_t *c, SOCKET listen_fd) {
     }
 
     /* Data phase: receive timeout 2s; send timeout 3s (same as ws_connect) + keepalive */
-    {
-        struct timeval tv;
-        tv.tv_sec = 2; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-        tv.tv_sec = 3; tv.tv_usec = 0;
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
-    }
+    ws_set_timeo(fd, 2, 3);
     ws_set_keepalive(fd);
 
     c->state = WS_OPEN;
