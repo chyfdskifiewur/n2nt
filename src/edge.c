@@ -6920,6 +6920,7 @@ static int scan_route(char* optarg, struct tuntap_config* tuntap_config) {
         }
     }
 
+    r->added = 0;
     tuntap_config->routes_count++;
     return 1;
 fail:

@@ -300,8 +300,8 @@ int set_ipaddress(const tuntap_dev* device, int static_address) {
             if ((error = netlink_talk(_sock, &req)) != 0) {
                 char buf1[INET6_ADDRSTRLEN];
                 char buf2[INET6_ADDRSTRLEN];
-                /* A route that cannot be added (e.g. it already exists) must not
-                   prevent the interface from being used at all. */
+                /* A route that cannot be added must not keep the interface from
+                   being used at all. */
                 traceEvent(TRACE_WARNING, "Unable to add static route %s/%u via %s [%s], continuing",
                     inet_ntop(r->family, r->dest, buf1, INET6_ADDRSTRLEN),
                     r->prefixlen,
