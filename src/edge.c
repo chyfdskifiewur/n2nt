@@ -840,7 +840,7 @@ static void help() {
     printf("-p <local port>          | Fixed local UDP port.\n");
     printf("-Q <port>                | Query management port (for standalone use). (default: %d).\n", N2N_EDGE_MGMT_PORT);
     printf("-r                       | Enable packet forwarding through n2n community.\n");
-    printf("-R <dest>/<length>,<gw>  | Add a route via the n2n community, IPv4/6 is autodetected.\n");
+    printf("-R <dest>/<length>,<gw>  | Enable packet forwarding and add a route, IPv4/6 is autodetected.\n");
     printf("-t <port|path>           | Management Socket (UDP Port or absolute path). (default: %d).\n", N2N_EDGE_MGMT_PORT);
     printf("-T <token>               | Supernode registration token (ASCII, max 32).\n");
     printf("-v                       | Make more verbose. Repeat as required.\n");
@@ -5984,8 +5984,19 @@ process_n2n_packet:
                             if (old_pub.family != 0 &&
                                 sock_equal(&old_pub, &eee->my_public_sock) != 0)
                             {
-                                traceEvent(TRACE_NORMAL, "Our public address changed to %s",
+                                /* Under CGNAT the public PORT churns on every new
+                                 * mapping, which is routine; only a public IP change
+                                 * (network switch) deserves a NORMAL line. Port-only
+                                 * changes go to INFO to keep the console quiet. */
+                                int ip_changed = (old_pub.family != eee->my_public_sock.family) ||
+                                                 (old_pub.family == AF_INET &&
+                                                  memcmp(old_pub.addr.v4,
+                                                         eee->my_public_sock.addr.v4,
+                                                         IPV4_SIZE) != 0);
+                                traceEvent(ip_changed ? TRACE_NORMAL : TRACE_INFO,
+                                           "Our public address changed to %s",
                                            sock_to_cstr(sockbuf1, &eee->my_public_sock));
+
                                 if (eee->nat_suppress_remap) {
                                     /* This remap is the fixed-port restore of an
                                      * "n" refresh: classification already ran on
@@ -6920,10 +6931,6 @@ static int scan_route(char* optarg, struct tuntap_config* tuntap_config) {
         }
     }
 
-    /* reallocarray does not clear the slot, so the ownership flag must be
-     * set here: only routes edge installs itself may be removed on exit. */
-    r->added = 0;
-
     tuntap_config->routes_count++;
     return 1;
 fail:
@@ -7197,6 +7204,7 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
             break;
         case 'R': /* add a route */
             scan_route(optarg, &tuntap_config);
+            eee.allow_routing = 1;
             break;
 
         case 'l': /* supernode-list */
@@ -7664,7 +7672,13 @@ static void edge_ws_connect(n2n_edge_t *eee) {
     ws_init(&eee->ws_conn);
     eee->ws_conn.is_client = 1; /* edge side: send with mask */
     if (ws_connect(&eee->ws_conn, ws_host, host_header, ws_port) == 0) {
-        traceEvent(TRACE_NORMAL, "WS connected to %s:%u", ws_host, ws_port);
+        /* First connection logs at NORMAL; a reconnect logs at INFO so a
+         * flapping link does not flood the console (the reason for each
+         * disconnect is reported by the ws.c recv diagnostics). */
+        if (eee->ws_last_reconnect == 0)
+            traceEvent(TRACE_NORMAL, "WS connected to %s:%u", ws_host, ws_port);
+        else
+            traceEvent(TRACE_INFO, "WS reconnected to %s:%u", ws_host, ws_port);
     } else {
         traceEvent(TRACE_INFO, "WS connect to %s:%u failed (will retry)", ws_host, ws_port);
         eee->ws_last_reconnect = n2n_now();

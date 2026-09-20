@@ -688,6 +688,9 @@ ssize_t ws_recv(ws_conn_t *c, void *out, size_t outlen) {
                 if (c->rx_len < 4) goto needmore;
                 payload_len = ((size_t)c->rx_buf[2] << 8) | c->rx_buf[3];
                 if (payload_len > N2N_PKT_BUF_SIZE) {
+                    traceEvent(TRACE_WARNING,
+                               "WS recv: frame too large (%u > %u), closing",
+                               (unsigned)payload_len, (unsigned)N2N_PKT_BUF_SIZE);
                     ws_close(c);
                     return -1;
                 }
@@ -697,6 +700,8 @@ ssize_t ws_recv(ws_conn_t *c, void *out, size_t outlen) {
                 /* Validate: upper 32 bits must be zero (n2n packets fit in 32-bit);
                  * non-zero indicates a malicious/malformed frame. */
                 if (c->rx_buf[2] || c->rx_buf[3] || c->rx_buf[4] || c->rx_buf[5]) {
+                    traceEvent(TRACE_WARNING,
+                               "WS recv: malformed 64-bit length, closing");
                     ws_close(c);
                     return -1;
                 }
@@ -706,6 +711,9 @@ ssize_t ws_recv(ws_conn_t *c, void *out, size_t outlen) {
                               ((size_t)c->rx_buf[9]);
                 /* Reject oversized payloads (n2n packets are <= N2N_PKT_BUF_SIZE) */
                 if (payload_len > N2N_PKT_BUF_SIZE) {
+                    traceEvent(TRACE_WARNING,
+                               "WS recv: frame too large (%u > %u), closing",
+                               (unsigned)payload_len, (unsigned)N2N_PKT_BUF_SIZE);
                     ws_close(c);
                     return -1;
                 }
@@ -749,16 +757,23 @@ ssize_t ws_recv(ws_conn_t *c, void *out, size_t outlen) {
                  * FIN must be set (n2n never sends fragmented messages). */
                 if (opcode == 0x0) {
                     /* Unexpected continuation frame without preceding fragment */
+                    traceEvent(TRACE_WARNING,
+                               "WS recv: unexpected continuation frame, closing");
                     ws_close(c);
                     return -1;
                 }
                 if (!(b0 & 0x80)) {
                     /* Fragmented frame: n2n never fragments, treat as protocol error */
+                    traceEvent(TRACE_WARNING,
+                               "WS recv: fragmented frame, closing");
                     ws_close(c);
                     return -1;
                 }
                 if (payload_len > outlen) {
                     /* Caller's buffer too small for this frame — protocol error */
+                    traceEvent(TRACE_WARNING,
+                               "WS recv: frame %u exceeds caller buffer %u, closing",
+                               (unsigned)payload_len, (unsigned)outlen);
                     ws_close(c);
                     return -1;
                 }
@@ -776,6 +791,9 @@ needmore:
             ssize_t r;
             if (c->rx_len >= sizeof(c->rx_buf)) {
                 /* Buffer full but still cannot decode frame: protocol anomaly */
+                traceEvent(TRACE_WARNING,
+                           "WS recv: rx buffer full (%u bytes), closing",
+                           (unsigned)c->rx_len);
                 ws_close(c);
                 return -1;
             }
@@ -796,11 +814,20 @@ needmore:
                 c->rx_len += (size_t)r;
                 continue;
             }
-            if (r == 0) { ws_close(c); return -1; }  /* Peer closed */
+            if (r == 0) {
+                /* Peer sent FIN: the remote end closed the TCP connection.
+                 * This is the common case when a proxy or the supernode drops
+                 * an idle/long-lived WS connection. */
+                traceEvent(TRACE_WARNING, "WS recv: peer closed the connection");
+                ws_close(c);
+                return -1;
+            }
             {
                 int err = WS_ERRNO();
                 if (err == WS_EINTR) continue;
                 if (err == WS_EAGAIN || err == WS_ETIMEOUT) return 0;
+                traceEvent(TRACE_WARNING,
+                           "WS recv: socket error %d, closing", err);
                 ws_close(c);
                 return -1;
             }
