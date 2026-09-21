@@ -4572,16 +4572,6 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     }
 
     /* Send supernode info */
-    const char *sn_support;
-    if (eee->sn_ipv4_support && eee->sn_ipv6_support)
-        sn_support = "IPv4+IPv6";
-    else if (eee->sn_ipv6_support)
-        sn_support = "IPv6";
-    else if (eee->sn_ipv4_support)
-        sn_support = "IPv4";
-    else
-        sn_support = "unknown";
-
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE, "Supernodes\n");
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
@@ -4610,7 +4600,6 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                 snprintf(marker, sizeof(marker), " *");
             else
                 snprintf(marker, sizeof(marker), "%2u", (unsigned)disp);
-            const char *conn_str = (eee->supernode.family == AF_INET6) ? "IPv6" : "IPv4";
             const char *tok_str = (eee->token_configured && eee->sn_tokens[sn_i].toksize > 0) ? "Pass" : "NoTok";
             const char *b_marker = "";
             /* '+B' on the primary (sn1) row means "sn1 has a brother (sn2
@@ -4623,10 +4612,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             const char *mac_str = "-";
             if (sn_i == 0 && mac_nonzero(eee->sn1_mac))
                 mac_str = macaddr_str(mac_buf, eee->sn1_mac);
-            /* Host: show sn1 as dual-stack v4/v6 when we learned its IPv6.
-             * If it overflows the 46-col host column, cut the MIDDLE of the
-             * IPv6 (keep a leading chunk, a '*', and the bracketed tail with
-             * the full port) instead of hard-truncating and losing the port. */
+            /* Host: when sn1's IPv6 is known, print both stacks with the port
+             * once at the end ("v4/[v6]:port") since IPv4 and IPv6 share it.
+             * Worst case is 15 + 1 + 41 + 6 = 63 chars, inside the 65-wide
+             * column, so no truncation is needed. */
             const char *sn_host = eee->sn_ip_array[sn_i];
             /* ACK-learned brother: show the masked display copy instead */
             if ( sn_is_ack_brother(eee, sn_i) && eee->sn_bak_masked[0] )
@@ -4641,63 +4630,46 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             {
                 n2n_sock_str_t v6buf;
                 const char *v6s = sock_to_cstr(v6buf, &eee->sn1_v6); /* "[...]:port" */
-                /* Column is 49 chars wide (%-49.49s below): budget the full
-                 * v4/v6 string against 49, not 50, or the trailing port
-                 * digit gets truncated by the print width. */
-                if (strlen(sn_host) + 1 + strlen(v6s) <= 49)
+                const char *v6close = strchr(v6s, ']');
+                const char *v6colon = strrchr(v6s, ':');   /* last ':' -> port */
+                if (v6close && v6colon && v6colon > v6close)
                 {
-                    snprintf(host, sizeof(host), "%s/%s", sn_host, v6s);
+                    /* Drop the (identical) port from the IPv4 side. */
+                    const char *v4colon = strrchr(sn_host, ':');
+                    size_t v4_len = v4colon ? (size_t)(v4colon - sn_host)
+                                            : strlen(sn_host);
+                    snprintf(host, sizeof(host), "%.*s/%.*s:%s",
+                             (int)v4_len, sn_host,
+                             (int)(v6close - v6s + 1), v6s, v6colon + 1);
+                    sn_host = host;
                 }
-                else
-                {
-                    /* Keep v4 + leading IPv6 chunk + '*' + "]:port" so the port
-                     * survives the truncation. */
-                    const char *colon = strrchr(v6s, ':');   /* last ':' -> port */
-                    size_t port_len = colon ? strlen(colon + 1) : 0;
-                    size_t addr_len = 0;
-                    while (v6s[1 + addr_len] && v6s[1 + addr_len] != ']') addr_len++;
-                    size_t tail = 1 /* / */ + 1 /* [ */ + 2 /* ] : */ + port_len;
-                    size_t avail = (strlen(sn_host) + tail < 49)
-                             ? 49 - strlen(sn_host) - tail : 1;
-                    size_t keep = (avail >= 1) ? avail - 1 : 0;  /* room for '*' */
-                    if (keep > addr_len) keep = addr_len;
-                    size_t off = strlen(sn_host);
-                    memcpy(host, sn_host, off);
-                    host[off++] = '/';
-                    host[off++] = '[';
-                    if (keep > 0) { memcpy(host + off, v6s + 1, keep); off += keep; }
-                    host[off++] = '*';
-                    host[off++] = ']';
-                    host[off++] = ':';
-                    if (colon) { memcpy(host + off, colon + 1, port_len); off += port_len; }
-                    host[off] = '\0';
-                }
-                sn_host = host;
             }
             /* Fixed column widths -> fixed left edges for every group.
              * Over-long content is truncated (like the sample layout):
-             * marker 2, mac 17, host 49, "supp:" 14, "conn:" 9, tok 5, +B. */
-            char sup_field[20];
-            char conn_field[16];
+             * marker 2, mac 17, host 65, version 7, tok 7, +B. The version
+             * and token columns land on the "ver" and "os" header columns. */
+            char ver_field[16];
             char tok_row[8];
-            /* "supp" is learned from the latest ACK and only describes sn1.
-             * For the ACK-learned brother the row carries no real data of its
+            /* For the ACK-learned brother the row carries no real data of its
              * own: it was never configured via -l, never registered to, so its
-             * conn/token values (copied from the active socket / per-SN config)
-             * would be fabricated. Dash them all, same as the MAC/host. */
+             * version/token values would be fabricated. Dash them, same as the
+             * MAC/host. */
             if ( eee->sn_ack_backup[sn_i] ) {
-                snprintf(sup_field, sizeof(sup_field), "supp:-");
-                snprintf(conn_field, sizeof(conn_field), "conn:-");
+                snprintf(ver_field, sizeof(ver_field), "-");
                 snprintf(tok_row, sizeof(tok_row), "-");
             } else {
-                snprintf(sup_field, sizeof(sup_field), "supp:%s", sn_support);
-                snprintf(conn_field, sizeof(conn_field), "conn:%s", conn_str);
+                /* Version reported by the supernode in its ACK; only the
+                 * active one is known, the rest show a dash. */
+                const char *ver_str = ( sn_i == eee->sn_idx &&
+                                        eee->supernode_version[0] != '\0' )
+                                    ? eee->supernode_version : "-";
+                snprintf(ver_field, sizeof(ver_field), "%s", ver_str);
                 snprintf(tok_row, sizeof(tok_row), "%s", tok_str);
             }
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %s  %-17.17s  %-49.49s  %-14.14s  %-9.9s  %-5.5s  %s\n",
-                               marker, mac_str, sn_host, sup_field,
-                               conn_field, tok_row, b_marker);
+                               " %s  %-17.17s  %-65.65s  %-7.7s  %-7.7s  %s\n",
+                               marker, mac_str, sn_host, ver_field,
+                               tok_row, b_marker);
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
         }
