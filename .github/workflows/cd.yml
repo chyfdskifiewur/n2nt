@@ -46,83 +46,83 @@ jobs:
             artifact_name: windows_x86
 
           - target: aarch64-linux-musl_static
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: aarch64-linux-musl
             artifact_name: linux_aarch64_musl_static
           - target: aarch64-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: aarch64-linux-musl
             artifact_name: linux_aarch64_musl
 
           - target: x86_64-linux-musl_static
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: x86_64-linux-musl
             artifact_name: linux_x64_musl_static
           - target: x86_64-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: x86_64-linux-musl
             artifact_name: linux_x64_musl
 
           - target: i686-linux-musl_static
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: i686-linux-musl
             artifact_name: linux_x86_musl_static
           - target: i686-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: i686-linux-musl
             artifact_name: linux_x86_musl
 
           - target: armv7-linux-musleabihf_static
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: armv7l-linux-musleabihf
             artifact_name: linux_armv7_musleabihf_static
           - target: armv7-linux-musleabihf
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: armv7l-linux-musleabihf
             artifact_name: linux_armv7_musleabihf
 
           - target: armv7-linux-musleabi_static
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: armv7m-linux-musleabi
             artifact_name: linux_armv7_musleabi_static
           - target: armv7-linux-musleabi
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: armv7m-linux-musleabi
             artifact_name: linux_armv7_musleabi
 
           - target: arm-linux-musleabihf_static
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: arm-linux-musleabihf
             artifact_name: linux_arm_musleabihf_static
           - target: arm-linux-musleabihf
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: arm-linux-musleabihf
             artifact_name: linux_arm_musleabihf
 
           - target: arm-linux-musleabi_static
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: arm-linux-musleabi
             artifact_name: linux_arm_musleabi_static
           - target: arm-linux-musleabi
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: arm-linux-musleabi
             artifact_name: linux_arm_musleabi
 
           - target: mipsel-linux-musl_static
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: mipsel-linux-muslsf
             artifact_name: linux_mipsel_musl_static
           - target: mipsel-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: mipsel-linux-muslsf
             artifact_name: linux_mipsel_musl
 
           - target: mips-linux-musl_static
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: mips-linux-muslsf
             artifact_name: linux_mips_musl_static
           - target: mips-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             URL: mips-linux-muslsf
             artifact_name: linux_mips_musl
 
