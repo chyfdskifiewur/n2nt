@@ -397,6 +397,7 @@ static int edge_init(n2n_edge_t * eee)
     eee->nat_sym_tries = 0;
     eee->nat_final = 0;
     eee->nat_reprobe = 0;
+    eee->nat_autorecover_at = 0;
     eee->sn_query_index = 1;
     eee->sn_backup_index = 1;
     eee->sn_af = AF_UNSPEC;
@@ -2924,6 +2925,61 @@ static void handle_nat_fc( n2n_edge_t * eee, const n2n_sock_t * sender )
 }
 
 /* ------------------------------------------------------------------ */
+/* nat_autorecover: rebuild the UDP socket when every supernode is silent.
+ *
+ * Silence here means our registrations still reach the SN (it keeps listing us
+ * as online) while nothing at all comes back, so the NAT mapping on the return
+ * path is dead and re-registering on the same socket can never recover it.
+ * Rebuild the socket the way a restart does -- rebind the configured local port
+ * and re-register at once -- and deliberately nothing else: no NAT re-probe and
+ * no verdict reset. The mgmt "n" command does both, but those only make sense
+ * when a human asks for a fresh measurement.
+ *
+ * Rate limited, and skipped entirely while a peer is still reaching us
+ * directly: rebinding changes our source port and drops every established P2P
+ * direct path, so a supernode that is genuinely down must not make us churn
+ * through mappings. */
+static void nat_autorecover( n2n_edge_t * eee )
+{
+    time_t now = n2n_now();
+
+    if ( eee->use_ws )
+        return;             /* no UDP mapping to rebuild; the WS link reconnects itself */
+    if ( eee->last_sup == 0 )
+        return;             /* never reached a supernode: nothing to rebuild */
+    if ( now - eee->last_p2p <= 30 )
+        return;             /* a peer is reaching us directly: the mapping is fine,
+                               only the supernode path is broken */
+    if ( eee->nat_revert_at != 0 )
+        return;             /* a mgmt "n" refresh is still settling */
+    if ( eee->nat_autorecover_at != 0 &&
+         now - eee->nat_autorecover_at < 300 )
+        return;             /* at most one rebuild every 5 min */
+
+    eee->nat_autorecover_at = now;
+    traceEvent(TRACE_WARNING,
+               "Every supernode is silent - rebuilding the UDP socket to refresh the NAT mapping");
+
+    closesocket( eee->udp_sock );
+    eee->udp_sock = -1;
+    if ( eee->udp_sock6 != -1 ) {
+        closesocket( eee->udp_sock6 );
+        eee->udp_sock6 = -1;
+    }
+
+    if ( setup_sockets( eee, (int)eee->local_port ) < 0 ) {
+        traceEvent(TRACE_ERROR, "NAT autorecover: rebinding the local port failed");
+        return;
+    }
+
+    /* Re-register at once so the SN (and through it every peer) learns the new
+     * endpoint instead of the abandoned one. */
+    send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+    eee->sn_wait = 1;
+    eee->last_register_req = now;
+}
+
+/* ------------------------------------------------------------------ */
 /* update_supernode_reg: supernode periodic registration + failover.
  * Failover flow (CHANGES_MasterBackup_v3):
  *   sn1 fails 3 times -> ask_backup -> dual probe (sn1 old address + sn2)
@@ -2976,6 +3032,9 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
                 traceEvent(TRACE_WARNING,
                            "sn1 unreachable, sn2 not responding - switching to supernode %u",
                            (unsigned int)(eee->sn_backup_index + 1));
+                /* We probed both supernodes and neither answered: the return
+                 * path is dead, not the supernodes. */
+                nat_autorecover( eee );
             }
             else
             {
@@ -3129,6 +3188,9 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
             }
             sn_switch_to( eee, 0 );
             eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
+            /* Single-supernode setup (nothing to cross-check against), or the
+             * failover target went silent too: same dead return path. */
+            nat_autorecover( eee );
         }
     }
     else

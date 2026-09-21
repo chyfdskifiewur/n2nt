@@ -148,7 +148,6 @@ typedef struct route {
     uint8_t dest[IPV6_SIZE];
     uint8_t prefixlen;
     uint8_t gateway[IPV6_SIZE];
-    uint8_t added;          /* set when edge installed this route itself */
 } route;
 
 #define N2N_MAX_TRANSFORMS      16
@@ -637,6 +636,8 @@ struct n2n_edge
                                            local port again once this time is reached (0 = none) */
     uint8_t             nat_suppress_remap; /* one-shot: next ACK-remap only updates
                                            my_public_sock, keeps the fresh NAT verdict */
+    time_t              nat_autorecover_at; /* last automatic UDP socket rebuild (every
+                                           supernode silent); 0 = never */
 
     n2n_sock_t          own_ipv6;       /* routable global IPv6 (GUA) of this edge,
                                            reported to supernode for IPv6 hole-punching
