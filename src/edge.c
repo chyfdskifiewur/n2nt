@@ -4648,7 +4648,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
              * Over-long content is truncated (like the sample layout):
              * marker 2, mac 17, host 65, version 7, tok 7, +B. The version
              * and token columns land on the "ver" and "os" header columns. */
-            char ver_field[16];
+            char ver_field[8];
             char tok_row[8];
             /* For the ACK-learned brother the row carries no real data of its
              * own: it was never configured via -l, never registered to, so its
@@ -4663,7 +4663,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                 const char *ver_str = ( sn_i == eee->sn_idx &&
                                         eee->supernode_version[0] != '\0' )
                                     ? eee->supernode_version : "-";
-                snprintf(ver_field, sizeof(ver_field), "%s", ver_str);
+                snprintf(ver_field, sizeof(ver_field), "%.7s", ver_str);
                 snprintf(tok_row, sizeof(tok_row), "%s", tok_str);
             }
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,

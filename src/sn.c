@@ -24,6 +24,7 @@
 struct n2n_sn;
 static int resolve_brother_addr(const char *text, n2n_sock_t *out);
 static void send_brother_reg(struct n2n_sn *sss, time_t now);
+static void send_brother_reg_to(struct n2n_sn *sss, const n2n_sock_t *dst, int is_reply);
 static size_t brother_list_format(struct n2n_sn *sss, time_t now, char *buf, size_t bufsz);
 static uint16_t backup_text_port( const char *text );
 
@@ -1109,46 +1110,80 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
     int shown = 0;
     int counter = 0;
 
-    /* Live brother SN: one slot per brother, show v4/v6 on one line. */
-    for (int j = 0; j < MAX_BROTHER_SNS; j++)
+    /* Live brother SN: one slot per brother, show v4/v6 on one line.
+     * Two passes so my little brother (the SN I register with) is listed
+     * first, ahead of the big brothers that register with me. */
+    for (int pass = 0; pass < 2; pass++)
     {
-        n2n_brother_entry_t *b = &sss->brothers[j];
-        uint8_t zero[6] = {0,0,0,0,0,0};
-        if (memcmp(b->mac, zero, 6) == 0) continue;
-        int have_v4 = (b->sock.family != 0 && b->seen != 0);
-        int have_v6 = (b->sock6.family != 0 && b->seen6 != 0);
-        if (!have_v4 && !have_v6) continue;
-
-        if (shown == 0)
-            written += snprintf(buf + written, bufsz - written, "[brother]\n");
-        counter++;
-        const uint8_t *mac = b->mac;
-        char v4_part[64] = "-";
-        if (have_v4)
-            sock_to_cstr(v4_part, &b->sock);
-        char v6_part[64] = "-";
-        if (have_v6)
+        for (int j = 0; j < MAX_BROTHER_SNS; j++)
         {
-            char v6_str[INET6_ADDRSTRLEN];
-            inet_ntop(AF_INET6, b->sock6.addr.v6, v6_str, sizeof(v6_str));
-            snprintf(v6_part, sizeof(v6_part), "[%s]:%u", v6_str, b->sock6.port);
+            n2n_brother_entry_t *b = &sss->brothers[j];
+            uint8_t zero[6] = {0,0,0,0,0,0};
+            if (memcmp(b->mac, zero, 6) == 0) continue;
+            if ( (pass == 0) != (b->role == N2N_BROTHER_ROLE_MY_LITTLE) ) continue;
+            int have_v4 = (b->sock.family != 0 && b->seen != 0);
+            int have_v6 = (b->sock6.family != 0 && b->seen6 != 0);
+            if (!have_v4 && !have_v6) continue;
+
+            if (shown == 0)
+                written += snprintf(buf + written, bufsz - written, "[brother]\n");
+            counter++;
+            const uint8_t *mac = b->mac;
+            char v4_part[64] = "-";
+            if (have_v4)
+            {
+                /* IPv4 and IPv6 share the port, so it is printed once at the end
+                 * (on the IPv6 part when both families are present). */
+                char a4[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, b->sock.addr.v4, a4, sizeof(a4));
+                if (have_v6)
+                    snprintf(v4_part, sizeof(v4_part), "%s", a4);
+                else
+                    snprintf(v4_part, sizeof(v4_part), "%s:%u", a4, b->sock.port);
+            }
+            char v6_part[64] = "-";
+            if (have_v6)
+            {
+                char v6_str[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, b->sock6.addr.v6, v6_str, sizeof(v6_str));
+                snprintf(v6_part, sizeof(v6_part), "[%s]:%u", v6_str, b->sock6.port);
+            }
+            /* Version and OS come from this brother's brother_reg; they start
+             * on the header's "ver" (sizeof - 23) and "os" (sizeof - 14)
+             * columns. The heartbeat age stays right-aligned on "nat"
+             * (sizeof - 5; sizeof() counts the header's '\0' as well).
+             * have_v4 || have_v6 is guaranteed above, so the slot always has
+             * a last-seen timestamp. */
+            const char *ver = b->version[0] ? b->version : "-";
+            const char *os  = b->os_name[0] ? b->os_name : "-";
+            /* The little brother is the SN we register with; the big brothers
+             * are the ones that register with us. A single-row table cannot
+             * be told apart by order alone, so flag the little brother with
+             * the same "+B" the edge-side supernode list uses. */
+            const char *b_marker = (b->role == N2N_BROTHER_ROLE_MY_LITTLE)
+                                 ? "    +B" : "";
+            time_t last = b->seen ? b->seen : b->seen6;
+            size_t line_start = written;
+            written += snprintf(buf + written, bufsz - written,
+                                "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s",
+                                counter,
+                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                                v4_part, v6_part);
+            int pad = (int)sizeof(mgmt_header) - 23 - (int)(written - line_start);
+            if (pad < 1) pad = 1;
+            written += snprintf(buf + written, bufsz - written,
+                                "%*s%-7.7s", pad, "", ver);
+            pad = (int)sizeof(mgmt_header) - 14 - (int)(written - line_start);
+            if (pad < 1) pad = 1;
+            written += snprintf(buf + written, bufsz - written,
+                                "%*s%-7.7s", pad, "", os);
+            pad = (int)sizeof(mgmt_header) - 5 - (int)(written - line_start);
+            if (pad < 1) pad = 1;
+            written += snprintf(buf + written, bufsz - written,
+                                "%*s%lds%s\n", pad, "", (long)(now - last),
+                                b_marker);
+            shown++;
         }
-        /* Heartbeat age: right-aligned so it ends on the last column of the
-         * header. (sizeof() counts the header's '\0' as well, hence -5;
-         * have_v4 || have_v6 is guaranteed above, so the slot always has a
-         * last-seen timestamp.) */
-        time_t last = b->seen ? b->seen : b->seen6;
-        size_t line_start = written;
-        written += snprintf(buf + written, bufsz - written,
-                            "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s",
-                            counter,
-                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                            v4_part, v6_part);
-        int pad = (int)sizeof(mgmt_header) - 5 - (int)(written - line_start);
-        if (pad < 1) pad = 1;
-        written += snprintf(buf + written, bufsz - written,
-                            "%*s%lds\n", pad, "", (long)(now - last));
-        shown++;
     }
     return written;
 }
@@ -2115,7 +2150,7 @@ static int process_mgmt( n2n_sn_t * sss,
                  * the member that forces relaying (-Z 3). Same 2-char width
                  * as %2u to keep the column aligned. */
                 const char *seq = " *";
-                char seqnum[8];
+                char seqnum[12]; /* "%2u" of an int is at most 10 digits + NUL */
                 int is_live_relay = (edge->relay_adv_live != 0) ||
                                     (edge->relay_willing == 3 && !community_has_sticky && !force_shown);
                 if ( is_live_relay )
@@ -3460,6 +3495,10 @@ static int process_udp( n2n_sn_t * sss,
 
             n2n_brother_entry_t *be = &sss->brothers[slot];
             memcpy(be->mac, reg.edgeMac, sizeof(n2n_mac_t));
+            /* Version + OS carried by brother_reg. Both stay empty when the
+             * sender did not set N2N_AFLAGS_SN_INFO; mgmt then shows "-". */
+            snprintf(be->version, sizeof(be->version), "%.7s", reg.version);
+            snprintf(be->os_name, sizeof(be->os_name), "%.15s", reg.os_name);
 
             /* Build n2n_sock_t from sender and assign to matching slot family. */
             n2n_sock_t sender_n2n;
@@ -3535,6 +3574,17 @@ static int process_udp( n2n_sn_t * sss,
                 be->sock6 = reg.own_ipv6;
                 be->seen6 = now;
             }
+            /* Reply to a big brother. It only ever sends brother_reg, so it
+             * holds no entry of its own for us and could never show our
+             * address, version or OS. A packet that is itself a reply is
+             * never answered, which is what keeps the two SNs from
+             * ping-ponging when the reply's source port differs from the
+             * receiver's [-b] port and its role check therefore misses. */
+            if ( be->role == N2N_BROTHER_ROLE_MY_BIG &&
+                 !(reg.aflags & N2N_AFLAGS_BROTHER_REPLY) &&
+                 sender_n2n.family != 0 )
+                send_brother_reg_to( sss, &sender_n2n, 1 );
+
             traceEvent(TRACE_INFO, "Brother SN registered from %s",
                        sock_to_cstr(sockbuf, &sender_n2n));
             return 0; /* brother registration does not need an ACK */
@@ -4569,12 +4619,7 @@ static int run_loop( n2n_sn_t * sss )
  * update rather than a normal edge register. */
 static void send_brother_reg(n2n_sn_t *sss, time_t now)
 {
-    n2n_sock_t              backup_sock;
-    n2n_common_t            cmn;
-    n2n_REGISTER_SUPER_t    reg;
-    uint8_t                 pktbuf[N2N_SN_PKTBUF_SIZE];
-    size_t                  idx = 0;
-    n2n_sock_str_t          sockbuf;
+    n2n_sock_t backup_sock;
 
     if (sss->backup_addr_text[0] == '\0') return;
 
@@ -4582,6 +4627,20 @@ static void send_brother_reg(n2n_sn_t *sss, time_t now)
      * brother_reg direction check in the packet handler). */
     if ( resolve_my_brother_addr( sss, &backup_sock, now ) != 0 )
         return;
+
+    send_brother_reg_to( sss, &backup_sock, 0 );
+}
+
+/* Send one brother_reg to dst. Also used as the reply to a big brother:
+ * a big brother only ever sends, so without a reply it would never learn
+ * our address, version or OS. */
+static void send_brother_reg_to(n2n_sn_t *sss, const n2n_sock_t *dst, int is_reply)
+{
+    n2n_common_t            cmn;
+    n2n_REGISTER_SUPER_t    reg;
+    uint8_t                 pktbuf[N2N_SN_PKTBUF_SIZE];
+    size_t                  idx = 0;
+    n2n_sock_str_t          sockbuf;
 
     /* Prefer the live NIC MAC. Skip registration entirely if neither NIC
      * MAC nor fallback is available so the partner SN never sees a
@@ -4608,14 +4667,21 @@ static void send_brother_reg(n2n_sn_t *sss, time_t now)
         memcpy(reg.auth.token, sss->backup_token.token, sss->backup_token.toksize);
         reg.auth.toksize = sss->backup_token.toksize;
     }
+    /* Carry our version and OS so the partner SN can show both. Marked by
+     * N2N_AFLAGS_SN_INFO; the decoder is length-guarded, and edges never
+     * set the flag so their packets stay byte-identical. */
+    reg.aflags |= N2N_AFLAGS_SN_INFO;
+    if ( is_reply )
+        reg.aflags |= N2N_AFLAGS_BROTHER_REPLY;
+    snprintf(reg.version, sizeof(reg.version), "%.7s", n2n_sw_version_full);
+    snprintf(reg.os_name, sizeof(reg.os_name), "%.15s", n2n_sw_osName);
 
     encode_REGISTER_SUPER(pktbuf, &idx, &cmn, &reg);
 
-    /* Send to sn2 over the address family the resolver returned. */
-    sendto_sock( sss, &backup_sock, pktbuf, idx );
+    sendto_sock( sss, dst, pktbuf, idx );
 
     traceEvent(TRACE_DEBUG, "Sent brother_reg to %s as %02x:%02x:%02x:%02x:%02x:%02x",
-               sock_to_cstr(sockbuf, &backup_sock),
+               sock_to_cstr(sockbuf, dst),
                id_mac[0], id_mac[1], id_mac[2], id_mac[3], id_mac[4], id_mac[5]);
 }
 

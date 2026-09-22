@@ -467,6 +467,8 @@ typedef struct {
     time_t       seen6;        /* last v6 registration time */
     n2n_mac_t    mac;          /* MAC of the brother SN (all-zero = invalid) */
     uint8_t      role;         /* N2N_BROTHER_ROLE_* : direction of the relationship */
+    char         version[8];   /* version string this brother sent in its brother_reg */
+    char         os_name[16];  /* OS name this brother sent in its brother_reg */
 } n2n_brother_entry_t;
 
 #ifndef N2N_PATHNAME_MAXLEN

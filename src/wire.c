@@ -357,6 +357,14 @@ size_t encode_REGISTER_SUPER( uint8_t * base,
      * edge actually has a routable GUA. */
     if ( reg->aflags & N2N_AFLAGS_IPV6_SOCKET )
         retval += encode_sock( base, idx, &reg->own_ipv6 );
+    /* Version + OS tail (brother_reg only, marked by N2N_AFLAGS_SN_INFO).
+     * Must stay ahead of the ask_backup tail: that one is decoded by length
+     * alone, so it would swallow these bytes as a sock + MAC. */
+    if ( reg->aflags & N2N_AFLAGS_SN_INFO )
+    {
+        retval += encode_buf( base, idx, reg->version, sizeof(reg->version) );
+        retval += encode_buf( base, idx, reg->os_name, sizeof(reg->os_name) );
+    }
     /* ask_backup tail (sn1 lookup hints): desired_sn1_sock + desired_sn1_mac.
      * Sent only when the edge actually carries a hint, so normal
      * registrations save 14 bytes on the wire. The decoder is
@@ -418,6 +426,15 @@ size_t decode_REGISTER_SUPER( n2n_REGISTER_SUPER_t * reg,
      * truncated/foreign packet is not over-read. */
     if ( (reg->aflags & N2N_AFLAGS_IPV6_SOCKET) && *rem >= sizeof(n2n_sock_t) )
         retval += decode_sock( &reg->own_ipv6, base, rem, idx );
+    /* Version + OS tail (brother_reg only, N2N_AFLAGS_SN_INFO). Read before
+     * the ask_backup tail, whose length-only guards would otherwise consume
+     * these bytes as a sock + MAC. Flag clear (every edge packet) skips it. */
+    if ( (reg->aflags & N2N_AFLAGS_SN_INFO) &&
+         *rem >= sizeof(reg->version) + sizeof(reg->os_name) )
+    {
+        retval += decode_buf( reg->version, sizeof(reg->version), base, rem, idx );
+        retval += decode_buf( reg->os_name, sizeof(reg->os_name), base, rem, idx );
+    }
     /* desired_sn1_sock — ask_backup request. sn2 matches by IP only
      * (port-agnostic) since sn1 may have changed port. Old edges omit.
      * NOTE: an encoded sock is only 8 bytes for family 0 / IPv4 (20 for

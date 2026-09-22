@@ -192,6 +192,17 @@ typedef struct n2n_PACKET n2n_PACKET_t;
                                              brother's full-cone "N2NF" probe even though
                                              this registration is not a new/remapped edge
                                              (mgmt "n" command re-runs NAT detection) */
+#define N2N_AFLAGS_SN_INFO        0x8000  /* version + os_name tail is present. Only
+                                             brother_reg sets it, so a brother SN can
+                                             display our version and OS. Edges never
+                                             set it, which keeps their packets (and
+                                             the ask_backup tail) byte-identical. */
+#define N2N_AFLAGS_BROTHER_REPLY  0x0020  /* this brother_reg is a reply to a big
+                                             brother, not a periodic heartbeat. A
+                                             reply is never answered, which is what
+                                             stops the two SNs from ping-ponging
+                                             when the reply's source port does not
+                                             match the receiver's [-b] port. */
 
 struct n2n_REGISTER_SUPER
 {
@@ -203,6 +214,14 @@ struct n2n_REGISTER_SUPER
     n2n_sock_t          local_sock;     /* LAN address for same-NAT direct connect */
     n2n_sock_t          own_ipv6;       /* global IPv6 (GUA) reported by the edge, valid
                                            only when N2N_AFLAGS_IPV6_SOCKET set */
+
+    /* version / os_name: brother_reg only (N2N_AFLAGS_SN_INFO). Placed
+     * before the ask_backup tail so the two optional tails stay
+     * unambiguous: the ask_backup fields are read by length alone, so a
+     * version/os tail behind them would be mistaken for a sock+MAC.
+     * Edges clear the flag, so their packets are unchanged. */
+    char                version[8];     /* e.g. "2.3_7.7" */
+    char                os_name[16];    /* e.g. "Linux" */
 
     /* desired_sn1_sock: when set (family != 0), the edge is in ask_backup
      * mode and asks this sn2 to look up its brother with the matching
