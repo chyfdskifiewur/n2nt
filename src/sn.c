@@ -1103,37 +1103,64 @@ static void deinit_sn( n2n_sn_t * sss )
 static const char mgmt_header[] =
     "  id  mac                n2n_ip           wan_ip               <KB/s     GB/24h   GB/30d>  ver      os       nat\n";
 
+/* Emit spaces to bring the current row (whose first byte sits at line_start)
+ * up to column col. At least one space is always written, so two adjacent
+ * fields can never run into each other. */
+static size_t mgmt_pad_to(char *buf, size_t bufsz, size_t written,
+                          size_t line_start, int col)
+{
+    int pad = col - (int)(written - line_start);
+    if (pad < 1)
+        pad = 1;
+
+    return snprintf(buf + written, bufsz - written, "%*s", pad, "");
+}
+
 /* brother_list display helper: format brother SN status lines (for -Q / trace). */
 static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t bufsz)
 {
+    /* Column offsets inside mgmt_header; sizeof() counts its trailing '\n'
+     * and '\0', hence the odd-looking numbers. */
+    const int col_ver = (int)sizeof(mgmt_header) - 23;
+    const int col_os  = (int)sizeof(mgmt_header) - 14;
+    const int col_age = (int)sizeof(mgmt_header) - 5;
+    const int col_b   = col_age + 7; /* "+B" sits four spaces past a 3-wide age */
+
     size_t written = 0;
     int shown = 0;
     int counter = 0;
 
-    /* Live brother SN: one slot per brother, show v4/v6 on one line.
-     * Two passes so my little brother (the SN I register with) is listed
-     * first, ahead of the big brothers that register with me. */
+    /* One line per brother, IPv4 and IPv6 side by side. Two passes so the
+     * big brothers that register with me come first and my little brother
+     * (the SN I register with) is listed last. */
     for (int pass = 0; pass < 2; pass++)
     {
+        int want_little = (pass == 1);
+
         for (int j = 0; j < MAX_BROTHER_SNS; j++)
         {
             n2n_brother_entry_t *b = &sss->brothers[j];
-            uint8_t zero[6] = {0,0,0,0,0,0};
-            if (memcmp(b->mac, zero, 6) == 0) continue;
-            if ( (pass == 0) != (b->role == N2N_BROTHER_ROLE_MY_LITTLE) ) continue;
+            n2n_mac_t zero = {0};
+
+            if (memcmp(b->mac, zero, sizeof(zero)) == 0)
+                continue;
+            if ( (b->role == N2N_BROTHER_ROLE_MY_LITTLE) != want_little )
+                continue;
+
             int have_v4 = (b->sock.family != 0 && b->seen != 0);
             int have_v6 = (b->sock6.family != 0 && b->seen6 != 0);
-            if (!have_v4 && !have_v6) continue;
+            if (!have_v4 && !have_v6)
+                continue;
 
             if (shown == 0)
                 written += snprintf(buf + written, bufsz - written, "[brother]\n");
             counter++;
-            const uint8_t *mac = b->mac;
+
+            /* IPv4 and IPv6 share the port, so it is printed once at the end
+             * (on the IPv6 part when both families are present). */
             char v4_part[64] = "-";
             if (have_v4)
             {
-                /* IPv4 and IPv6 share the port, so it is printed once at the end
-                 * (on the IPv6 part when both families are present). */
                 char a4[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, b->sock.addr.v4, a4, sizeof(a4));
                 if (have_v6)
@@ -1144,47 +1171,49 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
             char v6_part[64] = "-";
             if (have_v6)
             {
-                char v6_str[INET6_ADDRSTRLEN];
-                inet_ntop(AF_INET6, b->sock6.addr.v6, v6_str, sizeof(v6_str));
-                snprintf(v6_part, sizeof(v6_part), "[%s]:%u", v6_str, b->sock6.port);
+                char a6[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, b->sock6.addr.v6, a6, sizeof(a6));
+                snprintf(v6_part, sizeof(v6_part), "[%s]:%u", a6, b->sock6.port);
             }
-            /* Version and OS come from this brother's brother_reg; they start
-             * on the header's "ver" (sizeof - 23) and "os" (sizeof - 14)
-             * columns. The heartbeat age stays right-aligned on "nat"
-             * (sizeof - 5; sizeof() counts the header's '\0' as well).
-             * have_v4 || have_v6 is guaranteed above, so the slot always has
-             * a last-seen timestamp. */
+
+            /* Version and OS arrive in this brother's brother_reg; they stay
+             * empty for a brother that has not been upgraded yet. */
             const char *ver = b->version[0] ? b->version : "-";
-            const char *os  = b->os_name[0] ? b->os_name : "-";
-            /* The little brother is the SN we register with; the big brothers
-             * are the ones that register with us. A single-row table cannot
-             * be told apart by order alone, so flag the little brother with
-             * the same "+B" the edge-side supernode list uses. */
-            const char *b_marker = (b->role == N2N_BROTHER_ROLE_MY_LITTLE)
-                                 ? "    +B" : "";
+            const char *os_name = b->os_name[0] ? b->os_name : "-";
+            /* A single-row table cannot be told apart by order alone, so the
+             * little brother carries the same "+B" the edge-side supernode
+             * list uses. */
+            const char *marker = (b->role == N2N_BROTHER_ROLE_MY_LITTLE)
+                               ? "+B" : NULL;
+            /* have_v4 || have_v6 holds above, so a stamp is always set. */
             time_t last = b->seen ? b->seen : b->seen6;
+
             size_t line_start = written;
             written += snprintf(buf + written, bufsz - written,
                                 "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s",
                                 counter,
-                                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                                b->mac[0], b->mac[1], b->mac[2],
+                                b->mac[3], b->mac[4], b->mac[5],
                                 v4_part, v6_part);
-            int pad = (int)sizeof(mgmt_header) - 23 - (int)(written - line_start);
-            if (pad < 1) pad = 1;
-            written += snprintf(buf + written, bufsz - written,
-                                "%*s%-7.7s", pad, "", ver);
-            pad = (int)sizeof(mgmt_header) - 14 - (int)(written - line_start);
-            if (pad < 1) pad = 1;
-            written += snprintf(buf + written, bufsz - written,
-                                "%*s%-7.7s", pad, "", os);
-            pad = (int)sizeof(mgmt_header) - 5 - (int)(written - line_start);
-            if (pad < 1) pad = 1;
-            written += snprintf(buf + written, bufsz - written,
-                                "%*s%lds%s\n", pad, "", (long)(now - last),
-                                b_marker);
+            written += mgmt_pad_to(buf, bufsz, written, line_start, col_ver);
+            written += snprintf(buf + written, bufsz - written, "%-7.7s", ver);
+            written += mgmt_pad_to(buf, bufsz, written, line_start, col_os);
+            written += snprintf(buf + written, bufsz - written, "%-7.7s", os_name);
+            written += mgmt_pad_to(buf, bufsz, written, line_start, col_age);
+            written += snprintf(buf + written, bufsz - written, "%lds",
+                                (long)(now - last));
+            /* The marker is pinned to a fixed column so it does not drift with
+             * the age width; rows without one end right after the age. */
+            if (marker)
+            {
+                written += mgmt_pad_to(buf, bufsz, written, line_start, col_b);
+                written += snprintf(buf + written, bufsz - written, "%s", marker);
+            }
+            written += snprintf(buf + written, bufsz - written, "\n");
             shown++;
         }
     }
+
     return written;
 }
 
