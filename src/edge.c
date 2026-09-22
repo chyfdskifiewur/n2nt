@@ -385,6 +385,7 @@ static int edge_init(n2n_edge_t * eee)
     memset(&eee->sn_query, 0, sizeof(n2n_sock_t));
     memset(&eee->sn1_probe_addr, 0, sizeof(n2n_sock_t));
     eee->sn_probe_cookie_valid = 0;
+    eee->last_failover_dns = 0;
     eee->nat_type = N2N_NAT_UNKNOWN;
     memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
@@ -3128,6 +3129,17 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
          nowTime > eee->last_primary_probe + 30 )
     {
         eee->last_primary_probe = nowTime;
+
+        /* The sn1 cache was last written from sn2's ask_backup answer (a
+         * binary IP text), so the -l domain would never be looked at again.
+         * Every ~5 min drop the cache; the existing resolution below then
+         * falls back to sn_ip_array[0] (the original -l domain), and this
+         * round's sn2 reply re-caches whatever is freshest. */
+        if ( nowTime > eee->last_failover_dns + 300 )
+        {
+            eee->last_failover_dns = nowTime;
+            eee->sn1_current_addr[0] = '\0';
+        }
 
         n2n_sock_t sn1addr;
         memset(&sn1addr, 0, sizeof(sn1addr));
