@@ -26,7 +26,6 @@ static int resolve_brother_addr(const char *text, n2n_sock_t *out);
 static void send_brother_reg(struct n2n_sn *sss, time_t now);
 static void send_brother_reg_to(struct n2n_sn *sss, const n2n_sock_t *dst, int is_reply);
 static size_t brother_list_format(struct n2n_sn *sss, time_t now, char *buf, size_t bufsz);
-static uint16_t backup_text_port( const char *text );
 
 /* Resolve our [-b] little-brother address (sn2) with caching.
  * Returns 0 on success, -1 if -b is unconfigured or resolution failed. */
@@ -1124,7 +1123,6 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
     const int col_ver = (int)sizeof(mgmt_header) - 23;
     const int col_os  = (int)sizeof(mgmt_header) - 14;
     const int col_age = (int)sizeof(mgmt_header) - 5;
-    const int col_b   = col_age + 7; /* "+B" sits four spaces past a 3-wide age */
 
     size_t written = 0;
     int shown = 0;
@@ -1181,10 +1179,11 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
             const char *ver = b->version[0] ? b->version : "-";
             const char *os_name = b->os_name[0] ? b->os_name : "-";
             /* A single-row table cannot be told apart by order alone, so the
-             * little brother carries the same "+B" the edge-side supernode
-             * list uses. */
+             * little brother carries the "-b" marker (my -b points at it,
+             * i.e. it is the one configured via -b). The big brother
+             * (which configured us as its -b) gets none. */
             const char *marker = (b->role == N2N_BROTHER_ROLE_MY_LITTLE)
-                               ? "+B" : NULL;
+                               ? "-b" : NULL;
             /* have_v4 || have_v6 holds above, so a stamp is always set. */
             time_t last = b->seen ? b->seen : b->seen6;
 
@@ -1199,16 +1198,15 @@ static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t b
             written += snprintf(buf + written, bufsz - written, "%-7.7s", ver);
             written += mgmt_pad_to(buf, bufsz, written, line_start, col_os);
             written += snprintf(buf + written, bufsz - written, "%-7.7s", os_name);
+            /* The little brother's "-b" takes the "nat" column, as it does on
+             * the edge side, and the heartbeat age follows in a fixed-width
+             * slot so it lines up on every row. The slot stays blank on rows
+             * without a marker. */
             written += mgmt_pad_to(buf, bufsz, written, line_start, col_age);
-            written += snprintf(buf + written, bufsz - written, "%lds",
+            written += snprintf(buf + written, bufsz - written, "%-7.5s",
+                                marker ? marker : "");
+            written += snprintf(buf + written, bufsz - written, "%ld",
                                 (long)(now - last));
-            /* The marker is pinned to a fixed column so it does not drift with
-             * the age width; rows without one end right after the age. */
-            if (marker)
-            {
-                written += mgmt_pad_to(buf, bufsz, written, line_start, col_b);
-                written += snprintf(buf + written, bufsz - written, "%s", marker);
-            }
             written += snprintf(buf + written, bufsz - written, "\n");
             shown++;
         }
@@ -3536,16 +3534,12 @@ static int process_udp( n2n_sn_t * sss,
             {
                 be->sock = sender_n2n;
                 be->seen = now;
-                /* adv_* = the address we ADVERTISE to ask_backup lookups.
-                 * IP is the live source, but the port MUST come from our own
-                 * [-b] config: an SN keeps its configured listen port across
-                 * rebinds while its UDP source port can be any ephemeral
-                 * value (and a NAT in front rewrites it regardless). Using
-                 * the source port made the edge re-register to a dead
-                 * 8.148.244.159:<random> and lose touch with sn1. */
+                /* adv_* = the big brother's address ADVERTISED to ask_backup
+                 * lookups: the registration's source IP and source port.
+                 * The packet left sn1's [-l] service socket (sendto_sock
+                 * sends from sss->sock), so that source port IS sn1's -l
+                 * port — exactly where its edges must re-register. */
                 be->adv_sock = sender_n2n;
-                { uint16_t bport = backup_text_port( sss->backup_addr_text );
-                  if ( bport ) be->adv_sock.port = bport; }
                 be->adv_sock6.family = 0;
             }
             else if ( sender_n2n.family == AF_INET6 )
@@ -3554,43 +3548,41 @@ static int process_udp( n2n_sn_t * sss,
                 be->seen6 = now;
                 be->adv_sock.family = 0;
                 be->adv_sock6 = sender_n2n;
-                { uint16_t bport = backup_text_port( sss->backup_addr_text );
-                  if ( bport ) be->adv_sock6.port = bport; }
             }
             sss->last_brother_seen = now;
 
-            /* Determine relationship direction: compare sender against our
-             * [-b] (sn2) address. If the sender IS our configured [-b]
-             * partner (circular -b: sn1↔sn2 both set each other), the
-             * sender is our little brother and goes into the slot with
-             * ROLE_MY_LITTLE. Otherwise the sender registered us as
-             * *their* [-b] and is our big brother (ROLE_MY_BIG). */
+            /* Direction of the relationship — circular [-b] is withdrawn.
+             * Whoever REGISTERS to me (a plain brother_reg) is my BIG
+             * brother: I back it up when it goes away. The only way to
+             * become my LITTLE brother is to ANSWER my own registration:
+             * a BROTHER_REPLY whose source matches my [-b] target, and it
+             * backs me up. An SN that points [-b] at me AND registers
+             * here stays BIG — the packet direction decides, not the
+             * address. SNs I have no direct exchange with never enter
+             * this table and are never contacted. */
             {
-                n2n_sock_t backup_addr;
-                if ( resolve_my_brother_addr( sss, &backup_addr, now ) == 0 &&
-                     sender_n2n.family == backup_addr.family )
+                int is_little = 0;
+                if ( reg.aflags & N2N_AFLAGS_BROTHER_REPLY )
                 {
-                    int addr_match = 0;
-                    if ( sender_n2n.family == AF_INET &&
-                         memcmp( sender_n2n.addr.v4, backup_addr.addr.v4, IPV4_SIZE ) == 0 &&
-                         sender_n2n.port == backup_addr.port )
-                        addr_match = 1;
-                    else if ( sender_n2n.family == AF_INET6 &&
-                              memcmp( sender_n2n.addr.v6, backup_addr.addr.v6, IPV6_SIZE ) == 0 &&
-                              sender_n2n.port == backup_addr.port )
-                        addr_match = 1;
-
-                    if ( addr_match )
+                    n2n_sock_t backup_addr;
+                    if ( resolve_my_brother_addr( sss, &backup_addr, now ) == 0 &&
+                         sender_n2n.family == backup_addr.family )
                     {
-                        be->role = N2N_BROTHER_ROLE_MY_LITTLE;
-                        traceEvent(TRACE_INFO, "Brother slot %d = my little brother (sn2): %s",
-                                   slot, sock_to_cstr(sockbuf, &sender_n2n));
+                        if ( sender_n2n.family == AF_INET &&
+                             memcmp( sender_n2n.addr.v4, backup_addr.addr.v4, IPV4_SIZE ) == 0 &&
+                             sender_n2n.port == backup_addr.port )
+                            is_little = 1;
+                        else if ( sender_n2n.family == AF_INET6 &&
+                                  memcmp( sender_n2n.addr.v6, backup_addr.addr.v6, IPV6_SIZE ) == 0 &&
+                                  sender_n2n.port == backup_addr.port )
+                            is_little = 1;
                     }
                 }
-                if ( be->role != N2N_BROTHER_ROLE_MY_LITTLE )
-                {
-                    be->role = N2N_BROTHER_ROLE_MY_BIG;
-                }
+                be->role = is_little ? N2N_BROTHER_ROLE_MY_LITTLE
+                                     : N2N_BROTHER_ROLE_MY_BIG;
+                if ( is_little )
+                    traceEvent(TRACE_INFO, "Brother slot %d = my little brother (my -b): %s",
+                               slot, sock_to_cstr(sockbuf, &sender_n2n));
             }
 
             /* Refresh IPv6 entry from reg.own_ipv6 whenever sn1 provides one.
@@ -3701,12 +3693,15 @@ static int process_udp( n2n_sn_t * sss,
          * or have a live brother within 180s. The edge uses sn_bak_str (the
          * verbatim DNS-style string from sn1's -b argument) so it stays
          * stable across DNS changes. sn_bak / sn_bak_v6 are kept zero and
-         * ignored on the edge. */
+         * ignored on the edge. Do NOT touch num_sn here: sn_bak_str is
+         * encoded independently of it (wire.c encode_REGISTER_SUPER_ACK),
+         * so the domain string travels without forcing a zero sn_bak onto
+         * the wire. num_sn is set below only when the ask_backup lookup
+         * actually matched a live brother address. */
         if (sss->backup_addr_text[0] != 0)
         {
             size_t slen = strlen(sss->backup_addr_text);
             if (slen >= N2N_SOCKBUF_SIZE) slen = N2N_SOCKBUF_SIZE - 1;
-            ack.num_sn = 1;
             ack.sn_bak_str_len = (uint16_t)slen;
             memcpy(ack.sn_bak_str, sss->backup_addr_text, slen);
             ack.sn_bak_str[slen] = '\0';
@@ -4712,18 +4707,6 @@ static void send_brother_reg_to(n2n_sn_t *sss, const n2n_sock_t *dst, int is_rep
     traceEvent(TRACE_DEBUG, "Sent brother_reg to %s as %02x:%02x:%02x:%02x:%02x:%02x",
                sock_to_cstr(sockbuf, dst),
                id_mac[0], id_mac[1], id_mac[2], id_mac[3], id_mac[4], id_mac[5]);
-}
-
-/* Extract the port from a "host:port" text; used to rebuild the advertised
- * brother address. Returns 0 when unparsable. */
-static uint16_t backup_text_port( const char *text )
-{
-    if (!text || !text[0]) return 0;
-    const char *colon = strrchr( text, ':' );
-    if (!colon) return 0;
-    long p = atol( colon + 1 );
-    if ( p <= 0 || p > 65535 ) return 0;
-    return (uint16_t)p;
 }
 
 /* resolve_brother_addr: parse "host:port" into an n2n_sock_t.

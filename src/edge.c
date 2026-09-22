@@ -2960,6 +2960,35 @@ static void nat_autorecover( n2n_edge_t * eee )
     traceEvent(TRACE_WARNING,
                "Every supernode is silent - rebuilding the UDP socket to refresh the NAT mapping");
 
+    /* Re-resolve the active supernode from its configured -l parameter: the
+     * address may have drifted (DDNS, the SN relaunched on a new IP) while we
+     * kept silently failing on the cached one. The original -l string is the
+     * authority here -- nothing is guessed, nothing cached. */
+    {
+        n2n_sock_t fresh;
+        memset(&fresh, 0, sizeof(fresh));
+        if ( supernode2addr( &fresh, eee->sn_af, eee->sn_ip_array[eee->sn_idx] ) == 0 &&
+             fresh.family != 0 &&
+             sock_equal( &fresh, &eee->supernode ) != 0 )
+        {
+            n2n_sock_str_t fstr;
+            traceEvent(TRACE_WARNING, "Supernode re-resolved from -l: %s",
+                       sock_to_cstr( fstr, &fresh ));
+            eee->supernode = fresh;
+            /* Re-resolve the alternate address family for this supernode. */
+            memset( &eee->supernode_alt, 0, sizeof(n2n_sock_t) );
+            {
+                int alt_af = ( fresh.family == AF_INET6 ) ? AF_INET : AF_INET6;
+                if ( ( alt_af == AF_INET6 ) ? ( eee->udp_sock6 != -1 ) : ( eee->udp_sock != -1 ) )
+                    supernode2addr( &eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx] );
+            }
+            /* Purge the periodic-resolve cache so check_supernode_domain_and_update
+             * compares against this fresh value next round instead of
+             * mis-reporting an "address updated" against the old cache. */
+            memset( &eee->last_resolved_supernode, 0, sizeof(n2n_sock_t) );
+        }
+    }
+
     closesocket( eee->udp_sock );
     eee->udp_sock = -1;
     if ( eee->udp_sock6 != -1 ) {
@@ -4576,7 +4605,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
     /* -Q output: list every SN (with fixed left edges). The active one is
-     * marked with '*'; +B tags any row whose entry came from the sn1 ACK. */
+     * marked with '*'; -b tags any row whose entry came from the sn1 ACK. */
     {
         macstr_t mac_buf;
         size_t disp = 0;   /* sequential label across shown rows (hide jump numbers) */
@@ -4602,13 +4631,14 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                 snprintf(marker, sizeof(marker), "%2u", (unsigned)disp);
             const char *tok_str = (eee->token_configured && eee->sn_tokens[sn_i].toksize > 0) ? "Pass" : "NoTok";
             const char *b_marker = "";
-            /* '+B' on the primary (sn1) row means "sn1 has a brother (sn2
-             * learned from the sn1 ACK)". It stays shown as long as that
-             * sibling exists, regardless of which supernode is active. */
+            /* '-b' on the primary (sn1) row means "sn1 has a little brother
+             * (sn2, learned from the sn1 ACK), i.e. this SN is configured via
+             * -b". It stays shown as long as that sibling exists, regardless
+             * of which supernode is active. */
             if ( sn_i == 0 &&
                  eee->sn_query_index < eee->sn_num &&
                  eee->sn_ack_backup[eee->sn_query_index] )
-                b_marker = "+B";
+                b_marker = "-b";
             const char *mac_str = "-";
             if (sn_i == 0 && mac_nonzero(eee->sn1_mac))
                 mac_str = macaddr_str(mac_buf, eee->sn1_mac);
@@ -4646,7 +4676,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             }
             /* Fixed column widths -> fixed left edges for every group.
              * Over-long content is truncated (like the sample layout):
-             * marker 2, mac 17, host 65, version 7, tok 7, +B. The version
+             * marker 2, mac 17, host 65, version 7, tok 7, -b. The version
              * and token columns land on the "ver" and "os" header columns. */
             char ver_field[8];
             char tok_row[8];
