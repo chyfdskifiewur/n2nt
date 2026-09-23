@@ -871,6 +871,10 @@ struct n2n_sn
     SOCKET              bounce_sock;    /* NAT bounce-test helper socket (random
                                          * source port, outbound-only; replies
                                          * "N2NB" to edges requesting a bounce). */
+    SOCKET              alt_sock;       /* second UDP port (lport+1) answering NAT
+                                         * probes from a different destination port
+                                         * of the same IP (dual-port mapping check).
+                                         * -1 = unavailable / disabled. */
     SOCKET              ws_listen_sock; /* TCP listen socket for WebSocket (same as lport). */
 #define N2N_SN_MAX_WS 64
     ws_conn_t           ws_conns[N2N_SN_MAX_WS]; /* WS connection table (edge connected via WS). */
@@ -1174,6 +1178,7 @@ static int init_sn( n2n_sn_t * sss )
     sss->sock6 = -1;
     sss->mgmt_sock = -1;
     sss->bounce_sock = -1;
+    sss->alt_sock = -1;
     sss->ws_listen_sock = -1;
     {
         int wi;
@@ -1231,6 +1236,12 @@ static void deinit_sn( n2n_sn_t * sss )
         closesocket(sss->bounce_sock);
     }
     sss->bounce_sock = -1;
+
+    if ( sss->alt_sock >= 0 )
+    {
+        closesocket(sss->alt_sock);
+    }
+    sss->alt_sock = -1;
 
     if ( sss->ws_listen_sock >= 0 )
     {
@@ -2971,6 +2982,9 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
  *
  */
 static int process_udp( n2n_sn_t * sss,
+                        SOCKET rx_sock,  /* socket the packet arrived on; replies
+                                          * wanting a matching source port (alt
+                                          * probes) honor it */
                         const struct sockaddr * sender_sock,
 												socklen_t sender_sock_len,
                         const uint8_t * udp_buf,
@@ -4095,9 +4109,15 @@ static int process_udp( n2n_sn_t * sss,
         encode_REGISTER_SUPER_ACK( ackbuf, &encx, &cmn2, &ack );
 
 
-        /* Reply ACK: WS via ws_send, UDP via the matching v4/v6 socket */
+        /* Reply ACK: WS via ws_send, alt-port probes from the same alt
+         * socket (the edge's NAT whitelist admits exactly that source port,
+         * and the twin ACK shows a second destination-port mapping), every
+         * other UDP reply via the matching v4/v6 socket */
         if (ws_sender) {
             ws_send(ws_sender, ackbuf, encx);
+        } else if ( rx_sock == sss->alt_sock ) {
+            sendto( sss->alt_sock, ackbuf, encx, 0,
+                    (struct sockaddr *)sender_sock, sender_sock_len );
         } else {
             sendto_sock( sss, &ack.sock, ackbuf, encx );
         }
@@ -4420,6 +4440,17 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
             if (sss.bounce_sock == -1) {
                 traceEvent( TRACE_WARNING, "NAT bounce socket failed; bounce tests disabled" );
             }
+            /* Alt UDP port (lport+1): echoes NAT probes from a second
+             * destination port of the same IP, letting an edge tell a reused
+             * (per-IP) mapping from a symmetric one. A bind failure only
+             * disables that refinement; the main port keeps working. */
+            sss.alt_sock = open_socket((uint16_t)(sss.lport + 1), 1 /*bind ANY*/ );
+            if (sss.alt_sock == -1)
+                traceEvent( TRACE_WARNING, "alt port %u bind failed; dual-port NAT check off",
+                            (unsigned)(sss.lport + 1) );
+            else
+                traceEvent( TRACE_NORMAL, "alt UDP port %u open (dual-port NAT check)",
+                            (unsigned)(sss.lport + 1) );
         } else {
             traceEvent( TRACE_WARNING, "IPv4 socket failed, continuing without IPv4" );
             sss.sock = -1;
@@ -4594,6 +4625,11 @@ static int run_loop( n2n_sn_t * sss )
             max_sock = max(max_sock, sss->sock6);
         }
 
+        if (sss->alt_sock != -1) {
+            FD_SET(sss->alt_sock, &socket_mask);
+            max_sock = max(max_sock, sss->alt_sock);
+        }
+
         if (sss->mgmt_sock != -1) {
             FD_SET(sss->mgmt_sock, &socket_mask);
             max_sock = max(max_sock, sss->mgmt_sock);
@@ -4639,8 +4675,8 @@ static int run_loop( n2n_sn_t * sss )
                                (struct sockaddr *)&udp_sender_sock, &udp_sender_len);
 
                 if (bread > 0) {
-                    process_udp( sss, (struct sockaddr*) &udp_sender_sock, udp_sender_len,
-                                pktbuf, bread, now, NULL );
+                    process_udp( sss, sss->sock, (struct sockaddr*) &udp_sender_sock,
+                                udp_sender_len, pktbuf, bread, now, NULL );
                 }
             }
 
@@ -4652,8 +4688,21 @@ static int run_loop( n2n_sn_t * sss )
                                (struct sockaddr *)&udp6_sender_sock, &udp6_sender_len);
 
                 if (bread > 0) {
-                    process_udp( sss, (struct sockaddr*) &udp6_sender_sock, udp6_sender_len,
-                                pktbuf, bread, now, NULL );
+                    process_udp( sss, sss->sock6, (struct sockaddr*) &udp6_sender_sock,
+                                udp6_sender_len, pktbuf, bread, now, NULL );
+                }
+            }
+
+            if (sss->alt_sock != -1 && FD_ISSET(sss->alt_sock, &socket_mask)) {
+                struct sockaddr_storage udpalt_sender_sock;
+                socklen_t udpalt_sender_len = sizeof(udpalt_sender_sock);
+
+                bread = recvfrom(sss->alt_sock, pktbuf, N2N_SN_PKTBUF_SIZE, 0,
+                               (struct sockaddr *)&udpalt_sender_sock, &udpalt_sender_len);
+
+                if (bread > 0) {
+                    process_udp( sss, sss->alt_sock, (struct sockaddr*) &udpalt_sender_sock,
+                                 udpalt_sender_len, pktbuf, bread, now, NULL );
                 }
             }
 
@@ -4712,7 +4761,7 @@ static int run_loop( n2n_sn_t * sss )
                         ssize_t n = ws_recv(wc, wbuf, sizeof(wbuf));
                         if (n > 0) {
                             wc->last_seen = now;
-                            process_udp(sss,
+                            process_udp(sss, -1,
                                         (struct sockaddr*)&wc->peer,
                                         (socklen_t)sizeof(wc->peer),
                                         wbuf, (size_t)n, now, wc);

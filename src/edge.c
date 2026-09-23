@@ -2771,6 +2771,7 @@ static int nat_refresh_rebuild( n2n_edge_t * eee )
     eee->nat_type = N2N_NAT_UNKNOWN;
     memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
+    memset(&eee->nat_seen_sn2_alt, 0, sizeof(n2n_sock_t));
     memset(&eee->my_public_sock, 0, sizeof(n2n_sock_t));
     eee->nat_probe_time = n2n_now();
     eee->nat_probe_pending = 0;
@@ -2829,7 +2830,16 @@ static void nat_classify( n2n_edge_t * eee )
     pub2 = ( eee->nat_seen_sn2.family == AF_INET &&
              !nat_addr_private( eee->nat_seen_sn2.addr.v4 ) );
 
-    if ( pub1 && pub2 &&
+    /* Dual-port reuse: the twin probe sent to sn_query's alt port echoed the
+     * same public port as sn2's main one. The mapping is then only endpoint-
+     * dependent ACROSS IPs and is reused within an IP (gostun's NAT3-style
+     * port-restricted) — such a NAT punches fine, so the sn1-vs-sn2
+     * disagreement must NOT read as symmetric NAT4. */
+    int reuse2 = ( eee->nat_seen_sn2.family == AF_INET &&
+                   eee->nat_seen_sn2_alt.family == AF_INET &&
+                   eee->nat_seen_sn2.port == eee->nat_seen_sn2_alt.port );
+
+    if ( pub1 && pub2 && !reuse2 &&
          ( memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
            eee->nat_seen_sn1.port != eee->nat_seen_sn2.port ) )
         /* The two public observations disagree: the mapping is
@@ -3196,6 +3206,17 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
             random_bytes( NULL, eee->sn_probe_cookie, N2N_COOKIE_SIZE );
             eee->sn_probe_cookie_valid = 1;
             send_register_super( eee, &(eee->sn_query), 0, 2, NULL );
+            /* Twin probe to sn_query's alt port (lport+1): the same IP at a
+             * second destination port, sharing the one cookie. Equal public
+             * ports then prove the mapping is reused per IP (NAT3-style), the
+             * evidence that keeps a per-IP NAT from being mislabelled NAT4. */
+            if ( eee->sn_query.family == AF_INET &&
+                 eee->sn_query.port != 0xFFFF )
+            {
+                n2n_sock_t snq_alt = eee->sn_query;
+                snq_alt.port = (uint16_t)( eee->sn_query.port + 1 );
+                send_register_super( eee, &snq_alt, 0, 2, NULL );
+            }
         }
     }
 
@@ -5788,25 +5809,15 @@ process_n2n_packet:
                      * the probed address; afterwards the edge registers
                      * solely with sn1. */
                     int was_sym_check = eee->nat_probe_pending;
-                    eee->nat_probe_pending = 0;
 
                     if ( sock_equal( &sender, &eee->sn_query ) == 0 )
                     {
-                        /* sn2's echo of our source address: the second
-                         * observation for NAT classification. */
+                        /* sn2's echo of our source address (main port): the
+                         * second observation for NAT classification. */
                         if ( ra.sock.family == AF_INET )
                         {
                             eee->nat_seen_sn2 = ra.sock;
                             nat_classify( eee );
-                            if ( was_sym_check )
-                            {
-                                /* The single second observation is spent: sn2
-                                 * is no longer a stranger, so nothing can be
-                                 * re-measured in this mapping generation. */
-                                eee->nat_final = 1;
-                                traceEvent( TRACE_INFO, "NAT verdict frozen as %s",
-                                            N2N_NAT_NAME( eee->nat_type ) );
-                            }
                         }
 
                         /* sn2 answered the probe: it is alive. Keep last_sup
@@ -5829,6 +5840,25 @@ process_n2n_packet:
                             traceEvent( TRACE_DEBUG,
                                         "sn2 reports sn1 at %s (probe)",
                                         sock_to_cstr( sockbuf1, &ra.sn_bak ) );
+                        }
+                    }
+                    else if ( eee->sn_query.family == AF_INET &&
+                              sender.family == AF_INET &&
+                              sender.port == (uint16_t)( eee->sn_query.port + 1 ) &&
+                              memcmp( sender.addr.v4, eee->sn_query.addr.v4,
+                                      IPV4_SIZE ) == 0 )
+                    {
+                        /* Twin probe echo from sn_query's alt port (lport+1):
+                         * the same IP at a second destination port. Both
+                         * echoes share one cookie and can arrive in either
+                         * order; equal public ports prove the mapping is
+                         * reused per IP (never frozen as symmetric). sn2 is
+                         * just as reachable through its alt port. */
+                        eee->last_sup = now;
+                        if ( ra.sock.family == AF_INET )
+                        {
+                            eee->nat_seen_sn2_alt = ra.sock;
+                            nat_classify( eee );
                         }
                     }
                     else if ( eee->sn1_probe_addr.family != 0 &&
@@ -5855,6 +5885,22 @@ process_n2n_packet:
                         }
                         traceEvent( TRACE_WARNING,
                                     "sn1 back online - switching back to sn1");
+                    }
+
+                    /* Spend the one-shot symmetric check only once BOTH twin
+                     * echoes are in: they share one cookie and can arrive in
+                     * either order, and the alt echo is exactly what keeps a
+                     * per-IP-reuse NAT from being frozen as symmetric. An
+                     * alt-less SN answers only the main probe; the Phase 2.5
+                     * retry timeout then freezes the verdict as before. */
+                    if ( was_sym_check &&
+                         eee->nat_seen_sn2.family == AF_INET &&
+                         eee->nat_seen_sn2_alt.family == AF_INET )
+                    {
+                        eee->nat_probe_pending = 0;
+                        eee->nat_final = 1;
+                        traceEvent( TRACE_INFO, "NAT verdict frozen as %s",
+                                    N2N_NAT_NAME( eee->nat_type ) );
                     }
                 }
                 else if ( 0 == memcmp( ra.cookie, eee->last_cookie, N2N_COOKIE_SIZE ) )
@@ -6161,6 +6207,7 @@ process_n2n_packet:
                                     eee->nat_type = N2N_NAT_UNKNOWN;
                                     memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
                                     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
+                                    memset(&eee->nat_seen_sn2_alt, 0, sizeof(n2n_sock_t));
                                     eee->nat_bounce_seen = 0;
                                     eee->fc_seen = 0;
                                     eee->fc_window = 1;

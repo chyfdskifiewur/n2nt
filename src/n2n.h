@@ -622,6 +622,10 @@ struct n2n_edge
     uint8_t             nat_type;       /* N2N_NAT_* */
     n2n_sock_t          nat_seen_sn1;   /* edge addr observed by sn1 (family=0 if none) */
     n2n_sock_t          nat_seen_sn2;   /* edge addr observed by sn2 (family=0 if none) */
+    n2n_sock_t          nat_seen_sn2_alt; /* twin echo from sn_query's alt port
+                                           (lport+1): same IP, a second destination
+                                           port; equal public ports prove the mapping
+                                           is reused per IP (not symmetric) */
     time_t              nat_probe_time; /* last one-shot symmetric check attempt */
     uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
     uint8_t             nat_bounce_seen;   /* a helper-port delivery got through: not port-restricted */
