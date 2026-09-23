@@ -8001,6 +8001,7 @@ static int run_loop(n2n_edge_t * eee )
                 eee->nat_refresh_start = 0;
                 memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
                 memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
+                memset(&eee->nat_seen_sn2_alt, 0, sizeof(n2n_sock_t));
                 eee->nat_bounce_seen = 0;
                 eee->nat_final = 1;
                 eee->nat_probe_pending = 0;
