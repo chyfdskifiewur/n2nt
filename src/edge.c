@@ -5786,7 +5786,13 @@ process_n2n_packet:
         {
             n2n_REGISTER_SUPER_ACK_t ra;
 
-            if ( eee->sn_wait || eee->sn_ack_count > 0 )
+            /* Stay receptive during the one-shot twin check: handling the
+             * FIRST echo can fire the classify push (cookie_mode 0, force),
+             * which zeroes sn_ack_count at its send — closing this gate
+             * before the SECOND echo lands and stranding the verdict as
+             * symmetric. Either twin order must be processable. */
+            if ( eee->sn_wait || eee->sn_ack_count > 0 ||
+                 eee->nat_probe_pending )
             {
                 decode_REGISTER_SUPER_ACK( &ra, &cmn, udp_buf, &rem, &idx );
 
