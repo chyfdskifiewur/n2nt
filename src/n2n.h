@@ -458,11 +458,11 @@ typedef char n2n_sn_name_t[N2N_EDGE_SN_HOST_SIZE];
 typedef struct {
     n2n_sock_t   sock;         /* current socket of this brother SN (IPv4 or IPv6, whichever arrives first) */
     n2n_sock_t   sock6;        /* IPv6 socket of this brother SN (optional, family=0 if not seen on v6) */
-    n2n_sock_t   adv_sock;     /* address advertised to ask_backup lookups: sender's live IP
-                                  but with the port from OUR [-b] config (the real service
-                                  port), NOT this packet's source port which may be an
-                                  ephemeral port after an SN rebind. v4 family. */
-    n2n_sock_t   adv_sock6;    /* same as adv_sock, v6 family */
+    n2n_sock_t   adv_sock;     /* address advertised to ask_backup lookups: the big
+                                  brother's registration source IP and source port —
+                                  that packet left its [-l] service socket, so the
+                                  source port IS its real service port. v4 family. */
+    n2n_sock_t   adv_sock6;    /* same as adv_sock, v6 family (or reg.own_ipv6) */
     time_t       seen;         /* last registration time (0 = never, not counted in num_brothers) */
     time_t       seen6;        /* last v6 registration time */
     n2n_mac_t    mac;          /* MAC of the brother SN (all-zero = invalid) */

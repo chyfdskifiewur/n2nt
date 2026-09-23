@@ -20,6 +20,12 @@
  * the announcement. */
 #define SN_RELAY_ADVERT_ACTIVE_SECS  5
 
+/** maximum length of command line arguments */
+#define MAX_CMDLINE_BUFFER_LENGTH       4096
+
+/** maximum length of a line in the configuration file */
+#define MAX_CONFFILE_LINE_LENGTH        1024
+
 /* forward declarations - needed by run_loop before their definitions */
 struct n2n_sn;
 static int resolve_brother_addr(const char *text, n2n_sock_t *out);
@@ -58,6 +64,7 @@ static int sock_from_sender( n2n_sock_t *out, const struct sockaddr *sa )
  * only available after the include block below, so the body is placed
  * further down. */
 static int sn_get_device_mac(n2n_mac_t out_mac);
+
 #include <signal.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -85,6 +92,155 @@ static int sn_get_device_mac(n2n_mac_t out_mac);
 #define SOCKET_INVALID -1
 #define CLOSE_SOCKET(s) close(s)
 #endif
+
+/* Read a parameter file (one option per line, '#' comments, lines folded
+ * into a single space-separated command line) into linebuffer. */
+static int readConfFile(const char * filename, char * const linebuffer) {
+    FILE* fd;
+    char* buffer;
+
+    buffer = (char*) malloc(MAX_CONFFILE_LINE_LENGTH);
+    if (!buffer) return -1;
+
+    if (access(filename, R_OK)) {
+        if (errno == ENOENT)
+            traceEvent(TRACE_ERROR, "parameter file %s not found/unable to access", filename);
+        else
+            traceEvent(TRACE_ERROR, "cannot stat file %s, %s",filename, strerror(errno));
+        free(buffer);
+        return -1;
+    }
+
+    fd = fopen(filename, "rb");
+    if (!fd) {
+        traceEvent(TRACE_ERROR, "Unable to open parameter file '%s': %s", filename, strerror(errno));
+        free(buffer);
+        return -1;
+    }
+    while(fgets(buffer, MAX_CONFFILE_LINE_LENGTH,fd)) {
+        char* p;
+
+        p = strchr(buffer, '#');
+        if (p) *p ='\0';
+
+        p = strchr(buffer, '\n');
+        if (p) *p ='\0';
+
+        if (strlen(buffer) == 0) continue;
+
+        p = buffer;
+        while (*p == ' ') ++p;
+        if (p != buffer) {
+            size_t len = strlen(p);
+            if (len < MAX_CONFFILE_LINE_LENGTH) {
+                memmove(buffer, p, len + 1);
+            } else {
+                traceEvent(TRACE_ERROR, "line too long");
+                continue;
+            }
+        }
+
+        size_t buf_len = strlen(buffer);
+        while(buf_len > 0 && buffer[buf_len-1] == ' ') {
+            buffer[buf_len-1] = '\0';
+            buf_len--;
+        }
+
+        if (strchr(buffer, '@')) {
+            traceEvent(TRACE_ERROR, "@file in file nesting is not supported");
+            free(buffer);
+            fclose(fd);
+            return -1;
+        }
+        
+        size_t line_len = strlen(linebuffer);
+        if (line_len + buf_len + 2 <= MAX_CMDLINE_BUFFER_LENGTH) {
+            linebuffer[line_len] = ' ';
+            memcpy(linebuffer + line_len + 1, buffer, buf_len + 1);
+        } else {
+            traceEvent(TRACE_ERROR, "too many arguments");
+            free(buffer);
+            fclose(fd);
+            return -1;
+        }
+    }
+
+    free(buffer);
+    fclose(fd);
+
+    return 0;
+}
+
+/* Split the folded command line into an argv vector (space-separated). */
+static char ** buildargv(int * effectiveargc, char * const linebuffer) {
+    const int  INITIAL_MAXARGC = 16;	/* Number of args + NULL in initial argv */
+    int     maxargc;
+    int     argc=0;
+    char ** argv;
+    char *  buffer, * buff;
+
+    if (!linebuffer) {
+        return NULL;
+    }
+
+    *effectiveargc = 0;
+    buffer = (char *)calloc(1, strlen(linebuffer)+2);
+    if (!buffer) return NULL;
+
+    memcpy(buffer, linebuffer, strlen(linebuffer) + 1);
+
+    maxargc = INITIAL_MAXARGC;
+    argv = (char **)malloc(maxargc * sizeof(char*));
+    if (!argv) {
+        traceEvent(TRACE_ERROR, "Unable to allocate memory");
+        free(buffer);
+        return NULL;
+    }
+    buff = buffer;
+    while(buff) {
+        char * p = strchr(buff,' ');
+        if (p) {
+            *p='\0';
+            argv[argc] = strdup(buff);
+            if (!argv[argc]) {
+                traceEvent(TRACE_ERROR, "Unable to allocate memory for argv[%d]", argc);
+                for (int j = 0; j < argc; j++) free(argv[j]);
+                free(argv);
+                free(buffer);
+                return NULL;
+            }
+            argc++;
+            while(*++p == ' ');
+            buff=p;
+        } else {
+            argv[argc] = strdup(buff);
+            if (!argv[argc]) {
+                traceEvent(TRACE_ERROR, "Unable to allocate memory for argv[%d]", argc);
+                for (int j = 0; j < argc; j++) free(argv[j]);
+                free(argv);
+                free(buffer);
+                return NULL;
+            }
+            argc++;
+            break;
+        }
+        if (argc >= maxargc) {
+            maxargc *= 2;
+            char** new_argv = (char **)realloc(argv, maxargc * sizeof(char*));
+            if (new_argv == NULL) {
+                traceEvent(TRACE_ERROR, "Unable to re-allocate memory");
+                for (int i = 0; i < argc; i++) free(argv[i]);
+                free(argv);
+                free(buffer);
+                return NULL;
+            }
+            argv = new_argv;
+        }
+    }
+    free(buffer);
+    *effectiveargc = argc;
+    return argv;
+}
 
 /* sn_get_device_mac implementation: depends on platform headers above. */
 static int sn_get_device_mac(n2n_mac_t out_mac)
@@ -4031,8 +4187,10 @@ static void help(int argc, char * const argv[])
     printf("\n");
 
     printf("Usage: supernode -l <lport>\n");
+    printf("or: supernode [config_file] <options>\n");
     printf("\n");
 
+    fprintf( stderr, "[config_file]\tParameter file, one option per line ('#' comments).\n" );
     fprintf( stderr, "-l <lport>\tSet UDP main listen port to <lport>.\n" );
     fprintf( stderr, "-4|-6     \tIP mode: -4 (IPv4 only), -6 (IPv6 only), both/none (dual-stack).\n" );
     fprintf( stderr, "-b <host:port>\tBrother supernode address.\n" );
@@ -4117,6 +4275,45 @@ int main( int argc, char * const argv[] )
             }
         }
     }
+
+/* Check if first argument is a config file (not starting with '-') */
+if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
+    char linebuffer[MAX_CMDLINE_BUFFER_LENGTH] = {0};
+    if (readConfFile(argv[1], linebuffer) < 0) {
+        traceEvent(TRACE_ERROR, "Failed to read config file: %s", argv[1]);
+        exit(1);
+    }
+
+    /* Build new argv from config file and remaining arguments */
+    char **config_argv;
+    int config_argc;
+
+    /* Parse config file into argv */
+    config_argv = buildargv(&config_argc, linebuffer);
+    if (!config_argv) {
+        traceEvent(TRACE_ERROR, "Failed to parse config file");
+        exit(1);
+    }
+
+    /* Create new argv array with program name and remaining args */
+    char **new_argv = malloc((config_argc + argc - 1) * sizeof(char*));
+    new_argv[0] = argv[0];
+
+    /* Copy config file arguments */
+    for (int i = 0; i < config_argc; i++) {
+        new_argv[i + 1] = config_argv[i];
+    }
+
+    /* Copy remaining command line arguments */
+    for (int i = 2; i < argc; i++) {
+        new_argv[config_argc + i - 1] = argv[i];
+    }
+
+    /* Update argc and argv for getopt_long */
+    argc = config_argc + argc - 1;
+    argv = new_argv;
+    optind = 1; /* Reset getopt */
+}
 
     init_sn( &sss );
 
