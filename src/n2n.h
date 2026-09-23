@@ -637,6 +637,10 @@ struct n2n_edge
                                            re-trigger the brother's N2NF probe (mgmt "n") */
     time_t              nat_revert_at;  /* mgmt "n" in fixed-port mode: rebind the configured
                                            local port again once this time is reached (0 = none) */
+    time_t              nat_refresh_start; /* mgmt "n": when the refresh began. Independent of
+                                           fc_arm_time (which is re-armed on extension): the hard
+                                           cap that eventually forces a freeze/restore even if
+                                           sn2 never answers. 0 = none */
     uint8_t             nat_suppress_remap; /* one-shot: next ACK-remap only updates
                                            my_public_sock, keeps the fresh NAT verdict */
     time_t              nat_autorecover_at; /* last automatic UDP socket rebuild (every

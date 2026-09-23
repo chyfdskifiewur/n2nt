@@ -399,6 +399,7 @@ static int edge_init(n2n_edge_t * eee)
     eee->nat_final = 0;
     eee->nat_reprobe = 0;
     eee->nat_autorecover_at = 0;
+    eee->nat_refresh_start = 0;
     eee->sn_query_index = 1;
     eee->sn_backup_index = 1;
     eee->sn_af = AF_UNSPEC;
@@ -2748,6 +2749,15 @@ static void sn_switch_to( n2n_edge_t * eee, size_t idx )
 #define NAT_SYM_RETRY_SECS  5
 #define NAT_SYM_MAX_TRIES   3
 
+/* Fixed-port refresh ("n"): how long to stay on a fresh random port before
+ * rebinding the configured port. Detection can outlast the first probe
+ * round (brother N2NF delayed/lost, sn2 slow to echo), so an unfinished
+ * verdict extends the window instead of freezing "unknown" prematurely —
+ * but only up to a hard cap, so a silent environment eventually gives up
+ * and restores the fixed port anyway. */
+#define NAT_REVERT_RETRY_SECS   20  /* re-arm the fixed-port revert delay */
+#define NAT_REVERT_MAX_SECS     90  /* absolute cap since fc_arm_time */
+
 static int nat_addr_private( const uint8_t * a ) /* network-order IPv4 */
 {
     return ( a[0] == 10 ) ||
@@ -4390,6 +4400,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
             if (setup_sockets(eee, 0 /* random port */) < 0) {
                 eee->nat_revert_at = 0;
+                eee->nat_refresh_start = 0;
                 /* Try to bring the main socket back before giving up. */
                 if (eee->local_port != 0)
                     setup_sockets(eee, (int)eee->local_port);
@@ -4415,11 +4426,13 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                  * then the main loop rebinds the configured port again. The
                  * verdict from the random mapping is kept — NAT type is a
                  * property of the NAT device, not of the port it was probed on. */
+                eee->nat_refresh_start = n2n_now();
                 eee->nat_revert_at = n2n_now() + 15;
                 msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                                     "> NAT refresh: probing on a fresh random port, fixed port restored in ~15s\n");
             } else {
                 eee->nat_revert_at = 0;
+                eee->nat_refresh_start = n2n_now();
                 msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
                                     "> NAT refresh: probing on a fresh random port\n");
             }
@@ -7889,7 +7902,41 @@ static int run_loop(n2n_edge_t * eee )
          * device) and the one-shot remap suppression below keeps that verdict
          * when the first ACK arrives on the restored port. */
         if (eee->nat_revert_at != 0 && n2n_now() >= eee->nat_revert_at) {
+            /* Detection can legitimately outlast the first 15s window: the
+             * brother's N2NF probe may be delayed/lost and sn2 may be slow
+             * to echo the one-shot probe. Freezing "unknown" in that state
+             * would permanently brand the NAT as unknown, so instead extend
+             * the random-port window (re-arming the stranger timer and
+             * re-asking the SN to re-fire the brother probe) — bounded by a
+             * hard cap, so a truly silent environment eventually gives up
+             * and restores the fixed port anyway. */
+            if ( eee->nat_type == N2N_NAT_UNKNOWN &&
+                 !eee->nat_final &&
+                 ( eee->nat_refresh_start == 0 ||
+                   n2n_now() - eee->nat_refresh_start < NAT_REVERT_MAX_SECS ) )
+            {
+                eee->nat_revert_at = n2n_now() + NAT_REVERT_RETRY_SECS;
+                if ( eee->fc_window )
+                {
+                    /* Stranger window still open: re-arm the one-shot
+                     * symmetric check to fire NAT_STRANGER_SECS from now and
+                     * ask the SN to re-fire the brother's N2NF probe, so a
+                     * delayed probe still lands inside the window. */
+                    eee->fc_arm_time = n2n_now();
+                    eee->nat_probe_pending = 0;
+                    eee->nat_sym_tries = 0;
+                    if ( eee->supernode.family != 0 )
+                    {
+                        eee->nat_reprobe = 1; /* one-shot, consumed by send_register_super */
+                        send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+                    }
+                }
+                traceEvent( TRACE_INFO, "NAT refresh: verdict still unknown, extending probe window" );
+            }
+            else
+            {
             eee->nat_revert_at = 0;
+            eee->nat_refresh_start = 0;
             closesocket(eee->udp_sock);  eee->udp_sock = -1;
             if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
             /* Keep the verdict measured on the random mapping, but drop the
@@ -7918,6 +7965,7 @@ static int run_loop(n2n_edge_t * eee )
                 send_register_super( eee, &(eee->supernode), 1, 0, NULL );
                 eee->sn_wait = 1;
                 eee->last_register_req = n2n_now();
+            }
             }
         }
 
