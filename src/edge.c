@@ -7998,36 +7998,56 @@ static int run_loop(n2n_edge_t * eee )
             }
             else
             {
-                /* Verdict in hand, or the window hard-capped: stop refreshing
-                 * and freeze it. Drop the observations (they belong to the
-                 * abandoned mapping); fixed-port mode rebinds the configured
-                 * port and the first ACK there keeps the verdict thanks to
-                 * nat_suppress_remap. */
-                eee->nat_revert_at = 0;
-                eee->nat_refresh_start = 0;
-                memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
-                memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
-                memset(&eee->nat_seen_sn2_alt, 0, sizeof(n2n_sock_t));
-                eee->nat_bounce_seen = 0;
-                eee->nat_final = 1;
-                eee->nat_probe_pending = 0;
-                if ( eee->local_port != 0 )
+                /* The twin symmetric check is still in flight: only one of the
+                 * two echoes has landed (the verdict was newly re-derived and
+                 * can still move to port-restr when the alt echo agrees, or be
+                 * frozen by the check's own 3x5s retry timeout). The revert
+                 * deadline (15s) is shorter than that window (12s+3x5s), so
+                 * freezing here would strand the verdict on half the evidence
+                 * and silently cancel the "sn2 silent" path — defer instead and
+                 * let the probe loop finish; the absolute cap still bounds the
+                 * wait. */
+                if ( eee->nat_probe_pending &&
+                     ( eee->nat_refresh_start == 0 ||
+                       n2n_now() - eee->nat_refresh_start < NAT_REVERT_MAX_SECS ) )
                 {
-                    eee->nat_suppress_remap = 1;
-                    closesocket(eee->udp_sock);  eee->udp_sock = -1;
-                    if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
-                    if (setup_sockets(eee, (int)eee->local_port) < 0)
-                        traceEvent(TRACE_ERROR, "NAT refresh: rebind to fixed port %u failed",
-                                   (unsigned int)eee->local_port);
-                    else {
-                        traceEvent(TRACE_NORMAL, "NAT refresh: local port restored to %u",
-                                   (unsigned int)eee->local_port);
-                        /* Re-register so the SN (and every peer, via the
-                         * address-change community push) switches to the
-                         * restored fixed-port endpoint. */
-                        send_register_super( eee, &(eee->supernode), 1, 0, NULL );
-                        eee->sn_wait = 1;
-                        eee->last_register_req = n2n_now();
+                    eee->nat_revert_at = n2n_now() + NAT_REVERT_RETRY_SECS;
+                    traceEvent( TRACE_INFO,
+                                "NAT refresh: twin symmetric check still pending, deferring freeze" );
+                }
+                else
+                {
+                    /* Verdict in hand, or the window hard-capped: stop refreshing
+                     * and freeze it. Drop the observations (they belong to the
+                     * abandoned mapping); fixed-port mode rebinds the configured
+                     * port and the first ACK there keeps the verdict thanks to
+                     * nat_suppress_remap. */
+                    eee->nat_revert_at = 0;
+                    eee->nat_refresh_start = 0;
+                    memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
+                    memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
+                    memset(&eee->nat_seen_sn2_alt, 0, sizeof(n2n_sock_t));
+                    eee->nat_bounce_seen = 0;
+                    eee->nat_final = 1;
+                    eee->nat_probe_pending = 0;
+                    if ( eee->local_port != 0 )
+                    {
+                        eee->nat_suppress_remap = 1;
+                        closesocket(eee->udp_sock);  eee->udp_sock = -1;
+                        if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
+                        if (setup_sockets(eee, (int)eee->local_port) < 0)
+                            traceEvent(TRACE_ERROR, "NAT refresh: rebind to fixed port %u failed",
+                                       (unsigned int)eee->local_port);
+                        else {
+                            traceEvent(TRACE_NORMAL, "NAT refresh: local port restored to %u",
+                                       (unsigned int)eee->local_port);
+                            /* Re-register so the SN (and every peer, via the
+                             * address-change community push) switches to the
+                             * restored fixed-port endpoint. */
+                            send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+                            eee->sn_wait = 1;
+                            eee->last_register_req = n2n_now();
+                        }
                     }
                 }
             }
