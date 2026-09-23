@@ -641,6 +641,9 @@ struct n2n_edge
                                            fc_arm_time (which is re-armed on extension): the hard
                                            cap that eventually forces a freeze/restore even if
                                            sn2 never answers. 0 = none */
+    uint8_t             nat_rebuild_tries; /* "one more round" rebuilds already run for the current
+                                           refresh; capped so a sick environment eventually freezes
+                                           instead of rebuilding forever */
     uint8_t             nat_suppress_remap; /* one-shot: next ACK-remap only updates
                                            my_public_sock, keeps the fresh NAT verdict */
     time_t              nat_autorecover_at; /* last automatic UDP socket rebuild (every
