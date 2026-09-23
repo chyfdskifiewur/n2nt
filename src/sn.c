@@ -4212,6 +4212,7 @@ static void help(int argc, char * const argv[])
 
     fprintf( stderr, "[config_file]\tParameter file, one option per line ('#' comments).\n" );
     fprintf( stderr, "-l <lport>\tSet UDP main listen port to <lport>.\n" );
+    fprintf( stderr, "          \tAlso opens second port <lport+1> for the NAT check.\n" );
     fprintf( stderr, "-4|-6     \tIP mode: -4 (IPv4 only), -6 (IPv6 only), both/none (dual-stack).\n" );
     fprintf( stderr, "-b <host:port>\tBrother supernode address.\n" );
     fprintf( stderr, "-B <token>\tToken required from brother SNs (no -B = accept any brother).\n" );

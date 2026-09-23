@@ -617,13 +617,16 @@ struct n2n_edge
 
     n2n_sock_t          my_public_sock;
 
-    /* NAT type detection: dual-sn reflection (mapping compare) plus the sn
-     * bounce test (helper socket, different source port) for cone sub-types. */
+    /* NAT type detection: twin probes to the connected supernode's two ports
+     * (lport / lport+1 mapping compare) plus the sn bounce test (helper
+     * socket, different source port) for cone sub-types. */
     uint8_t             nat_type;       /* N2N_NAT_* */
     n2n_sock_t          nat_seen_sn1;   /* edge addr observed by sn1 (family=0 if none) */
-    n2n_sock_t          nat_seen_sn2;   /* edge addr observed by sn2 (family=0 if none) */
-    n2n_sock_t          nat_seen_sn2_alt; /* twin echo from sn_query's alt port
-                                           (lport+1): same IP, a second destination
+    n2n_sock_t          nat_seen_sn2;   /* edge addr observed by the twin probe's
+                                           MAIN port (second observation; in multi-sn
+                                           failover also any sn2 query-channel ACK) */
+    n2n_sock_t          nat_seen_sn2_alt; /* twin echo from the current supernode's
+                                           alt port (lport+1): same IP, a second destination
                                            port; equal public ports prove the mapping
                                            is reused per IP (not symmetric) */
     time_t              nat_probe_time; /* last one-shot symmetric check attempt */
@@ -635,8 +638,9 @@ struct n2n_edge
                                            the one-shot symmetric check is spent 12s
                                            later, once the window has served its purpose */
     uint8_t             nat_sym_tries;  /* attempts spent on the one-shot symmetric check */
-    uint8_t             nat_final;      /* 1: verdict frozen, sn2 is a stranger no more
-                                           (cleared on restart / mapping change only) */
+    uint8_t             nat_final;      /* 1: verdict frozen, the one-shot twin check
+                                          is spent (cleared on restart / mapping
+                                          change only) */
     uint8_t             nat_reprobe;    /* one-shot: next sn1 registration asks the SN to
                                            re-trigger the brother's N2NF probe (mgmt "n") */
     time_t              nat_revert_at;  /* mgmt "n" in fixed-port mode: rebind the configured
