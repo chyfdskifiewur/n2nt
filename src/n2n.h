@@ -286,7 +286,6 @@ struct peer_info {
     uint8_t             keepalive_fails;   /* consecutive keepalive failures */
     time_t              last_query_sent;   /* time last query_peer was sent, for rate-limiting */
     time_t              last_punch_probe;  /* time last PROBE was sent during hole-punch */
-    uint64_t            last_punch_probe_ms; /* EXPERIMENT: ms timestamp of last punch PROBE */
     uint8_t             punch_retry_count; /* number of punch retries, remove after max */
     uint8_t             register_retry_count; /* REGISTER retries after PROBE_ACK, max 3 */
     time_t              last_register_sent;   /* time last REGISTER was sent after PROBE_ACK */
