@@ -592,6 +592,7 @@ struct n2n_edge
     CRITICAL_SECTION    peers_lock;
 #endif
     time_t              last_register_req;
+    time_t              punch_burst_until;  /* EXPERIMENT: violent-talk window; while now < this, REGISTER_SUPER every 1s */
     time_t              last_primary_probe; /* last heartbeat sent to primary (on backup) */
     time_t              last_failover_dns; /* last periodic clear of sn1_current_addr (on backup), to re-resolve the -l domain */
     size_t              register_lifetime;

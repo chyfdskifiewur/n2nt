@@ -1632,41 +1632,6 @@ static void send_probe( n2n_edge_t * eee, const n2n_sock_t * peer_sock, const n2
     sendto_sock(sock_for_dest(eee, peer_sock), pktbuf, idx, peer_sock);
 }
 
-/** Port prediction window: probe the announced port plus these offsets.
- *  Some NATs (esp. CGNAT and several home routers) pick a DIFFERENT public
- *  source port toward a NEW destination (the peer) than the one they used
- *  toward the supernode — usually a small sequential offset (+1/+2). */
-#define N2N_PUNCH_PORT_OFFSETS { 0, 1, 2, -1, -2 }
-
-/** Send PROBE(s) to the peer's announced public address plus nearby ports.
- *  IPv4 only — IPv6 practically has no NAT port reallocation to predict.
- *  Any direct reply from one of these candidates teaches us the peer's real
- *  port (the n2n_probe handler records the direct sender address and replies
- *  on it), so 'peer->sock' needs no explicit rewrite here. */
-static void send_punch_sweep( n2n_edge_t * eee, const n2n_sock_t * base, const n2n_mac_t dstMac )
-{
-    int offsets[] = N2N_PUNCH_PORT_OFFSETS;
-    n2n_sock_t target = *base;
-    size_t n = sizeof(offsets) / sizeof(offsets[0]);
-
-    for ( size_t i = 0; i < n; i++ )
-    {
-        int off = offsets[i];
-        int p = base->port;
-
-        if ( off > 0 ) {
-            if ( p > 0xFFFF - off ) continue;      /* port too high to widen */
-            p += off;
-        } else if ( off < 0 ) {
-            if ( (int)p + off <= 0 ) continue;     /* keep predicted port legal */
-            p += off;
-        }
-
-        target.port = (uint16_t)p;
-        send_probe(eee, &target, dstMac);
-    }
-}
-
 /** Send PROBE_ACK directly to peer: tell srcMac what addr we observed from their PROBE */
 static void send_probe_ack( n2n_edge_t * eee,
                             const n2n_mac_t srcMac,
@@ -1723,7 +1688,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     
     /* Try IPv4 punch if both sides have IPv4 */
     if ( peer_has_ipv4 && we_have_ipv4 ) {
-        send_punch_sweep(eee, &peer->sock, peer->mac_addr);
+        send_probe(eee, &peer->sock, peer->mac_addr);
         punched = 1;
         traceEvent(TRACE_INFO, "IPv4 hole-punch started for %s",
                    macaddr_str(mac_tmp, peer->mac_addr));
@@ -1740,6 +1705,10 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if (punched) {
         peer->punch_start_time = n2n_now();
         peer->last_punch_probe = peer->punch_start_time;
+        /* EXPERIMENT (violent talk): open a 60s window during which
+         * REGISTER_SUPER fires every 1s so the SN re-pushes our current
+         * NAT endpoint to all peers the moment it changes. */
+        eee->punch_burst_until = peer->punch_start_time + 60;
     }
 }
 
@@ -1783,21 +1752,22 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 &&
              !scan->punch_failed &&
+             (now > eee->punch_burst_until) &&
              (now - scan->punch_start_time) > PUNCH_TIMEOUT )
         {
             scan->punch_failed = 1;
             scan->punch_reset_time = now;
         } else if ( scan->punch_start_time != 0 &&
                     !scan->punch_failed &&
-                    (now - scan->punch_start_time) <= 5 &&
-                    (now - scan->last_punch_probe) >= 1 )
+                    (now - scan->last_punch_probe) >= 1 &&
+                    ((now - scan->punch_start_time) <= 5 || now < eee->punch_burst_until) )
         {
             /* Retransmit PROBE every 1s for first 5s */
             int sent_probe = 0;
             
             /* Try IPv4 if available */
             if ( scan->sock.family == AF_INET && eee->udp_sock != -1 ) {
-                send_punch_sweep(eee, &scan->sock, scan->mac_addr);
+                send_probe(eee, &scan->sock, scan->mac_addr);
                 sent_probe = 1;
             }
             
@@ -3332,8 +3302,12 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         }
     }
 
-    /* Phase 4: normal register cycle (30s). */
-    if ( nowTime > eee->last_register_req + 30 )
+    /* Phase 4: normal register cycle (30s).
+     * EXPERIMENT (violent talk): while a punch burst window is open,
+     * hammer REGISTER_SUPER every 1s instead. The SN re-pushes the
+     * fresh NAT endpoint to every peer on each address change, so the
+     * punched peer always aims at our current port. */
+    if ( nowTime > eee->last_register_req + (nowTime < eee->punch_burst_until ? 1 : 30) )
     {
         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
         send_register_super( eee, &(eee->supernode), 1, 0, NULL );
