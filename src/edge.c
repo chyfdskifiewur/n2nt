@@ -66,17 +66,6 @@
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
 #define PUNCH_TIMEOUT                   7    /* sec: give up hole-punch after this */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
-/* EXPERIMENT-D: while any peer is still punching (or in punch retry), the
- * normal 30s REGISTER_SUPER cadence is compressed to 5s. The SN's table is
- * the single source of every [PUNCH] address push; a drift NAT can jump
- * ports (observed 18093->18378 in 11s), and until WE re-register, the SN
- * keeps pushing the STALE port - every punch/QUERY during that window is
- * aimed at a dead endpoint. Re-registering every 5s during punching
- * confines any drift window to <=5s and lets the SN's addr_changed broadcast
- * wake BOTH sides to the fresh port at once. Idle (no active punch) keeps
- * the original 30s cadence so the SN is not disturbed. */
-#define PUNCH_REGISTER_FAST_INTERVAL   5    /* sec: REGISTER period while punching */
-#define PUNCH_REGISTER_IDLE_INTERVAL   30   /* sec: original REGISTER period */
 
 /** maximum length of command line arguments */
 #define MAX_CMDLINE_BUFFER_LENGTH       4096
@@ -3333,30 +3322,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         }
     }
 
-    /* Phase 4: normal register cycle. EXPERIMENT-D: compress the 30s cadence
-     * to 5s while any pending peer is actively punching (punch in progress or
-     * in the failed-retry loop). Only OUR own REGISTER refreshes the SN's view
-     * of our public port; the drift NAT can jump ports at any time, and during
-     * the stale window every [PUNCH]/QUERY push carries the dead address.
-     * A 5s self-refresh while punching shrinks that window to <=5s; when the
-     * port actually changed the SN responds with its addr_changed broadcast,
-     * which is the programmatic equivalent of the restart-broadcast that made
-     * the old manual-restart trick work. When no punch is active, keep the
-     * original 30s so the SN stays undisturbed. */
-    time_t reg_interval = PUNCH_REGISTER_IDLE_INTERVAL;
-    {
-        PEERS_LOCK(eee);
-        struct peer_info *pp = eee->pending_peers;
-        while (pp) {
-            if (pp->punch_start_time != 0 || pp->punch_failed) {
-                reg_interval = PUNCH_REGISTER_FAST_INTERVAL;
-                break;
-            }
-            pp = pp->next;
-        }
-        PEERS_UNLOCK(eee);
-    }
-    if ( nowTime > eee->last_register_req + reg_interval )
+    /* Phase 4: normal register cycle (30s). */
+    if ( nowTime > eee->last_register_req + 30 )
     {
         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
         send_register_super( eee, &(eee->supernode), 1, 0, NULL );
