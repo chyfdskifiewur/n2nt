@@ -1750,13 +1750,14 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
              !scan->punch_failed &&
              (now - scan->punch_start_time) > PUNCH_TIMEOUT )
         {
-            /* EXPERIMENT-A: on punch timeout, immediately ask the supernode
-             * to push BOTH sides' addresses (PUNCH_REQUEST). The peer will
-             * reset its failed state and re-open fire the same second ->
-             * a programmatic "restart = simultaneous open". */
+            /* EXPERIMENT-B: mark the punch failed but do NOT query the
+             * supernode instantly. The handshake takes ~2s and a REGISTER /
+             * REGISTER_ACK exchange may still be confirming right at the
+             * timeout; an instant QUERY makes the SN [PUNCH]-push to the
+             * peer, which tears down a link that is about to confirm.
+             * The query is issued 1s later (punch_failed branch). */
             scan->punch_failed = 1;
             scan->punch_reset_time = now;
-            send_query_peer(eee, scan->mac_addr);
         } else if ( scan->punch_start_time != 0 &&
                     !scan->punch_failed &&
                     (now - scan->punch_start_time) <= 5 &&
@@ -1823,6 +1824,19 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             continue;
         } else if ( scan->punch_failed )
         {
+            /* EXPERIMENT-B: QUERY the supernode 1s AFTER the failure, not at
+             * the failure instant. The extra second lets an in-flight
+             * REGISTER / REGISTER_ACK exchange confirm and move the peer to
+             * known_peers before our query wakes it with the SN's [PUNCH]
+             * double-push. last_query_sent < punch_reset_time allows at most
+             * one query per failure episode. */
+            if ( (now - scan->punch_reset_time) >= 1 &&
+                 scan->last_query_sent < scan->punch_reset_time )
+            {
+                send_query_peer(eee, scan->mac_addr);
+                scan->last_query_sent = now;
+            }
+
             /* EXPERIMENT-A: retry every 5s instead of the old 40s idle wait.
              * Before each retry, QUERY_PEER forces the supernode to re-push
              * BOTH sides' addresses (they keep drifting), so this side
@@ -5732,6 +5746,35 @@ process_n2n_packet:
             }
 
             if (known) {
+                /* EXPERIMENT-B: a [PUNCH] push must NEVER demolish a link
+                 * that is confirmed and still fresh (direct_seen within
+                 * CACHE_DST_TTL). Without this gate, every SN double-push
+                 * triggered by our QUERY flips a healthy peer back to
+                 * pending_peers, resets its punch state and re-fires —
+                 * that repeated teardown is what made frequent QUERY
+                 * destroy the direct link it had just built. Refresh the
+                 * address (and drop a stale destination cache) instead. */
+                if ( known->direct_seen != 0 &&
+                     (now - known->direct_seen) <= CACHE_DST_TTL )
+                {
+                    if (pi.sockets[0].family == AF_INET) {
+                        if (known->sock.family != AF_INET ||
+                            sock_equal(&known->sock, &pi.sockets[0]) != 0) {
+                            known->sock = pi.sockets[0];
+                            eee->cached_dst_valid = 0;
+                        }
+                        known->sockets[0] = pi.sockets[0];
+                    }
+                    if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                        pi.sockets[1].family != 0 && pi.sockets[1].port != 0) {
+                        known->sockets[1] = pi.sockets[1];
+                        known->num_sockets = 2;
+                    }
+                    if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) && pi.sock6.family == AF_INET6)
+                        known->sock6 = pi.sock6;
+                    PEERS_UNLOCK(eee);
+                    return 1;
+                }
                 struct peer_info *prev = NULL, *scan = eee->known_peers;
                 while (scan && memcmp(scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
                     prev = scan; scan = scan->next;
