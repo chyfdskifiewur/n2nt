@@ -5770,6 +5770,18 @@ process_n2n_packet:
             if (pi.os_name[0]) strncpy(pending->os_name, pi.os_name, sizeof(pending->os_name) - 1);
             pending->assigned_ip = pi.assigned_ip;
             pending->last_seen = n2n_now();
+
+            /* EXPERIMENT guard: once hole-punch has started (punch_start_time
+             * != 0), an incoming [PUNCH] refreshes only the addresses above;
+             * never reset the punch timer/failed flag or re-enter the deferred
+             * sequence. Otherwise the QUERY_PEER -> [PUNCH] feedback loop
+             * re-arms the 5s probe window every ~1s, PUNCH_TIMEOUT(7s) never
+             * fires and the storm never converges to relay-only. */
+            if (pending->punch_start_time != 0) {
+                PEERS_UNLOCK(eee);
+                return 1;
+            }
+
             pending->punch_start_time = 0;
             pending->punch_failed = 0;
             pending->register_retry_count = 0;
