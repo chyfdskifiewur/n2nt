@@ -105,8 +105,10 @@ static int bypass_kcp_output(const char *buf, int len, ikcpcb *kcp, void *user)
     return len;
 }
 
-/** Monotonic milliseconds for KCP timing. */
-static IUINT64 bypass_monotonic_ms(void)
+/** Monotonic milliseconds for KCP timing.
+ *  Non-static: reused by edge.c's 200ms hole-punch drift-chase probes
+ *  (EXPERIMENT) — the project's single ms clock, no new clock functions. */
+IUINT64 bypass_monotonic_ms(void)
 {
 #ifdef _WIN32
     return (IUINT64)GetTickCount64();

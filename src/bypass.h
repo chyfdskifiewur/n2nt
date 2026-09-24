@@ -190,6 +190,9 @@ static inline int bypass_has_kcp_conns(bypass_context_t *ctx) {
 
 /* ===== Functions ===== */
 
+/* Monotonic milliseconds since boot (KCP timing; reused by edge punch timing) */
+IUINT64 bypass_monotonic_ms(void);
+
 /* Init / deinit */
 int  bypass_init(bypass_context_t *ctx, struct n2n_edge *edge,
                  tuntap_dev *tap, uint32_t dev_ip, uint8_t dev_prefix);

@@ -1705,6 +1705,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if (punched) {
         peer->punch_start_time = n2n_now();
         peer->last_punch_probe = peer->punch_start_time;
+        peer->last_punch_probe_ms = bypass_monotonic_ms(); /* EXPERIMENT: ms clock for 200ms probes */
     }
 }
 
@@ -1754,10 +1755,11 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             scan->punch_reset_time = now;
         } else if ( scan->punch_start_time != 0 &&
                     !scan->punch_failed &&
-                    (now - scan->punch_start_time) <= 5 &&
-                    (now - scan->last_punch_probe) >= 1 )
+                    (bypass_monotonic_ms() - scan->last_punch_probe_ms) >= 200 )
         {
-            /* Retransmit PROBE every 1s for first 5s */
+            /* EXPERIMENT: Retransmit PROBE every 200ms (ms clock) for the
+             * whole PUNCH_TIMEOUT window — chase the peer's drifting NAT
+             * port instead of stopping after the first 5 seconds. */
             int sent_probe = 0;
             
             /* Try IPv4 if available */
@@ -1774,6 +1776,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             
             if (sent_probe) {
                 scan->last_punch_probe = now;
+                scan->last_punch_probe_ms = bypass_monotonic_ms();
             }
         } else if ( scan->register_retry_count > 0 && !scan->punch_failed )
         {
@@ -1818,31 +1821,25 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             continue;
         } else if ( scan->punch_failed )
         {
-            if ( scan->punch_retry_count >= 3 ) {
-                prev = scan;
-                scan = scan->next;
-                continue;
-            }
-            if ( (now - scan->punch_reset_time) > 40 )
+            /* EXPERIMENT: never give up while the peer is pending. Only a
+             * short 3s pause, then actively chase: QUERY_PEER asks the
+             * supernode for the peer's CURRENT address (it answers both
+             * ways with PUNCH_REQUEST, so both sides re-punch together).
+             * If the address changed, try_send_register resets punch state
+             * and re-punches the new port immediately; if not, re-punch
+             * the same port below. */
+            if ( (now - scan->punch_reset_time) > 3 )
             {
-                scan->punch_retry_count++;
-                if ( scan->punch_retry_count >= 3 ) {
-                    traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
-                               PEER_ID(mac_tmp, scan),
-                               scan->punch_retry_count);
-                    prev = scan;
-                    scan = scan->next;
-                    continue;
-                }
                 scan->punch_failed = 0;
                 scan->punch_start_time = 0;
                 scan->lan_punch_done = 0;
                 scan->lan_punch_start = 0;
                 scan->register_retry_count = 0;
                 scan->psp_logged = 0;
-                traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/3)",
-                           PEER_ID(mac_tmp, scan),
-                           scan->punch_retry_count);
+                scan->punch_reset_time = 0;
+                send_query_peer(eee, scan->mac_addr);
+                traceEvent(TRACE_INFO, "Re-punching %s (drift chase)",
+                           PEER_ID(mac_tmp, scan));
                 start_punch(eee, scan);
             }
         }
@@ -2302,13 +2299,6 @@ void try_send_register_lan( n2n_edge_t * eee,
                         const n2n_sock_t * peer,
                         const n2n_sock_t * local_sock )
 {
-    /* LAN-SKIP-EXPERIMENT: skip the LAN-first attempt entirely and go
-     * straight to the WAN punch path (try_send_register -> start_punch)
-     * so the fresh-address window is used by WAN only. Revert by
-     * deleting this early-return block. */
-    try_send_register(eee, from_supernode, mac, peer);
-    return;
-
     struct peer_info * scan = find_peer_by_mac( eee->pending_peers, mac );
     n2n_sock_t found_ip;
     n2n_sock_t best_local_sock;
