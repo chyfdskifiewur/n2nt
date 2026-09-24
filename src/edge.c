@@ -1716,6 +1716,19 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
     struct peer_info * prev = NULL;
     MACSTR_TMP(mac_tmp);
     while ( scan ) {
+        /* EXPERIMENT: deferred two-way punch phase advance.
+         * seq 1 (own reg refreshed, waiting 1s) -> after 1s send QUERY_PEER for
+         * the peer's newest info and move to seq 2 (await response). seq 2 that
+         * never hears a response is dropped back to 0 after 3s so the next
+         * [PUNCH] push restarts the cycle instead of wedging. */
+        if ( scan->punch_seq == 1 && (now - scan->punch_defer_time) >= 1 ) {
+            send_query_peer(eee, scan->mac_addr);
+            scan->punch_seq = 2;
+            scan->punch_defer_time = now;
+        } else if ( scan->punch_seq == 2 && (now - scan->punch_defer_time) >= 3 ) {
+            scan->punch_seq = 0;
+        }
+
         /* LAN punch phase: retransmit REGISTER to LAN address */
         if ( scan->num_sockets == 2 && !scan->lan_punch_done &&
              scan->lan_punch_start != 0 )
@@ -5762,6 +5775,25 @@ process_n2n_packet:
             pending->register_retry_count = 0;
             pending->psp_logged = 0;
             pending->p2p_logged = 0;
+
+            /* EXPERIMENT: deferred two-way punch — before actually punching we
+             * (1) refresh our own registration at the SN so it holds our newest
+             * address, (2) wait 1s, (3) QUERY_PEER for the peer's newest info,
+             * then (4) punch on that response. punch_seq: 0=idle, 1=waiting the
+             * 1s grace, 2=query sent / awaiting response. */
+            if (pending->punch_seq == 0) {
+                send_register_super(eee, &(eee->supernode), 1, 0, NULL);
+                pending->punch_seq = 1;
+                pending->punch_defer_time = now;
+                PEERS_UNLOCK(eee);
+                return 1;
+            }
+            if (pending->punch_seq == 1) {
+                /* still inside the 1s grace — ignore this push */
+                PEERS_UNLOCK(eee);
+                return 1;
+            }
+            pending->punch_seq = 0; /* seq==2: this push is the query response — punch now */
 
             if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1 &&
                 eee->sn_ipv6_support) {

@@ -280,6 +280,8 @@ struct peer_info {
     time_t              punch_start_time;
     uint8_t             punch_failed;
     time_t              punch_reset_time;
+    uint8_t             punch_seq;         /* EXPERIMENT deferred-punch state: 0=idle, 1=own-reg refreshed/waiting 1s, 2=query sent/await response */
+    time_t              punch_defer_time;  /* EXPERIMENT timestamp of current punch_seq phase */
     time_t              lan_punch_start;   /* when LAN punch started, 0=not started */
     uint8_t             lan_punch_done;    /* 1=LAN succeeded or timed out, proceed to WAN */
     time_t              last_probe_sent;   /* time last keepalive PROBE was sent */
