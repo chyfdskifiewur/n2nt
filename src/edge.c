@@ -1705,10 +1705,6 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if (punched) {
         peer->punch_start_time = n2n_now();
         peer->last_punch_probe = peer->punch_start_time;
-        /* EXPERIMENT (violent talk): open a 60s window during which
-         * REGISTER_SUPER fires every 1s so the SN re-pushes our current
-         * NAT endpoint to all peers the moment it changes. */
-        eee->punch_burst_until = peer->punch_start_time + 60;
     }
 }
 
@@ -1752,15 +1748,14 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 &&
              !scan->punch_failed &&
-             (now > eee->punch_burst_until) &&
              (now - scan->punch_start_time) > PUNCH_TIMEOUT )
         {
             scan->punch_failed = 1;
             scan->punch_reset_time = now;
         } else if ( scan->punch_start_time != 0 &&
                     !scan->punch_failed &&
-                    (now - scan->last_punch_probe) >= 1 &&
-                    ((now - scan->punch_start_time) <= 5 || now < eee->punch_burst_until) )
+                    (now - scan->punch_start_time) <= 5 &&
+                    (now - scan->last_punch_probe) >= 1 )
         {
             /* Retransmit PROBE every 1s for first 5s */
             int sent_probe = 0;
@@ -2307,6 +2302,13 @@ void try_send_register_lan( n2n_edge_t * eee,
                         const n2n_sock_t * peer,
                         const n2n_sock_t * local_sock )
 {
+    /* LAN-SKIP-EXPERIMENT: skip the LAN-first attempt entirely and go
+     * straight to the WAN punch path (try_send_register -> start_punch)
+     * so the fresh-address window is used by WAN only. Revert by
+     * deleting this early-return block. */
+    try_send_register(eee, from_supernode, mac, peer);
+    return;
+
     struct peer_info * scan = find_peer_by_mac( eee->pending_peers, mac );
     n2n_sock_t found_ip;
     n2n_sock_t best_local_sock;
@@ -3302,12 +3304,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         }
     }
 
-    /* Phase 4: normal register cycle (30s).
-     * EXPERIMENT (violent talk): while a punch burst window is open,
-     * hammer REGISTER_SUPER every 1s instead. The SN re-pushes the
-     * fresh NAT endpoint to every peer on each address change, so the
-     * punched peer always aims at our current port. */
-    if ( nowTime > eee->last_register_req + (nowTime < eee->punch_burst_until ? 1 : 30) )
+    /* Phase 4: normal register cycle (30s). */
+    if ( nowTime > eee->last_register_req + 30 )
     {
         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
         send_register_super( eee, &(eee->supernode), 1, 0, NULL );
