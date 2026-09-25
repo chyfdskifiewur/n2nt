@@ -1,0 +1,705 @@
+/*
+ * (C) 2007-09 - Luca Deri <deri@ntop.org>
+ *               Richard Andrews <andrews@ntop.org>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, see <http://www.gnu.org/licenses/>
+ *
+ * Code contributions courtesy of:
+ * Massimo Torquati <torquati@ntop.org>
+ * Matt Gilg
+ *
+ */
+
+#include "n2n.h"
+#include "minilzo.h"
+#include <assert.h>
+#ifndef _WIN32
+#include <sys/syscall.h>
+#include <sys/time.h>
+#endif
+
+#define PURGE_REGISTRATION_FREQUENCY   60
+#define REGISTRATION_TIMEOUT           150
+
+
+const uint8_t broadcast_addr[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+const uint8_t multicast_addr[6] = { 0x01, 0x00, 0x5E, 0x00, 0x00, 0x00 }; /* First 3 bytes are meaningful */
+const uint8_t ipv6_multicast_addr[6] = { 0x33, 0x33, 0x00, 0x00, 0x00, 0x00 }; /* First 2 bytes are meaningful */
+
+/* ************************************** */
+
+SOCKET open_socket(uint16_t local_port, int bind_any) {
+    SOCKET sock_fd;
+    struct sockaddr_in local_address;
+
+    sock_fd = socket(PF_INET, SOCK_DGRAM, 0);
+#ifdef _WIN32
+    if (sock_fd == INVALID_SOCKET) {
+#else
+    if (sock_fd < 0) {
+#endif
+        traceEvent(TRACE_ERROR, "Unable to create socket [%s][%d]\n", strerror(errno), sock_fd);
+        return -1;
+    }
+
+#ifndef _WIN32
+    fcntl(sock_fd, F_SETFL, O_NONBLOCK);
+#else
+    {
+        u_long mode = 1;
+        ioctlsocket(sock_fd, FIONBIO, &mode);
+        /* Prevent WSAECONNRESET error spam on Windows when ICMP
+         * port unreachable messages arrive for this UDP socket. */
+        DWORD bytesReturned = 0;
+        BOOL newBehavior = FALSE;
+        WSAIoctl(sock_fd, SIO_UDP_CONNRESET, &newBehavior, sizeof(newBehavior),
+                 NULL, 0, &bytesReturned, NULL, NULL);
+    }
+#endif
+
+#ifdef _WIN32
+    /* Windows default UDP buffer is only 8KB, increase to 1MB for throughput */
+    {
+        int bufsize = 1024 * 1024;
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
+        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
+    }
+#endif
+
+    memset(&local_address, 0, sizeof(local_address));
+    local_address.sin_family = AF_INET;
+    local_address.sin_port = htons(local_port);
+    local_address.sin_addr.s_addr = htonl(bind_any?INADDR_ANY:INADDR_LOOPBACK);
+
+    if(bind(sock_fd, (struct sockaddr*) &local_address, sizeof(local_address)) == -1) {
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        if(err == WSAEADDRINUSE)
+            traceEvent(TRACE_DEBUG, "Bind error [%d]\n", err);
+        else
+            traceEvent(TRACE_ERROR, "Bind error [%d]\n", err);
+#else
+        if(errno == EADDRINUSE)
+            traceEvent(TRACE_DEBUG, "Bind error [%s]\n", strerror(errno));
+        else
+            traceEvent(TRACE_ERROR, "Bind error [%s]\n", strerror(errno));
+#endif
+        closesocket(sock_fd);
+        return -1;
+    }
+
+    /* Leave IP_TOS at the OS default (0 = Best Effort). The original n2n set
+     * 0x10 (DSCP CS1), which some carrier QoS policies classify as low-priority
+     * and rate-limit, capping tunnel throughput well below line rate (~53 Mbps
+     * vs ~82 Mbps for the same link). A null DSCP avoids that classification. */
+    { int tos = 0; setsockopt(sock_fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)); }
+    {
+        int buf_sz = 2 * 1024 * 1024;  /* 2MB */
+#ifdef _WIN32
+        /* Windows default UDP rcvbuf is only 8-64KB, causing burst packet loss
+         * when the main loop is briefly delayed (PEERS_LOCK, keepalive, etc.).
+         * Linux is already set to 2MB. Windows may silently reduce to a lower
+         * value if the requested size exceeds the system max, but 2MB is safe. */
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&buf_sz, sizeof(buf_sz));
+        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&buf_sz, sizeof(buf_sz));
+#else
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, &buf_sz, sizeof(buf_sz));
+#endif
+    }
+
+    return sock_fd;
+}
+
+SOCKET open_socket6(uint16_t local_port, int bind_any) {
+    SOCKET sock_fd;
+    struct sockaddr_in6 local_address;
+    int sockopt = 1;
+
+    sock_fd = socket(PF_INET6, SOCK_DGRAM, 0);
+#ifdef _WIN32
+    if (sock_fd == INVALID_SOCKET) {
+#else
+    if (sock_fd < 0) {
+#endif
+        traceEvent(TRACE_ERROR, "Unable to create socket [%s][%d]\n", strerror(errno), sock_fd);
+        return -1;
+    }
+
+#ifndef _WIN32
+    fcntl(sock_fd, F_SETFL, O_NONBLOCK);
+#else
+    {
+        u_long mode = 1;
+        ioctlsocket(sock_fd, FIONBIO, &mode);
+        /* Prevent WSAECONNRESET error spam on Windows when ICMP
+         * port unreachable messages arrive for this UDP socket. */
+        DWORD bytesReturned = 0;
+        BOOL newBehavior = FALSE;
+        WSAIoctl(sock_fd, SIO_UDP_CONNRESET, &newBehavior, sizeof(newBehavior),
+                 NULL, 0, &bytesReturned, NULL, NULL);
+    }
+#endif
+
+    setsockopt(sock_fd, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&sockopt, sizeof(sockopt));
+
+#ifdef _WIN32
+    /* Windows default UDP buffer is only 8KB, increase to match Linux (2MB) */
+    {
+        int bufsize = 2 * 1024 * 1024;
+        setsockopt(sock_fd, SOL_SOCKET, SO_RCVBUF, (const char*)&bufsize, sizeof(bufsize));
+        setsockopt(sock_fd, SOL_SOCKET, SO_SNDBUF, (const char*)&bufsize, sizeof(bufsize));
+    }
+#endif
+
+    memset(&local_address, 0, sizeof(local_address));
+    local_address.sin6_family = AF_INET6;
+    local_address.sin6_port = htons(local_port);
+    local_address.sin6_addr = bind_any ? in6addr_any : in6addr_loopback;
+
+    if(bind(sock_fd, (struct sockaddr*) &local_address, sizeof(local_address)) == -1) {
+        traceEvent(TRACE_ERROR, "Bind error [%s]\n", strerror(errno));
+        closesocket(sock_fd);
+        return -1;
+    }
+
+    return sock_fd;
+}
+
+#ifndef _WIN32
+SOCKET open_socket_unix(const char* path, mode_t access) {
+    SOCKET sock_fd;
+    struct sockaddr_un socket_address;
+    struct stat stat_buf;
+
+    if (stat(path, &stat_buf) == 0) {
+        traceEvent(TRACE_WARNING, "socket exists %s ... deleting\n", path);
+        unlink(path);
+    } else {
+        if (errno != ENOENT) {
+            traceEvent(TRACE_WARNING, "could not stat socket [%s]\n", strerror(errno));
+            return -1;
+        }
+    }
+
+    if((sock_fd = socket(PF_UNIX, SOCK_DGRAM, 0)) < 0) {
+        traceEvent(TRACE_ERROR, "Unable to create socket [%s][%d]\n", strerror(errno), sock_fd);
+        return -1;
+    }
+
+    fcntl(sock_fd, F_SETFL, O_NONBLOCK);
+
+    memset(&socket_address, 0, sizeof(socket_address));
+    socket_address.sun_family = AF_UNIX;
+    strncpy(socket_address.sun_path, path, sizeof(socket_address.sun_path) - 1);
+
+#if __linux__
+    fchmod(sock_fd, access);
+#endif
+
+    if(bind(sock_fd, (struct sockaddr*) &socket_address, sizeof(socket_address)) == -1) {
+        traceEvent(TRACE_ERROR, "Bind error [%s]\n", strerror(errno));
+        return -1;
+    }
+
+    chmod(path, access);
+
+    return sock_fd;
+}
+#endif // _WIN32
+
+int traceLevel = 2 /* NORMAL */;
+bool useSyslog = false, syslog_opened = false, useSystemd = false;
+
+/* Get wall-clock time via time(NULL) — fast vDSO call on Linux,
+ * equivalent fast call on Windows. No syscall overhead on either platform. */
+static time_t n2n_wall_time(void) {
+    return time(NULL);
+}
+
+/* Monotonic time source: if system clock is near epoch (broken RTC),
+ * return seconds elapsed since first call instead of wall-clock time.
+ * This ensures all timeout logic works correctly on systems without NTP. */
+time_t n2n_now(void) {
+    time_t now = n2n_wall_time();
+    if (now >= 946684800) return now; /* clock is fine (>= 2000-01-01) */
+
+    /* Clock not set: use POSIX clock_gettime for monotonic time if available,
+     * otherwise fall back to clock() which is always monotonic. */
+#if defined(_WIN32)
+    {
+        static ULONGLONG first_tick = 0;
+        ULONGLONG tick = GetTickCount64();
+        if (first_tick == 0) first_tick = tick;
+        return 1000 + (time_t)((tick - first_tick) / 1000ULL);
+    }
+#elif defined(CLOCK_MONOTONIC)
+    {
+        struct timespec ts;
+        static time_t first_mono = 0;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        if (first_mono == 0) first_mono = ts.tv_sec;
+        return 1000 + (ts.tv_sec - first_mono);
+    }
+#else
+    {
+        static clock_t first_clk = 0;
+        clock_t clk = clock();
+        if (first_clk == 0) first_clk = clk;
+        return 1000 + (time_t)((clk - first_clk) / CLOCKS_PER_SEC);
+    }
+#endif
+}
+
+#define N2N_TRACE_DATESIZE 32
+void _traceEvent(int eventTraceLevel, char* file, int line, char * format, ...) {
+    va_list va_ap;
+
+    if(eventTraceLevel <= traceLevel) {
+        char buf[2048];
+        char out_buf[640];
+        char theDate[N2N_TRACE_DATESIZE];
+        char *extra_msg = "";
+        time_t theTime = n2n_wall_time();
+        int i;
+
+        memset(buf, 0, sizeof(buf));
+
+        va_start (va_ap, format);
+        vsnprintf(buf, sizeof(buf)-1, format, va_ap);
+        va_end(va_ap);
+
+        if(eventTraceLevel == 0) extra_msg = "ERROR: ";
+        else if(eventTraceLevel == 1) extra_msg = "WARNING: ";
+
+        while(strlen(buf) > 0 && buf[strlen(buf)-1] == '\n') buf[strlen(buf)-1] = '\0';
+
+#ifndef _WIN32
+        if(useSyslog) {
+            if(!syslog_opened) {
+                openlog("n2n", LOG_PID, LOG_DAEMON);
+                syslog_opened = 1;
+            }
+            snprintf(out_buf, sizeof(out_buf), "%s%s", extra_msg, buf);
+            syslog(LOG_INFO, "%s", out_buf);
+        } else {
+            if (useSystemd)
+                snprintf(out_buf, sizeof(out_buf), "%s%s", extra_msg, buf);
+            else {
+                struct tm *tm_info = localtime(&theTime);
+                if (tm_info)
+                    strftime(theDate, N2N_TRACE_DATESIZE, "%d/%b/%Y %H:%M:%S", tm_info);
+                else
+                    strncpy(theDate, "01/Jan/1970 00:00:00", N2N_TRACE_DATESIZE);
+                for(i=(int)strlen(file)-1; i>0; i--) if(file[i] == '/') { i++; break; };
+                snprintf(out_buf, sizeof(out_buf), "%s [%8s:%4d] %s%s", theDate, &file[i], line, extra_msg, buf);
+            }
+            printf("%s\n", out_buf);
+            fflush(stdout);
+        }
+#else
+        if (event_log == INVALID_HANDLE_VALUE) {
+            /* running in the console */
+            strftime(theDate, N2N_TRACE_DATESIZE, "%d/%b/%Y %H:%M:%S", localtime(&theTime));
+            for(i=(int)strlen(file)-1; i>0; i--) if(file[i] == '\\') { i++; break; };
+            snprintf(out_buf, sizeof(out_buf), "%s [%8s:%4d] %s%s", theDate, &file[i], line, extra_msg, buf);
+            printf("%s\n", out_buf);
+            fflush(stdout);
+        } else {
+            /* running as a service */
+            wchar_t out[640];
+            swprintf(out, sizeof(out), L"%hs%hs", extra_msg, buf);
+
+            wchar_t* msg[] = {
+                scm_name,
+                out
+            };
+
+            short level = EVENTLOG_ERROR_TYPE;
+            if(eventTraceLevel == 1)
+                level = EVENTLOG_WARNING_TYPE;
+            else if(eventTraceLevel == 2)
+                level = EVENTLOG_INFORMATION_TYPE;
+
+            ReportEventW(event_log, level, 0, 0x40020000L, NULL, 2, 0, msg, NULL);
+        }
+#endif
+    }
+
+}
+
+/* *********************************************** */
+
+char * macaddr_str( macstr_t buf,
+                    const n2n_mac_t mac )
+{
+    snprintf(buf, N2N_MACSTR_SIZE, "%02X:%02X:%02X:%02X:%02X:%02X",
+        mac[0] & 0xFF, mac[1] & 0xFF, mac[2] & 0xFF,
+        mac[3] & 0xFF, mac[4] & 0xFF, mac[5] & 0xFF);
+    return(buf);
+}
+
+/* *********************************************** */
+
+uint8_t is_multi_broadcast(const uint8_t * dest_mac) {
+
+       int is_broadcast = ( memcmp(broadcast_addr, dest_mac, 6) == 0 );
+       int is_multicast = ( memcmp(multicast_addr, dest_mac, 3) == 0 );
+       int is_ipv6_multicast = ( memcmp(ipv6_multicast_addr, dest_mac, 2) == 0 );
+
+       return is_broadcast || is_multicast || is_ipv6_multicast;
+
+}
+
+/* http://www.faqs.org/rfcs/rfc908.html */
+
+
+/* *********************************************** */
+
+char* msg_type2str(uint16_t msg_type) {
+    switch(msg_type) {
+        case MSG_TYPE_REGISTER: return "MSG_TYPE_REGISTER";
+        case MSG_TYPE_DEREGISTER: return "MSG_TYPE_DEREGISTER";
+        case MSG_TYPE_PACKET: return "MSG_TYPE_PACKET";
+        case MSG_TYPE_REGISTER_ACK: return "MSG_TYPE_REGISTER_ACK";
+        case MSG_TYPE_REGISTER_SUPER: return "MSG_TYPE_REGISTER_SUPER";
+        case MSG_TYPE_REGISTER_SUPER_ACK: return "MSG_TYPE_REGISTER_SUPER_ACK";
+        case MSG_TYPE_REGISTER_SUPER_NAK: return "MSG_TYPE_REGISTER_SUPER_NAK";
+        case MSG_TYPE_FEDERATION: return "MSG_TYPE_FEDERATION";
+        default: return "???";
+    }
+}
+
+/* *********************************************** */
+
+void hexdump(const uint8_t * buf, size_t len)
+{
+    size_t i;
+
+    if ( 0 == len ) { return; }
+
+    for(i=0; i<len; i++)
+    {
+        if((i > 0) && ((i % 16) == 0)) { printf("\n"); }
+        printf("%02X ", buf[i] & 0xFF);
+    }
+
+    printf("\n");
+}
+
+/* *********************************************** */
+
+/** Find the peer entry in list with mac_addr equal to mac.
+ *
+ *  Does not modify the list.
+ *
+ *  @return NULL if not found; otherwise pointer to peer entry.
+ */
+struct peer_info * find_peer_by_mac( struct peer_info * list, const n2n_mac_t mac )
+{
+  while(list != NULL)
+    {
+      if( 0 == memcmp(mac, list->mac_addr, 6) )
+        {
+	  return list;
+        }
+      list = list->next;
+    }
+
+  return NULL;
+}
+
+
+struct peer_info * find_peer_by_sock( struct peer_info * list, const struct sockaddr * sa )
+{
+    while (list != NULL)
+    {
+        if (sa->sa_family == AF_INET && list->sock.family == AF_INET)
+        {
+            const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
+            if (list->sock.port == ntohs(sin->sin_port) &&
+                memcmp(list->sock.addr.v4, &sin->sin_addr, 4) == 0)
+                return list;
+        }
+        if (sa->sa_family == AF_INET6 && list->sock6.family == AF_INET6)
+        {
+            const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
+            if (list->sock6.port == ntohs(sin6->sin6_port) &&
+                memcmp(list->sock6.addr.v6, &sin6->sin6_addr, 16) == 0)
+                return list;
+        }
+        list = list->next;
+    }
+    return NULL;
+}
+
+
+/** Return the number of elements in the list.
+ *
+ */
+size_t peer_list_size( const struct peer_info * list )
+{
+    size_t retval=0;
+
+    while ( list ) {
+      ++retval;
+      list = list->next;
+    }
+
+  return retval;
+}
+
+/** Add new to the head of list. If list is NULL; create it.
+ *
+ *  The item new is added to the head of the list. New is modified during
+ *  insertion. list takes ownership of new.
+ */
+void peer_list_add(struct peer_info * * list,
+                   struct peer_info * element )
+{
+    element->next = *list;
+    element->last_seen = n2n_now();
+    *list = element;
+}
+
+
+size_t purge_expired_registrations( struct peer_info ** peer_list ) {
+    time_t now = n2n_now();
+
+    return purge_peer_list( peer_list, now-REGISTRATION_TIMEOUT );
+}
+
+/** Purge old items from the peer_list and return the number of items that were removed. */
+size_t purge_peer_list( struct peer_info ** peer_list,
+                        time_t purge_before )
+{
+    struct peer_info *scan;
+    struct peer_info *prev;
+    size_t retval=0;
+
+    scan = *peer_list;
+    prev = NULL;
+    while(scan != NULL) {
+        if(scan->last_seen < purge_before) {
+            struct peer_info *next = scan->next;
+
+            if(prev == NULL) {
+                *peer_list = next;
+            } else {
+                prev->next = next;
+            }
+
+            ++retval;
+            free(scan);
+            scan = next;
+        } else {
+            prev = scan;
+            scan = scan->next;
+        }
+    }
+
+  return retval;
+}
+
+/** Purge all items from the peer_list and return the number of items that were removed. */
+size_t clear_peer_list( struct peer_info ** peer_list )
+{
+    struct peer_info *scan;
+    struct peer_info *prev;
+    size_t retval=0;
+
+    scan = *peer_list;
+    prev = NULL;
+    while(scan != NULL) {
+        struct peer_info *next = scan->next;
+
+        if(prev == NULL) {
+            *peer_list = next;
+        } else {
+            prev->next = next;
+        }
+
+        ++retval;
+        free(scan);
+        scan = next;
+    }
+
+    return retval;
+}
+
+char * sock_to_cstr( n2n_sock_str_t out, const n2n_sock_t * sock )
+{
+    ipstr_t buffer;
+
+    if ( NULL == out ) { return NULL; }
+    memset(out, 0, N2N_SOCKBUF_SIZE);
+
+    if ( AF_INET6 == sock->family )
+    {
+        inet_ntop(AF_INET6, &sock->addr, buffer, sizeof(buffer));
+        snprintf( out, N2N_SOCKBUF_SIZE, "[%s]:%hu", buffer, sock->port );
+        return out;
+    }
+    else if ( AF_INET == sock->family )
+    {
+        inet_ntop(AF_INET, &sock->addr, buffer, sizeof(buffer));
+        snprintf( out, N2N_SOCKBUF_SIZE, "%s:%hu", buffer, sock->port );
+        return out;
+    }
+    else
+    {
+        snprintf( out, N2N_SOCKBUF_SIZE, "unknown_af(%d):%hu", sock->family, sock->port );
+        return out;
+    }
+}
+
+uint32_t ip4_prefixlen_to_netmask(uint8_t prefixlen) {
+    return prefixlen ? htonl(~((1 << (32 - prefixlen)) - 1)) : 0;
+}
+
+/* @return zero if the two sockets are equivalent. */
+int sock_equal( const n2n_sock_t * a,
+                const n2n_sock_t * b )
+{
+    if ( a->port != b->port ) { return 1; }
+    if ( a->family != b->family ) { return 1; }
+    switch (a->family) /* they are the same */
+    {
+    case AF_INET:
+        if ( 0 != memcmp( a->addr.v4, b->addr.v4, IPV4_SIZE ) ) { return 1;};
+        break;
+    default:
+        if ( 0 != memcmp( a->addr.v6, b->addr.v6, IPV6_SIZE ) ) { return 1;};
+        break;
+    }
+
+    return 0;
+}
+
+/* *********************************************** */
+
+/** Query management port and display results interactively.
+ *
+ * Sends "status" to the management UDP port on localhost,
+ * prints all response packets (management sends multiple datagrams),
+ * then enters a loop where the user can press Enter to refresh
+ * or Ctrl+C to quit.
+ */
+int query_mgmt(uint16_t mgmt_port) {
+    SOCKET s;
+    struct sockaddr_in addr;
+    char buf[4096];
+    const char *cmd = "status\n";
+    fd_set fds;
+    struct timeval tv;
+    int ret;
+    int got_data = 0;
+
+    s = socket(PF_INET, SOCK_DGRAM, 0);
+#ifdef _WIN32
+    if (s == INVALID_SOCKET) {
+#else
+    if (s < 0) {
+#endif
+        printf("Failed to create socket\n");
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(mgmt_port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    /* Send query */
+    sendto(s, cmd, (int)strlen(cmd), 0, (struct sockaddr*)&addr, sizeof(addr));
+
+    /* Receive all response packets (management sends multiple datagrams) */
+    for (;;) {
+        FD_ZERO(&fds);
+        FD_SET(s, &fds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 200000;  /* 200ms per packet, allow for multiple datagrams */
+        ret = select((int)(s+1), &fds, NULL, NULL, &tv);
+        if (ret <= 0) break;  /* timeout or error: no more data */
+        ret = (int)recvfrom(s, buf, sizeof(buf)-1, 0, NULL, NULL);
+        if (ret <= 0) break;
+        buf[ret] = '\0';
+        printf("%s", buf);
+        got_data = 1;
+    }
+
+    if (!got_data) {
+        printf("\nNo response from management port %u\n", (unsigned)mgmt_port);
+        closesocket(s);
+        return -1;
+    }
+
+    /* Interactive refresh loop: empty line = status, else send command then status */
+    printf("\n--- Press Enter to refresh, or type a command, Ctrl+C to quit ---\n");
+    while (1) {
+        char line[128];
+        int i = 0, ch;
+
+        /* Read a line of input */
+        while (1) {
+            ch = getchar();
+            if (ch == EOF) goto done;
+            if (ch == '\n') break;
+            if (i < (int)sizeof(line) - 2) line[i++] = (char)ch;
+        }
+        line[i] = '\0';
+
+        /* Empty line → status; otherwise send user command only */
+        if (i == 0) {
+            sendto(s, cmd, (int)strlen(cmd), 0, (struct sockaddr*)&addr, sizeof(addr));
+        } else {
+            if (line[i-1] != '\n') { line[i] = '\n'; i++; line[i] = '\0'; }
+            sendto(s, line, i, 0, (struct sockaddr*)&addr, sizeof(addr));
+        }
+#ifdef _WIN32
+        {
+            HANDLE hCon = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (hCon != INVALID_HANDLE_VALUE) {
+                CONSOLE_SCREEN_BUFFER_INFO csbi;
+                COORD top = {0, 0};
+                DWORD written;
+                GetConsoleScreenBufferInfo(hCon, &csbi);
+                FillConsoleOutputCharacter(hCon, ' ', csbi.dwSize.X * csbi.dwSize.Y, top, &written);
+                FillConsoleOutputAttribute(hCon, csbi.wAttributes, csbi.dwSize.X * csbi.dwSize.Y, top, &written);
+                SetConsoleCursorPosition(hCon, top);
+            }
+        }
+#else
+        printf("\033[2J\033[H");
+#endif
+
+        for (;;) {
+            FD_ZERO(&fds);
+            FD_SET(s, &fds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 50000;
+            ret = select((int)(s+1), &fds, NULL, NULL, &tv);
+            if (ret <= 0) break;
+            ret = (int)recvfrom(s, buf, sizeof(buf)-1, 0, NULL, NULL);
+            if (ret <= 0) break;
+            buf[ret] = '\0';
+            printf("%s", buf);
+        }
+
+        printf("\n--- Press Enter to refresh, or type a command, Ctrl+C to quit ---\n");
+    }
+
+done:
+    closesocket(s);
+    return 0;
+}
