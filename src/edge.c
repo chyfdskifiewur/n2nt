@@ -371,6 +371,7 @@ static int edge_init(n2n_edge_t * eee)
     eee->keep_running   = 1;
     eee->last_register_req = 0;
     eee->register_lifetime = 120;
+    eee->want_first_peer_list = 1;
     eee->last_p2p = 0;
     eee->last_sup = 0;
     eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
@@ -1543,6 +1544,22 @@ static void send_register_super( n2n_edge_t * eee,
     if ( cookie_mode == 0 && eee->enable_gaming_mode && !eee->gaming_started) {
         reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
         eee->gaming_started = 1;
+    }
+
+    /* First successful registration of this process asks the SN to push every
+     * peer. Without it a restarted edge relies entirely on the SN classifying
+     * it as a brand-new edge — but the SN still holds our old entry until it
+     * expires, so a quick restart is seen as a known edge and NO peer list is
+     * pushed. The edge then never learns anyone exists: no PEER_INFO, no
+     * pending peer, no hole-punch, and it silently sits on the relay. Asking
+     * unconditionally on the first registration makes startup independent of
+     * how fast the previous process was replaced.
+     * One-shot via want_first_peer_list, NOT sn_ack_count: a cookie refresh
+     * or a NAT rebind also zeroes sn_ack_count, and those must not re-request
+     * the whole list. */
+    if ( cookie_mode == 0 && eee->want_first_peer_list ) {
+        reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
+        eee->want_first_peer_list = 0;
     }
 
     /* When this packet goes to the fixed query channel (sn2) and that

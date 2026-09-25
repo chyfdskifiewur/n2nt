@@ -694,6 +694,13 @@ struct n2n_edge
     int                 enable_gaming_mode;
     int                 gaming_started;
 
+    /* One-shot: the very first registration of this process asks the SN to
+     * push the full peer list. Cleared once that request has been sent, so
+     * later re-registrations (cookie refresh, NAT rebind, retries) stay
+     * quiet. Without it a restarted edge whose previous SN entry has not
+     * expired yet is treated as a known edge and receives no peer list. */
+    int                 want_first_peer_list;
+
     /* Statistics */
     size_t              tx_p2p;
     size_t              rx_p2p;
