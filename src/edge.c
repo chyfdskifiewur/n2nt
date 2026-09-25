@@ -1771,6 +1771,13 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
     struct peer_info * scan = eee->pending_peers;
     struct peer_info * prev = NULL;
     MACSTR_TMP(mac_tmp);
+
+    /* The UDP socket is global, so at most ONE rebind per pass. Several peers
+     * can come due for a retry in the same pass; rebinding per peer would
+     * roll the local port once per peer and every roll but the last would
+     * invalidate the registration that the previous roll had just created. */
+    int rebound_this_pass = 0;
+
     while ( scan ) {
         /* LAN punch phase: retransmit REGISTER to LAN address */
         if ( scan->num_sockets == 2 && !scan->lan_punch_done &&
@@ -1913,8 +1920,17 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                  * the equivalent of a process restart for the NAT mapping:
                  * every round is a genuinely new coin flip instead of
                  * re-poking the same unchanged mapping. Data keeps flowing
-                 * over the relay the whole time. */
-                rebind_udp_local( eee );
+                 * over the relay the whole time.
+                 * The rebind is shared across the whole pass: see
+                 * rebound_this_pass above. Peers retrying in the same pass
+                 * reuse this round's fresh mapping instead of rolling a
+                 * second one, which would void this registration. */
+                if ( !rebound_this_pass ) {
+                    rebind_udp_local( eee );
+                    rebound_this_pass = 1;
+                } else {
+                    send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+                }
                 eee->last_register_req = 0;
                 send_query_peer(eee, scan->mac_addr);
                 scan->punch_failed        = 0;
