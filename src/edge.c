@@ -2814,6 +2814,16 @@ static int nat_addr_private( const uint8_t * a ) /* network-order IPv4 */
            ( a[0] == 192 && a[1] == 168 );
 }
 
+static int sock_same_ip ( const n2n_sock_t *a, const n2n_sock_t *b )
+{
+    /* addr-only equality (ports ignored): HA pairs share one public IP */
+    if ( a->family != b->family || a->family == 0 )
+        return 0;
+    if ( a->family == AF_INET )
+        return memcmp( a->addr.v4, b->addr.v4, IPV4_SIZE ) == 0;
+    return memcmp( a->addr.v6, b->addr.v6, IPV6_SIZE ) == 0;
+}
+
 static void nat_classify( n2n_edge_t * eee )
 {
     const char *old, *new;
@@ -3237,7 +3247,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         if ( !eee->nat_probe_pending &&
              nowTime > eee->fc_arm_time + NAT_STRANGER_SECS )
         {
-            int want_dual = ( eee->sn_num >= 2 && eee->sn_query.family != 0 );
+            int want_dual = ( eee->sn_num >= 2 && eee->sn_query.family != 0 &&
+                              !sock_same_ip( &eee->sn_query, &eee->supernode ) );
             int nat1_settled = ( eee->fc_seen || !eee->fc_window );
 
             /* NAT1 first, dual-IP last: while the full-cone stranger test is
