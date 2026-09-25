@@ -5508,6 +5508,22 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
+            /* Address-refresh nudge: the SN names our OWN MAC with the
+             * NUDGE_REGISTER flag as a hint that a peer is about to punch us
+             * and wants a fresh mapping. Force an immediate re-REGISTER so the
+             * SN serves that peer a fresh address, then ignore the PEER_INFO —
+             * it carries no peer socket (it targets us, not a peer). */
+            if ( (pi.aflags & N2N_AFLAGS_NUDGE_REGISTER) &&
+                 memcmp(pi.mac, eee->device.mac_addr, N2N_MAC_SIZE) == 0 )
+            {
+                if ( eee->last_register_req != 0 )
+                {
+                    eee->last_register_req = 0; /* skip the 30s interval, re-register now */
+                    traceEvent( TRACE_DEBUG, "nudge: re-registering to refresh mapping" );
+                }
+                return 1;
+            }
+
             /* Relay: SN advertises the community relay peer. When the advertised
              * MAC is our own, the SN is designating THIS edge as the relay:
              * switch on forwarding. Otherwise the relay is another peer and we

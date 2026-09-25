@@ -463,6 +463,8 @@ size_t decode_PACKET( n2n_PACKET_t * pkt,
 #define N2N_AFLAGS_IPV6_SOCKET     0x0002  /* sock6 field is valid */
 #define N2N_AFLAGS_PUNCH_REQUEST   0x0004  /* QUERY_PEER triggered, edge should start punching */
 #define N2N_AFLAGS_SAME_LAN_AS_SN  0x0008  /* peer is in same LAN as supernode, replace IP with SN's public IP */
+#define N2N_AFLAGS_NUDGE_REGISTER  0x0020  /* named edge (pi.mac == its own MAC) should re-REGISTER
+                                              so the SN can hand out a fresh address before punching */
 #define N2N_AFLAGS_RELAY           0x0010  /* this peer is the community's relay peer (mini-SN):
                                               members must register to it and use it when direct fails */
 typedef struct n2n_PEER_INFO {
