@@ -674,6 +674,32 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
     return 0;
 }
 
+/* Rebind the UDP socket(s) onto a fresh ephemeral local port. The OS then
+ * assigns a new source port, so the NAT mappings toward the supernode (and
+ * every peer we re-probe) are re-rolled — this is what gives a re-punch a
+ * genuinely new coin flip. Re-registering on the SAME socket keeps the old
+ * mapping and is useless for symmetric-ish NAT. Note: rebinding tears down
+ * every established direct P2P path at once; data falls back to the relay
+ * during the transition, which is what a re-punch round does anyway. */
+static int rebind_udp_local( n2n_edge_t * eee )
+{
+    int has_udp6 = (eee->udp_sock6 != -1);
+    closesocket( eee->udp_sock );
+    eee->udp_sock = -1;
+    if ( has_udp6 ) {
+        closesocket( eee->udp_sock6 );
+        eee->udp_sock6 = -1;
+    }
+    if ( setup_sockets( eee, (int)eee->local_port ) < 0 ) {
+        traceEvent(TRACE_WARNING, "Punch retry: rebinding the local UDP port failed");
+        return -1;
+    }
+    /* Register at once so the SN (and through it the peer we are punching)
+     * learns our newest NAT mapping instead of the one we just abandoned. */
+    send_register_super( eee, &(eee->supernode), 1, 0, NULL );
+    return 0;
+}
+
 /* ************************************** */
 
 /* Setup management socket */
@@ -1840,12 +1866,14 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     scan = scan->next;
                     continue;
                 }
-                /* Re-punch round: force our own re-registration and re-query
-                 * the supernode so both sides roll fresh NAT ports at the same
-                 * moment. The supernode nudges the peer to re-register too and
-                 * then answers our query with the peer's newest address, which
-                 * keeps the two sides punching simultaneously. Data keeps
-                 * flowing over the relay the whole time. */
+                /* Re-punch round: bind a fresh local UDP port (new source
+                 * port -> re-rolled NAT mapping) and then re-query the
+                 * supernode so it re-advertises/re-nudges the peer. This is
+                 * the equivalent of a process restart for the NAT mapping:
+                 * every round is a genuinely new coin flip instead of
+                 * re-poking the same unchanged mapping. Data keeps flowing
+                 * over the relay the whole time. */
+                rebind_udp_local( eee );
                 eee->last_register_req = 0;
                 send_query_peer(eee, scan->mac_addr);
                 scan->punch_failed        = 0;
