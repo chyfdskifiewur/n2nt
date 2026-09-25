@@ -869,7 +869,6 @@ struct pending_query {
     socklen_t            req_sa_len;
     time_t               requested_at; /* when QUERY_PEER arrived (0 = free slot) */
 };
-struct pending_query *pending_queries; /* dynamic array, sized N2N_SN_PENDING_QUERY_MAX */
 
 struct n2n_sn
 {
@@ -898,6 +897,7 @@ struct n2n_sn
     ws_conn_t           ws_conns[N2N_SN_MAX_WS]; /* WS connection table (edge connected via WS). */
     struct peer_info *  edges;          /* Link list of registered edges. */
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
+    struct pending_query *pending_queries; /* deferred QUERY_PEER answers (address-refresh nudges) */
     int                 ipv4_available; /* 0=unavailable, 1=available */
     int                 ipv6_available; /* 0=unavailable, 1=available */
     int                 relay_advert_enabled; /* 1=advertise the community relay peer (default), 0=off */
