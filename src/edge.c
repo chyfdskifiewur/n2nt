@@ -674,6 +674,13 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
     return 0;
 }
 
+/* Forward declaration: defined later in this file (used by rebind_udp_local). */
+static void send_register_super( n2n_edge_t * eee,
+                                 const n2n_sock_t * sock_caller,
+                                 int tap_wait_ack,
+                                 int do_simple_handshake,
+                                 const n2n_sock_t * sock_sn_alt );
+
 /* Rebind the UDP socket(s) onto a fresh ephemeral local port. The OS then
  * assigns a new source port, so the NAT mappings toward the supernode (and
  * every peer we re-probe) are re-rolled — this is what gives a re-punch a
