@@ -3706,31 +3706,45 @@ static int process_udp( n2n_sn_t * sss,
         struct peer_info *target = find_peer_by_mac( sss->edges, query.targetMac );
         if ( target )
         {
-            /* Record the deferred answer and nudge the target to re-REGISTER,
-             * so the eventual reply carries a fresh mapping rather than a
-             * possibly-stale cached one. The answer is served from sn_answer_query
-             * when the target's fresh REGISTER arrives (sn_flush_pending_for) or,
-             * if it never does, by the timeout sweep in run_loop — so punching
-             * always proceeds, fresh when possible and with the cached address
-             * otherwise. */
-            int slot = -1, oldest = 0;
-            for ( int i = 0; i < N2N_SN_PENDING_QUERY_MAX; i++ )
+            /* Freshness short-circuit: if the target registered within the
+             * timeout window its cached address is already current, so go
+             * straight to the punch — no nudge, no delay. Saving that RTT on
+             * the stable (EIM) peers is what keeps hole-punch from missing
+             * its opening window. Only a target that has gone silent warrants
+             * the deferred nudge path below. */
+            if ( now - target->last_seen <= N2N_SN_PENDING_QUERY_TIMEOUT )
             {
-                if ( sss->pending_queries[i].requested_at == 0 ) { slot = i; break; }
-                if ( sss->pending_queries[oldest].requested_at >
-                     sss->pending_queries[i].requested_at ) oldest = i;
+                sn_answer_query( sss, &cmn.community, query.srcMac, query.targetMac,
+                                 sender_sock, sender_sock_len );
             }
-            if ( slot < 0 ) slot = oldest; /* full table: evict the oldest */
+            else
+            {
+                /* Record the deferred answer and nudge the target to re-REGISTER,
+                 * so the eventual reply carries a fresh mapping rather than a
+                 * possibly-stale cached one. The answer is served from sn_answer_query
+                 * when the target's fresh REGISTER arrives (sn_flush_pending_for) or,
+                 * if it never does, by the timeout sweep in run_loop — so punching
+                 * always proceeds, fresh when possible and with the cached address
+                 * otherwise. */
+                int slot = -1, oldest = 0;
+                for ( int i = 0; i < N2N_SN_PENDING_QUERY_MAX; i++ )
+                {
+                    if ( sss->pending_queries[i].requested_at == 0 ) { slot = i; break; }
+                    if ( sss->pending_queries[oldest].requested_at >
+                         sss->pending_queries[i].requested_at ) oldest = i;
+                }
+                if ( slot < 0 ) slot = oldest; /* full table: evict the oldest */
 
-            struct pending_query *q = &sss->pending_queries[slot];
-            memset( q, 0, sizeof(*q) );
-            memcpy( q->requester, query.srcMac, N2N_MAC_SIZE );
-            memcpy( q->target, query.targetMac, N2N_MAC_SIZE );
-            memcpy( q->community, cmn.community, sizeof(n2n_community_t) );
-            memcpy( &q->req_sa, sender_sock, q->req_sa_len = sender_sock_len );
-            q->requested_at = now;
+                struct pending_query *q = &sss->pending_queries[slot];
+                memset( q, 0, sizeof(*q) );
+                memcpy( q->requester, query.srcMac, N2N_MAC_SIZE );
+                memcpy( q->target, query.targetMac, N2N_MAC_SIZE );
+                memcpy( q->community, cmn.community, sizeof(n2n_community_t) );
+                memcpy( &q->req_sa, sender_sock, q->req_sa_len = sender_sock_len );
+                q->requested_at = now;
 
-            sn_send_nudge( sss, &cmn.community, query.targetMac );
+                sn_send_nudge( sss, &cmn.community, query.targetMac );
+            }
         }
     }
     else if ( msg_type == MSG_TYPE_REGISTER_SUPER )
