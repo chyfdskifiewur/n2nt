@@ -631,9 +631,9 @@ struct n2n_edge
                                            is reused per IP (not symmetric) */
     time_t              nat_probe_time; /* last one-shot symmetric check attempt */
     uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
-    uint8_t             nat_dual_ip;    /* EXPERIMENT 1: symmetric check's second observation
-                                           comes from the brother sn (different IP), deciding
-                                           cone-vs-symmetric across IPs instead of by twin ports */
+    uint8_t             nat_probe_cross;   /* 1: the pending one-shot check is the cross-IP
+                                             probe (to sn2, a distinct public IP) rather than
+                                             the same-IP twin probe to the current supernode */
     uint8_t             nat_bounce_seen;   /* a helper-port delivery got through: not port-restricted */
     uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
     uint8_t             fc_window;      /* 1 until the first packet is sent to sn2 */
