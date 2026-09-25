@@ -391,6 +391,7 @@ static int edge_init(n2n_edge_t * eee)
     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
     eee->nat_probe_time = n2n_now(); /* anchor to start-of-run, not t=0: a slow startup (DNS, retries) must not start the one-shot symmetric check before the mapping is live */
     eee->nat_probe_pending = 0;
+    eee->nat_dual_ip = 0;
     eee->nat_bounce_seen = 0;
     eee->fc_seen = 0;
     eee->fc_window = 1;
@@ -1716,19 +1717,6 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
     struct peer_info * prev = NULL;
     MACSTR_TMP(mac_tmp);
     while ( scan ) {
-        /* EXPERIMENT: deferred two-way punch phase advance.
-         * seq 1 (own reg refreshed, waiting 1s) -> after 1s send QUERY_PEER for
-         * the peer's newest info and move to seq 2 (await response). seq 2 that
-         * never hears a response is dropped back to 0 after 3s so the next
-         * [PUNCH] push restarts the cycle instead of wedging. */
-        if ( scan->punch_seq == 1 && (now - scan->punch_defer_time) >= 1 ) {
-            send_query_peer(eee, scan->mac_addr);
-            scan->punch_seq = 2;
-            scan->punch_defer_time = now;
-        } else if ( scan->punch_seq == 2 && (now - scan->punch_defer_time) >= 3 ) {
-            scan->punch_seq = 0;
-        }
-
         /* LAN punch phase: retransmit REGISTER to LAN address */
         if ( scan->num_sockets == 2 && !scan->lan_punch_done &&
              scan->lan_punch_start != 0 )
@@ -2788,6 +2776,7 @@ static int nat_refresh_rebuild( n2n_edge_t * eee )
     memset(&eee->my_public_sock, 0, sizeof(n2n_sock_t));
     eee->nat_probe_time = n2n_now();
     eee->nat_probe_pending = 0;
+    eee->nat_dual_ip = 0;
     eee->nat_bounce_seen = 0;
     eee->fc_seen = 0;
     eee->fc_window = 1;
@@ -2855,7 +2844,27 @@ static void nat_classify( n2n_edge_t * eee )
                    eee->nat_seen_sn2_alt.family == AF_INET &&
                    eee->nat_seen_sn2.port == eee->nat_seen_sn2_alt.port );
 
-    if ( pub1 && pub2 && !reuse2 &&
+    /* EXPERIMENT (dual-IP): second observation from brother sn2 (different
+     * IP). Echoes differ -> symmetric; agree -> cone (NAT1/2/3 below).
+     * Runs only after the full-cone question is settled, so the NAT1
+     * verdict is safe. */
+    if ( eee->nat_dual_ip && eee->nat_seen_sn2.family == AF_INET )
+    {
+        if ( pub1 && pub2 &&
+             ( memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4,
+                       IPV4_SIZE ) != 0 ||
+               eee->nat_seen_sn1.port != eee->nat_seen_sn2.port ) )
+            new_type = N2N_NAT_SYMMETRIC;
+        else if ( !pub1 || !pub2 )
+            new_type = N2N_NAT_UNKNOWN; /* an in-LAN observation proves nothing */
+        else if ( eee->fc_seen )
+            new_type = N2N_NAT_FULL_CONE;
+        else if ( eee->nat_bounce_seen )
+            new_type = N2N_NAT_RESTRICTED;
+        else
+            new_type = N2N_NAT_PORT_RESTRICT;
+    }
+    else if ( pub1 && pub2 && !reuse2 &&
          ( ( eee->nat_seen_sn2_alt.family == AF_INET &&
              eee->nat_seen_sn2.port != eee->nat_seen_sn2_alt.port ) ||
            memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
@@ -3228,23 +3237,51 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         if ( !eee->nat_probe_pending &&
              nowTime > eee->fc_arm_time + NAT_STRANGER_SECS )
         {
-            ++eee->nat_sym_tries;
-            eee->nat_probe_time = nowTime;
-            eee->nat_probe_pending = 1;
-            random_bytes( NULL, eee->sn_probe_cookie, N2N_COOKIE_SIZE );
-            eee->sn_probe_cookie_valid = 1;
-            send_register_super( eee, &(eee->supernode), 0, 2, NULL );
-            /* Twin probe to the supernode's alt port (lport+1): the same IP
-             * at a second destination port, sharing the one cookie. Equal
-             * public ports then prove the mapping is reused per IP
-             * (NAT3-style), the evidence that keeps a per-IP NAT from being
-             * mislabelled NAT4. */
-            if ( eee->supernode.family == AF_INET &&
-                 eee->supernode.port != 0xFFFF )
+            int want_dual = ( eee->sn_num >= 2 && eee->sn_query.family != 0 );
+            int nat1_settled = ( eee->fc_seen || !eee->fc_window );
+
+            /* NAT1 first, dual-IP last: while the full-cone stranger test is
+             * undecided and a brother sn exists, hold the whole one-shot
+             * (twin too) — an early twin freeze would lock out the dual-IP
+             * vote forever. Hard cap: a NAT that never sustains the N2NF is
+             * not full cone, so past it the cross-IP probe (which closes the
+             * window itself) proceeds anyway. */
+            if ( want_dual && !nat1_settled &&
+                 nowTime <= eee->fc_arm_time + NAT_STRANGER_SECS + NAT_SYM_RETRY_SECS )
             {
-                n2n_sock_t snq_alt = eee->supernode;
-                snq_alt.port = (uint16_t)( eee->supernode.port + 1 );
-                send_register_super( eee, &snq_alt, 0, 2, NULL );
+                /* hold: re-evaluate on the next loop tick */
+            }
+            else
+            {
+                ++eee->nat_sym_tries;
+                eee->nat_probe_time = nowTime;
+                eee->nat_probe_pending = 1;
+                random_bytes( NULL, eee->sn_probe_cookie, N2N_COOKIE_SIZE );
+                eee->sn_probe_cookie_valid = 1;
+                eee->nat_dual_ip = (uint8_t)want_dual;
+                if ( eee->nat_dual_ip )
+                {
+                    /* Cross-IP probe: one-shot QUERY_ONLY to the brother sn
+                     * (query channel). Its ACK echoes our source address as
+                     * seen from sn2's IP, the second NAT observation. */
+                    send_register_super( eee, &(eee->sn_query), 0, 2, NULL );
+                }
+                else
+                {
+                    send_register_super( eee, &(eee->supernode), 0, 2, NULL );
+                    /* Twin probe to the supernode's alt port (lport+1): the
+                     * same IP at a second destination port, sharing the one
+                     * cookie. Equal public ports prove the mapping is reused
+                     * per IP (NAT3-style), keeping a per-IP NAT from being
+                     * mislabelled NAT4. */
+                    if ( eee->supernode.family == AF_INET &&
+                         eee->supernode.port != 0xFFFF )
+                    {
+                        n2n_sock_t snq_alt = eee->supernode;
+                        snq_alt.port = (uint16_t)( eee->supernode.port + 1 );
+                        send_register_super( eee, &snq_alt, 0, 2, NULL );
+                    }
+                }
             }
         }
     }
@@ -3310,8 +3347,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         }
     }
 
-    /* Phase 4: normal register cycle (25s). */
-    if ( nowTime > eee->last_register_req + 25 )
+    /* Phase 4: normal register cycle (30s). */
+    if ( nowTime > eee->last_register_req + 30 )
     {
         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
         send_register_super( eee, &(eee->supernode), 1, 0, NULL );
@@ -5770,42 +5807,11 @@ process_n2n_packet:
             if (pi.os_name[0]) strncpy(pending->os_name, pi.os_name, sizeof(pending->os_name) - 1);
             pending->assigned_ip = pi.assigned_ip;
             pending->last_seen = n2n_now();
-
-            /* EXPERIMENT guard: once hole-punch has started (punch_start_time
-             * != 0), an incoming [PUNCH] refreshes only the addresses above;
-             * never reset the punch timer/failed flag or re-enter the deferred
-             * sequence. Otherwise the QUERY_PEER -> [PUNCH] feedback loop
-             * re-arms the 5s probe window every ~1s, PUNCH_TIMEOUT(7s) never
-             * fires and the storm never converges to relay-only. */
-            if (pending->punch_start_time != 0) {
-                PEERS_UNLOCK(eee);
-                return 1;
-            }
-
             pending->punch_start_time = 0;
             pending->punch_failed = 0;
             pending->register_retry_count = 0;
             pending->psp_logged = 0;
             pending->p2p_logged = 0;
-
-            /* EXPERIMENT: deferred two-way punch — before actually punching we
-             * (1) refresh our own registration at the SN so it holds our newest
-             * address, (2) wait 1s, (3) QUERY_PEER for the peer's newest info,
-             * then (4) punch on that response. punch_seq: 0=idle, 1=waiting the
-             * 1s grace, 2=query sent / awaiting response. */
-            if (pending->punch_seq == 0) {
-                send_register_super(eee, &(eee->supernode), 1, 0, NULL);
-                pending->punch_seq = 1;
-                pending->punch_defer_time = now;
-                PEERS_UNLOCK(eee);
-                return 1;
-            }
-            if (pending->punch_seq == 1) {
-                /* still inside the 1s grace — ignore this push */
-                PEERS_UNLOCK(eee);
-                return 1;
-            }
-            pending->punch_seq = 0; /* seq==2: this push is the query response — punch now */
 
             if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1 &&
                 eee->sn_ipv6_support) {
@@ -5934,6 +5940,19 @@ process_n2n_packet:
                             nat_classify( eee );
                         }
                     }
+                    else if ( eee->nat_dual_ip &&
+                              eee->sn_query.family != 0 &&
+                              sock_equal( &sender, &eee->sn_query ) == 0 )
+                    {
+                        /* EXPERIMENT (dual-IP): probe echo from the brother sn's
+                         * query channel — the second NAT observation. */
+                        eee->last_sup = now;
+                        if ( ra.sock.family == AF_INET )
+                        {
+                            eee->nat_seen_sn2 = ra.sock;
+                            nat_classify( eee );
+                        }
+                    }
                     else if ( eee->sn1_probe_addr.family != 0 &&
                               sock_equal( &sender, &eee->sn1_probe_addr ) == 0 )
                     {
@@ -5967,13 +5986,24 @@ process_n2n_packet:
                      * alt-less SN answers only the main probe; the Phase 2.5
                      * retry timeout then freezes the verdict as before. */
                     if ( was_sym_check &&
-                         eee->nat_seen_sn2.family == AF_INET &&
-                         eee->nat_seen_sn2_alt.family == AF_INET )
+                         eee->nat_seen_sn2.family == AF_INET )
                     {
-                        eee->nat_probe_pending = 0;
-                        eee->nat_final = 1;
-                        traceEvent( TRACE_INFO, "NAT verdict frozen as %s",
-                                    N2N_NAT_NAME( eee->nat_type ) );
+                        if ( eee->nat_dual_ip )
+                        {
+                            /* dual-IP: only one echo to wait for. */
+                            eee->nat_probe_pending = 0;
+                            eee->nat_final = 1;
+                            traceEvent( TRACE_INFO,
+                                        "NAT verdict frozen as %s (dual-IP)",
+                                        N2N_NAT_NAME( eee->nat_type ) );
+                        }
+                        else if ( eee->nat_seen_sn2_alt.family == AF_INET )
+                        {
+                            eee->nat_probe_pending = 0;
+                            eee->nat_final = 1;
+                            traceEvent( TRACE_INFO, "NAT verdict frozen as %s",
+                                        N2N_NAT_NAME( eee->nat_type ) );
+                        }
                     }
                 }
                 else if ( 0 == memcmp( ra.cookie, eee->last_cookie, N2N_COOKIE_SIZE ) )
@@ -6285,6 +6315,7 @@ process_n2n_packet:
                                     eee->fc_seen = 0;
                                     eee->fc_window = 1;
                                     eee->nat_sym_tries = 0;
+                                    eee->nat_dual_ip = 0;
                                     eee->nat_final = 0;
                                     /* The one-shot symmetric check is scheduled
                                      * NAT_STRANGER_SECS out instead of firing
