@@ -3100,7 +3100,16 @@ static void sn_answer_query( n2n_sn_t * sss,
         }
     }
 
-    /* Simultaneous open to the target: the requester's address, punch. */
+    /* Simultaneous open to the target: the requester's address, punch.
+     *
+     * Use the address this QUERY_PEER actually arrived FROM rather than the
+     * requester's cached registration entry. When the requester has just
+     * rebound its local UDP socket (punch retry) the REGISTER_SUPER carrying
+     * the new mapping and this query race each other on the wire, and UDP
+     * gives no ordering guarantee -- so the cache can still hold the OLD,
+     * now-abandoned port. Pushing that stale address would send the target at
+     * a dead port and the punch could never complete. The live source address
+     * is by definition the requester's current NAT mapping. */
     if ( requester )
     {
         n2n_PEER_INFO_t pi2;
@@ -3117,15 +3126,13 @@ static void sn_answer_query( n2n_sn_t * sss,
         cmn3.flags = N2N_FLAGS_FROM_SUPERNODE;
         memcpy( cmn3.community, *community, sizeof(n2n_community_t) );
 
+        n2n_sock_t live_req;
+        sock_from_sender( &live_req, req_sa );
+
         memcpy( pi2.mac, requesterMac, N2N_MAC_SIZE );
         pi2.aflags = N2N_AFLAGS_PUNCH_REQUEST;
-        if (requester->num_sockets > 1 && requester->sockets[1].family != 0 &&
-            requester->sockets[1].port != 0)
-            pi2.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
-        if (requester->sock.family == AF_INET)
-            pi2.sockets[0] = requester->sock;
-        else if (requester->sock6.family == AF_INET6)
-            pi2.sockets[0] = requester->sock6;
+        if (live_req.family != 0)
+            pi2.sockets[0] = live_req;
         if (requester->sock6.family == AF_INET6) {
             pi2.aflags |= N2N_AFLAGS_IPV6_SOCKET;
             pi2.sock6 = requester->sock6;
