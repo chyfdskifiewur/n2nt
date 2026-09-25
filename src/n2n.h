@@ -280,8 +280,6 @@ struct peer_info {
     time_t              punch_start_time;
     uint8_t             punch_failed;
     time_t              punch_reset_time;
-    uint8_t             punch_seq;         /* EXPERIMENT deferred-punch state: 0=idle, 1=own-reg refreshed/waiting 1s, 2=query sent/await response */
-    time_t              punch_defer_time;  /* EXPERIMENT timestamp of current punch_seq phase */
     time_t              lan_punch_start;   /* when LAN punch started, 0=not started */
     uint8_t             lan_punch_done;    /* 1=LAN succeeded or timed out, proceed to WAN */
     time_t              last_probe_sent;   /* time last keepalive PROBE was sent */
@@ -633,6 +631,9 @@ struct n2n_edge
                                            is reused per IP (not symmetric) */
     time_t              nat_probe_time; /* last one-shot symmetric check attempt */
     uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
+    uint8_t             nat_dual_ip;    /* EXPERIMENT 1: symmetric check's second observation
+                                           comes from the brother sn (different IP), deciding
+                                           cone-vs-symmetric across IPs instead of by twin ports */
     uint8_t             nat_bounce_seen;   /* a helper-port delivery got through: not port-restricted */
     uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
     uint8_t             fc_window;      /* 1 until the first packet is sent to sn2 */
