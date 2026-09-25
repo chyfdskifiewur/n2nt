@@ -1791,6 +1791,23 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
         {
             scan->punch_failed = 1;
             scan->punch_reset_time = now;
+        } else if ( scan->punch_start_time == 0 && !scan->punch_failed &&
+                    scan->last_seen != 0 &&
+                    (now - scan->last_seen) > PUNCH_TIMEOUT )
+        {
+            /* The punch was never actually launched (start_punch found no
+             * usable address/family for this peer) or it was launched and then
+             * cleared. Without this branch punch_failed would stay 0 forever,
+             * so the re-punch retry loop below could never run and the peer
+             * would sit in pending until the 1800s purge. Treat the same
+             * silence as a failed punch so the retry loop takes over.
+             * NORMAL level on purpose: this is the one diagnostic that
+             * distinguishes "retry loop never armed" from "retry loop ran
+             * and failed", which the INFO-level logs cannot show. */
+            traceEvent(TRACE_NORMAL, "Punch never started for %s (idle %lus), entering retry",
+                       PEER_ID(mac_tmp, scan), (unsigned long)(now - scan->last_seen));
+            scan->punch_failed = 1;
+            scan->punch_reset_time = now;
         } else if ( scan->punch_start_time != 0 &&
                     !scan->punch_failed &&
                     (now - scan->punch_start_time) <= 5 &&
@@ -1889,7 +1906,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 scan->lan_punch_start     = 0;
                 scan->register_retry_count = 0;
                 scan->psp_logged          = 0;
-                traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/%d)",
+                traceEvent(TRACE_NORMAL, "Retrying P2P punch for %s (attempt %u/%d)",
                            PEER_ID(mac_tmp, scan),
                            scan->punch_retry_count, PUNCH_RETRY_MAX);
                 start_punch(eee, scan);
