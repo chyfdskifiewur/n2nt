@@ -65,6 +65,9 @@
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
 #define PUNCH_TIMEOUT                   7    /* sec: give up hole-punch after this */
+#define PUNCH_RETRY_MAX                10    /* re-punch rounds before falling back to relay only */
+#define PUNCH_RETRY_INTERVAL            3    /* sec: delay between re-punch rounds after a failure */
+
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -1821,15 +1824,15 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             continue;
         } else if ( scan->punch_failed )
         {
-            if ( scan->punch_retry_count >= 3 ) {
+            if ( scan->punch_retry_count >= PUNCH_RETRY_MAX ) {
                 prev = scan;
                 scan = scan->next;
                 continue;
             }
-            if ( (now - scan->punch_reset_time) > 40 )
+            if ( (now - scan->punch_reset_time) > PUNCH_RETRY_INTERVAL )
             {
                 scan->punch_retry_count++;
-                if ( scan->punch_retry_count >= 3 ) {
+                if ( scan->punch_retry_count >= PUNCH_RETRY_MAX ) {
                     traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
                                PEER_ID(mac_tmp, scan),
                                scan->punch_retry_count);
@@ -1837,15 +1840,23 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     scan = scan->next;
                     continue;
                 }
-                scan->punch_failed = 0;
-                scan->punch_start_time = 0;
-                scan->lan_punch_done = 0;
-                scan->lan_punch_start = 0;
+                /* Re-punch round: force our own re-registration and re-query
+                 * the supernode so both sides roll fresh NAT ports at the same
+                 * moment. The supernode nudges the peer to re-register too and
+                 * then answers our query with the peer's newest address, which
+                 * keeps the two sides punching simultaneously. Data keeps
+                 * flowing over the relay the whole time. */
+                eee->last_register_req = 0;
+                send_query_peer(eee, scan->mac_addr);
+                scan->punch_failed        = 0;
+                scan->punch_start_time    = 0;
+                scan->lan_punch_done      = 0;
+                scan->lan_punch_start     = 0;
                 scan->register_retry_count = 0;
-                scan->psp_logged = 0;
-                traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/3)",
+                scan->psp_logged          = 0;
+                traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/%d)",
                            PEER_ID(mac_tmp, scan),
-                           scan->punch_retry_count);
+                           scan->punch_retry_count, PUNCH_RETRY_MAX);
                 start_punch(eee, scan);
             }
         }
