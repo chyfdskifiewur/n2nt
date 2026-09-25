@@ -2835,21 +2835,18 @@ static void nat_classify( n2n_edge_t * eee )
     pub2 = ( eee->nat_seen_sn2.family == AF_INET &&
              !nat_addr_private( eee->nat_seen_sn2.addr.v4 ) );
 
-    /* Dual-port reuse: the twin probe sent to the current supernode's alt
-     * port (lport+1) echoed the same public port as its main one. Reuse
-     * WITHIN one IP is the reliable NAT3/NAT4 arbiter: a NAT that reuses
-     * its port toward two ports of one destination IP is not
-     * endpoint-dependent, so it punches fine (NAT3); one that churns the
-     * port even within a single IP is endpoint-dependent (NAT4). */
+    /* reuse2: the dual-port probe echoed the same public port from two ports
+     * of one IP. Within-IP reuse is the reliable NAT3/NAT4 arbiter — reuse
+     * punches fine (NAT3), churn is endpoint-dependent (NAT4). */
     int reuse2 = ( eee->nat_seen_sn2.family == AF_INET &&
                    eee->nat_seen_sn2_alt.family == AF_INET &&
                    eee->nat_seen_sn2.port == eee->nat_seen_sn2_alt.port );
 
-    /* Cross-IP confirmation (sn2, a distinct public IP). A NAT3 changes its
-     * port per destination IP BY DESIGN, so a cross-IP port difference is
-     * expected there too and must never alone promote the verdict to NAT4;
-     * it only strengthens NAT4 once within-IP reuse (reuse2) is already
-     * absent. */
+    /* cross_diff: the same socket got a different public port at sn2, a
+     * distinct IP. A NAT3 changes port per destination by design, so it
+     * never alone implies NAT4 (reuse2 stays the arbiter); but it does veto
+     * NAT1 — a port that changes across destinations is endpoint-dependent,
+     * which no full-cone mapping is, regardless of fc_seen. */
     int cross_diff = ( eee->nat_seen_sn_cross.family == AF_INET &&
                        eee->nat_seen_sn2.family == AF_INET &&
                        eee->nat_seen_sn_cross.port != eee->nat_seen_sn2.port );
@@ -2859,26 +2856,22 @@ static void nat_classify( n2n_edge_t * eee )
              eee->nat_seen_sn2.port != eee->nat_seen_sn2_alt.port ) ||
            memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
            eee->nat_seen_sn1.port != eee->nat_seen_sn2.port ) )
-        /* The twin public observations disagree: the mapping is
-         * endpoint-dependent -> symmetric. This outranks the N2NF probe on
-         * purpose: a NAT with endpoint-independent filtering but
-         * endpoint-dependent mapping must not be called full cone. The twin
-         * disagreement (same IP, two destination ports) is what lets a
-         * single-sn setup - which has no second observation IP - still
-         * catch symmetric NATs. */
+        /* Twin observations disagree: endpoint-dependent -> symmetric. It
+         * outranks the N2NF probe on purpose: endpoint-independent filtering
+         * with endpoint-dependent mapping must not read as full cone. */
         new_type = N2N_NAT_SYMMETRIC;
-    else if ( eee->fc_seen )
-        /* A N2NF probe from the never-contacted brother crossed the NAT, so
-         * the filter admits ANY source -> full cone (mapping agreed above). */
+    else if ( eee->fc_seen && !cross_diff )
+        /* A stranger probe from the never-contacted brother crossed: filter
+         * is open -> full cone. cross_diff vetoes: nothing with a mapping
+         * dependent on the destination IP is a full cone. */
         new_type = N2N_NAT_FULL_CONE;
     else if ( pub1 && pub2 )
     {
         if ( eee->nat_bounce_seen )
             new_type = N2N_NAT_RESTRICTED;
         else
-            /* Cone confirmed and the helper-port bounce never got through
-             * (every registration carried a bounce request, and the sn
-             * bounces before ACKing) -> port-restricted. */
+            /* Cone confirmed but the helper-port bounce never got through
+             * (every registration carried one) -> port-restricted. */
             new_type = N2N_NAT_PORT_RESTRICT;
     }
     else if ( eee->nat_bounce_seen )
@@ -2894,7 +2887,8 @@ static void nat_classify( n2n_edge_t * eee )
 
     if ( cross_diff && new_type != N2N_NAT_SYMMETRIC )
         traceEvent( TRACE_DEBUG,
-                    "NAT cross-IP port differs toward sn2 but within-IP reuse holds: keeping %s",
+                    "NAT cross-IP port differs toward sn2: not full cone (kept %s, "
+                    "full cone vetoed if the brother probe had reached us)",
                     N2N_NAT_NAME( new_type ) );
 
     /* A partial observation set (e.g. right after the fixed-port restore of
