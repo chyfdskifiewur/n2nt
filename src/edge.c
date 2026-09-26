@@ -64,9 +64,9 @@
 #define REGISTER_SUPER_INTERVAL_MAX     120  /* sec */
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
-#define PUNCH_TIMEOUT                   7    /* sec: overall cap for one punch series */
+#define PUNCH_TIMEOUT                   18   /* sec: overall cap for one punch series */
 #define PUNCH_CYCLES                    5    /* PROBE+REGISTER rounds per punch attempt */
-#define PUNCH_CYCLE_INTERVAL            1    /* sec: delay between punch rounds */
+#define PUNCH_CYCLE_INTERVAL            3    /* sec: per round = PROBE, +1s REGISTER, +2s to next round */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -1693,17 +1693,17 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if (peer_has_ipv4 && !we_have_ipv4 && !peer_has_ipv6) return;
     if (peer_has_ipv6 && !we_have_ipv6 && !peer_has_ipv4) return;
 
-    /* Kick off the round loop. Each of the PUNCH_CYCLES rounds (1s apart)
-     * performs, in check_punch_timeouts: re-register to the SN on the same
-     * UDP socket (so the source port the SN/peer observe never changes),
-     * download the peer's latest address from the SN, PROBE with the
-     * just-downloaded info and REGISTER. The first round fires on the next
+    /* Kick off the round loop. Each of the PUNCH_CYCLES rounds performs, in
+     * check_punch_timeouts: re-register to the SN (rebound socket unless a
+     * live P2P path forbids it), download the peer's latest address from the
+     * SN, PROBE with the just-downloaded info, then REGISTER 1s later; the
+     * next round starts after another 2s. The first round fires on the next
      * check_punch_timeouts tick. */
     peer->punch_start_time = n2n_now();
     peer->punch_cycle      = 0;
     peer->last_punch_probe = 0;   /* 0 = nothing sent yet, first tick fires */
     peer->last_register_sent = 0;
-    traceEvent(TRACE_INFO, "Punch started for %s (%ux register+download+PROBE+REGISTER, 1s apart)",
+    traceEvent(TRACE_INFO, "Punch started for %s (%ux PROBE+1s+REGISTER, 3s apart)",
                macaddr_str(mac_tmp, peer->mac_addr), PUNCH_CYCLES);
 }
 
@@ -1766,11 +1766,12 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             }
             else if ( scan->punch_cycle < PUNCH_CYCLES )
             {
-                /* One round per second, as requested: re-register to the SN on a
-                 * freshly rebound socket (brand-new source port, brand-new NAT
-                 * mapping), download the peer's latest address from the SN (the
-                 * PEER_INFO reply refreshes scan->sock in handle_PEER_INFO), then
-                 * PROBE that freshly downloaded address, then REGISTER. */
+                /* Each round: re-register to the SN on a freshly rebound socket
+                 * (new source port, new NAT mapping) unless a live P2P path
+                 * forbids the rebind, download the peer's latest address from
+                 * the SN (the PEER_INFO reply refreshes scan->sock in
+                 * handle_PEER_INFO), PROBE that address, then REGISTER 1s later;
+                 * the next round starts after another 2s. */
                 time_t cycle_start = scan->punch_start_time + scan->punch_cycle * PUNCH_CYCLE_INTERVAL;
                 if ( now >= cycle_start && scan->last_punch_probe < cycle_start )
                 {
@@ -1778,8 +1779,11 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                      * land on a brand-new source port (new NAT mapping), while
                      * fixed-port edges (-p) keep their port unchanged and only
                      * the peer side changes. At most once per tick so several
-                     * punching peers share the same fresh socket. */
-                    if (!eee->use_ws && !punch_swapped)
+                     * punching peers share the same fresh socket. Skipped while
+                     * a direct P2P path is live (8s window): a rebind would
+                     * drop every established direct connection. */
+                    if (!eee->use_ws && !punch_swapped &&
+                        (now - eee->last_p2p) > 8)
                     {
                         punch_swapped = 1;
                         closesocket(eee->udp_sock);   eee->udp_sock = -1;
@@ -1799,7 +1803,10 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                         send_probe(eee, &scan->sock6, scan->mac_addr);
                     scan->last_punch_probe = now;
                 }
-                if ( scan->last_punch_probe >= cycle_start && scan->last_register_sent < cycle_start )
+                /* REGISTER 1s after the PROBE of this round, then the 2s rest
+                 * till the next cycle_start. */
+                if ( scan->last_punch_probe >= cycle_start && scan->last_register_sent < cycle_start &&
+                     now >= scan->last_punch_probe + 1 )
                 {
                     n2n_sock_t *target_addr = (scan->sock.family == AF_INET) ? &scan->sock : &scan->sock6;
                     if (target_addr->family != 0) {
@@ -1808,7 +1815,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     }
                     scan->last_register_sent = now;
                     scan->punch_cycle++;
-                    traceEvent(TRACE_INFO, "Punch round %u/%u for %s (register+download+PROBE+REGISTER)",
+                    traceEvent(TRACE_INFO, "Punch round %u/%u for %s (PROBE+1s+REGISTER, 3s apart)",
                                scan->punch_cycle, PUNCH_CYCLES, PEER_ID(mac_tmp, scan));
                 }
             }
