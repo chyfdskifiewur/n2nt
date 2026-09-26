@@ -5844,9 +5844,30 @@ process_n2n_packet:
             /* Direct connection still alive (<30s): never demote this peer to
              * pending nor refresh its punch addresses on a PUNCH reply — a
              * fresher (but possibly different) address must not disturb an
-             * established direct path. Only metadata is updated. */
+             * established direct path. Only metadata is updated.
+             * Exception: the PUNCH reply carries a DIFFERENT address than our
+             * working copy. That proves the peer changed its NAT mapping
+             * (restart or CGNAT re-map) — the old direct path is dead, so the
+             * freeze must not cling to it. Fall through and re-punch the
+             * fresh address right away. */
+            int p_punch_addr_changed = 0;
+            if (known && do_punch)
+            {
+                if (pi.sockets[0].family == AF_INET && known->sock.family == AF_INET &&
+                    sock_equal(&known->sock, &pi.sockets[0]) != 0)
+                    p_punch_addr_changed = 1;
+                else if (pi.sock6.family == AF_INET6 && known->sock6.family == AF_INET6 &&
+                         sock_equal(&known->sock6, &pi.sock6) != 0)
+                    p_punch_addr_changed = 1;
+                if (p_punch_addr_changed)
+                {
+                    MACSTR_TMP(mac_tmp2);
+                    traceEvent(TRACE_INFO, "PUNCH for %s: peer address changed, re-punching fresh mapping",
+                               macaddr_str(mac_tmp2, known->mac_addr));
+                }
+            }
             if (known && known->direct_seen != 0 &&
-                (now - known->direct_seen) < 30)
+                (now - known->direct_seen) < 30 && !p_punch_addr_changed)
             {
                 if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
                     pi.sockets[1].family != 0 && pi.sockets[1].port != 0) {
