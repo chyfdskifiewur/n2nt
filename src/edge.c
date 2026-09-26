@@ -64,10 +64,9 @@
 #define REGISTER_SUPER_INTERVAL_MAX     120  /* sec */
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
-#define PUNCH_TIMEOUT                   7    /* sec: give up hole-punch after this */
-#define PUNCH_RETRY_MAX                10    /* re-punch rounds before falling back to relay only */
-#define PUNCH_RETRY_INTERVAL            3    /* sec: delay between re-punch rounds after a failure */
-
+#define PUNCH_TIMEOUT                   7    /* sec: overall cap for one punch series */
+#define PUNCH_CYCLES                    5    /* PROBE+REGISTER rounds per punch attempt */
+#define PUNCH_CYCLE_INTERVAL            1    /* sec: delay between punch rounds */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -371,7 +370,6 @@ static int edge_init(n2n_edge_t * eee)
     eee->keep_running   = 1;
     eee->last_register_req = 0;
     eee->register_lifetime = 120;
-    eee->want_first_peer_list = 1;
     eee->last_p2p = 0;
     eee->last_sup = 0;
     eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
@@ -672,39 +670,6 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
     else
         traceEvent(TRACE_NORMAL, "Edge support: IPv4 only");
 
-    return 0;
-}
-
-/* Forward declaration: defined later in this file (used by rebind_udp_local). */
-static void send_register_super( n2n_edge_t * eee,
-                                 const n2n_sock_t * sock_caller,
-                                 int tap_wait_ack,
-                                 int do_simple_handshake,
-                                 const n2n_sock_t * sock_sn_alt );
-
-/* Rebind the UDP socket(s) onto a fresh ephemeral local port. The OS then
- * assigns a new source port, so the NAT mappings toward the supernode (and
- * every peer we re-probe) are re-rolled — this is what gives a re-punch a
- * genuinely new coin flip. Re-registering on the SAME socket keeps the old
- * mapping and is useless for symmetric-ish NAT. Note: rebinding tears down
- * every established direct P2P path at once; data falls back to the relay
- * during the transition, which is what a re-punch round does anyway. */
-static int rebind_udp_local( n2n_edge_t * eee )
-{
-    int has_udp6 = (eee->udp_sock6 != -1);
-    closesocket( eee->udp_sock );
-    eee->udp_sock = -1;
-    if ( has_udp6 ) {
-        closesocket( eee->udp_sock6 );
-        eee->udp_sock6 = -1;
-    }
-    if ( setup_sockets( eee, (int)eee->local_port ) < 0 ) {
-        traceEvent(TRACE_WARNING, "Punch retry: rebinding the local UDP port failed");
-        return -1;
-    }
-    /* Register at once so the SN (and through it the peer we are punching)
-     * learns our newest NAT mapping instead of the one we just abandoned. */
-    send_register_super( eee, &(eee->supernode), 1, 0, NULL );
     return 0;
 }
 
@@ -1546,22 +1511,6 @@ static void send_register_super( n2n_edge_t * eee,
         eee->gaming_started = 1;
     }
 
-    /* First successful registration of this process asks the SN to push every
-     * peer. Without it a restarted edge relies entirely on the SN classifying
-     * it as a brand-new edge — but the SN still holds our old entry until it
-     * expires, so a quick restart is seen as a known edge and NO peer list is
-     * pushed. The edge then never learns anyone exists: no PEER_INFO, no
-     * pending peer, no hole-punch, and it silently sits on the relay. Asking
-     * unconditionally on the first registration makes startup independent of
-     * how fast the previous process was replaced.
-     * One-shot via want_first_peer_list, NOT sn_ack_count: a cookie refresh
-     * or a NAT rebind also zeroes sn_ack_count, and those must not re-request
-     * the whole list. */
-    if ( cookie_mode == 0 && eee->want_first_peer_list ) {
-        reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
-        eee->want_first_peer_list = 0;
-    }
-
     /* When this packet goes to the fixed query channel (sn2) and that
      * channel is NOT the current supernode, it is a one-shot address lookup,
      * not a real registration — ask sn2 not to register us as a peer. */
@@ -1720,7 +1669,11 @@ static void send_probe_ack( n2n_edge_t * eee,
 
 static int is_empty_ip_address( const n2n_sock_t * sock );
 
-/** Start hole-punch for a peer: send PROBE directly, record punch start time */
+/** Start hole-punch for a peer: re-register to the SN (on the same UDP socket,
+ *  so the observed source port stays unchanged), pull the peer's latest info
+ *  from the SN, then let check_punch_timeouts drive PUNCH_CYCLES rounds of
+ *  PROBE+REGISTER (one round per second). Any direct signal received mid-loop
+ *  ends it early. */
 static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
 {
     MACSTR_TMP(mac_tmp);
@@ -1740,28 +1693,18 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if (peer_has_ipv4 && !we_have_ipv4 && !peer_has_ipv6) return;
     if (peer_has_ipv6 && !we_have_ipv6 && !peer_has_ipv4) return;
 
-    int punched = 0;
-    
-    /* Try IPv4 punch if both sides have IPv4 */
-    if ( peer_has_ipv4 && we_have_ipv4 ) {
-        send_probe(eee, &peer->sock, peer->mac_addr);
-        punched = 1;
-        traceEvent(TRACE_INFO, "IPv4 hole-punch started for %s",
-                   macaddr_str(mac_tmp, peer->mac_addr));
-    }
-    
-    /* Try IPv6 punch if both sides have IPv6 */
-    if ( peer_has_ipv6 && we_have_ipv6 ) {
-        send_probe(eee, &peer->sock6, peer->mac_addr);
-        punched = 1;
-        traceEvent(TRACE_INFO, "IPv6 hole-punch started for %s",
-                   macaddr_str(mac_tmp, peer->mac_addr));
-    }
-    
-    if (punched) {
-        peer->punch_start_time = n2n_now();
-        peer->last_punch_probe = peer->punch_start_time;
-    }
+    /* Kick off the round loop. Each of the PUNCH_CYCLES rounds (1s apart)
+     * performs, in check_punch_timeouts: re-register to the SN on the same
+     * UDP socket (so the source port the SN/peer observe never changes),
+     * download the peer's latest address from the SN, PROBE with the
+     * just-downloaded info and REGISTER. The first round fires on the next
+     * check_punch_timeouts tick. */
+    peer->punch_start_time = n2n_now();
+    peer->punch_cycle      = 0;
+    peer->last_punch_probe = 0;   /* 0 = nothing sent yet, first tick fires */
+    peer->last_register_sent = 0;
+    traceEvent(TRACE_INFO, "Punch started for %s (%ux register+download+PROBE+REGISTER, 1s apart)",
+               macaddr_str(mac_tmp, peer->mac_addr), PUNCH_CYCLES);
 }
 
 /** Check punch timeouts in pending_peers: give up after PUNCH_TIMEOUT seconds,
@@ -1771,13 +1714,6 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
     struct peer_info * scan = eee->pending_peers;
     struct peer_info * prev = NULL;
     MACSTR_TMP(mac_tmp);
-
-    /* The UDP socket is global, so at most ONE rebind per pass. Several peers
-     * can come due for a retry in the same pass; rebinding per peer would
-     * roll the local port once per peer and every roll but the last would
-     * invalidate the registration that the previous roll had just created. */
-    int rebound_this_pass = 0;
-
     while ( scan ) {
         /* LAN punch phase: retransmit REGISTER to LAN address */
         if ( scan->num_sockets == 2 && !scan->lan_punch_done &&
@@ -1815,70 +1751,59 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
         {
             scan->punch_failed = 1;
             scan->punch_reset_time = now;
-        } else if ( scan->punch_start_time == 0 && !scan->punch_failed &&
-                    scan->last_seen != 0 &&
-                    (now - scan->last_seen) > PUNCH_TIMEOUT )
+        } else if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* The punch was never actually launched (start_punch found no
-             * usable address/family for this peer) or it was launched and then
-             * cleared. Without this branch punch_failed would stay 0 forever,
-             * so the re-punch retry loop below could never run and the peer
-             * would sit in pending until the 1800s purge. Treat the same
-             * silence as a failed punch so the retry loop takes over.
-             * NORMAL level on purpose: this is the one diagnostic that
-             * distinguishes "retry loop never armed" from "retry loop ran
-             * and failed", which the INFO-level logs cannot show. */
-            traceEvent(TRACE_NORMAL, "Punch never started for %s (idle %lus), entering retry",
-                       PEER_ID(mac_tmp, scan), (unsigned long)(now - scan->last_seen));
-            scan->punch_failed = 1;
-            scan->punch_reset_time = now;
-        } else if ( scan->punch_start_time != 0 &&
-                    !scan->punch_failed &&
-                    (now - scan->punch_start_time) <= 5 &&
-                    (now - scan->last_punch_probe) >= 1 )
-        {
-            /* Retransmit PROBE every 1s for first 5s */
-            int sent_probe = 0;
-            
-            /* Try IPv4 if available */
-            if ( scan->sock.family == AF_INET && eee->udp_sock != -1 ) {
-                send_probe(eee, &scan->sock, scan->mac_addr);
-                sent_probe = 1;
-            }
-            
-            /* Try IPv6 if available */
-            if ( scan->sock6.family == AF_INET6 && eee->udp_sock6 != -1 ) {
-                send_probe(eee, &scan->sock6, scan->mac_addr);
-                sent_probe = 1;
-            }
-            
-            if (sent_probe) {
-                scan->last_punch_probe = now;
-            }
-        } else if ( scan->register_retry_count > 0 && !scan->punch_failed )
-        {
-            if ( scan->register_retry_count < 3 &&
-                 (now - scan->last_register_sent) >= 1 )
+            /* A direct packet, or a direct REGISTER_ACK (which promotes the
+             * peer out of pending), already proved the direct path: stop the
+             * round loop right away and keep the learned info. */
+            if ( scan->direct_seen != 0 && scan->direct_seen >= scan->punch_start_time )
             {
-                n2n_sock_t *target_addr = (scan->sock.family == AF_INET) ? &scan->sock : &scan->sock6;
-                if (target_addr->family != 0) {
-                    send_register(eee, target_addr);
-                    send_register(eee, &(eee->supernode));
+                scan->punch_start_time = 0;
+                scan->punch_cycle = 0;
+                traceEvent(TRACE_INFO, "Punch for %s stopped early - direct path works",
+                           PEER_ID(mac_tmp, scan));
+            }
+            else if ( scan->punch_cycle < PUNCH_CYCLES )
+            {
+                /* One round per second, as requested: re-register to the SN on
+                 * the same UDP socket (source port stays unchanged), download
+                 * the peer's latest address from the SN (the PEER_INFO reply
+                 * refreshes scan->sock in handle_PEER_INFO), then PROBE that
+                 * freshly downloaded address, then REGISTER. */
+                time_t cycle_start = scan->punch_start_time + scan->punch_cycle * PUNCH_CYCLE_INTERVAL;
+                if ( now >= cycle_start && scan->last_punch_probe < cycle_start )
+                {
+                    send_register_super( eee, &(eee->supernode), 0, 0, NULL );
+                    send_query_peer( eee, scan->mac_addr );
+                    scan->last_query_sent = now;
+
+                    if ( scan->sock.family == AF_INET && eee->udp_sock != -1 )
+                        send_probe(eee, &scan->sock, scan->mac_addr);
+                    if ( scan->sock6.family == AF_INET6 && eee->udp_sock6 != -1 )
+                        send_probe(eee, &scan->sock6, scan->mac_addr);
+                    scan->last_punch_probe = now;
                 }
-                scan->register_retry_count++;
-                scan->last_register_sent = now;
-                traceEvent(TRACE_INFO, "REGISTER retry %u/3 for %s",
-                           scan->register_retry_count,
-                           macaddr_str(mac_tmp, scan->mac_addr));
+                if ( scan->last_punch_probe >= cycle_start && scan->last_register_sent < cycle_start )
+                {
+                    n2n_sock_t *target_addr = (scan->sock.family == AF_INET) ? &scan->sock : &scan->sock6;
+                    if (target_addr->family != 0) {
+                        send_register(eee, target_addr);
+                        send_register(eee, &(eee->supernode));
+                    }
+                    scan->last_register_sent = now;
+                    scan->punch_cycle++;
+                    traceEvent(TRACE_INFO, "Punch round %u/%u for %s (register+download+PROBE+REGISTER)",
+                               scan->punch_cycle, PUNCH_CYCLES, PEER_ID(mac_tmp, scan));
+                }
             }
-            else if ( scan->register_retry_count >= 3 &&
-                      (now - scan->last_register_sent) >= 1 )
+            else
             {
+                /* All rounds done without any direct signal: give up for now.
+                 * check_punch_timeouts retries the whole series after 40s. */
                 scan->punch_failed = 1;
                 scan->punch_reset_time = now;
-                scan->register_retry_count = 0;
                 if (!scan->psp_logged) {
-                    traceEvent(TRACE_NORMAL, "REGISTER retries exhausted for %s, PsP",
+                    traceEvent(TRACE_NORMAL, "Punch rounds exhausted for %s, PsP",
                                PEER_ID(mac_tmp, scan));
                     scan->psp_logged = 1;
                 }
@@ -1898,15 +1823,15 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             continue;
         } else if ( scan->punch_failed )
         {
-            if ( scan->punch_retry_count >= PUNCH_RETRY_MAX ) {
+            if ( scan->punch_retry_count >= 3 ) {
                 prev = scan;
                 scan = scan->next;
                 continue;
             }
-            if ( (now - scan->punch_reset_time) > PUNCH_RETRY_INTERVAL )
+            if ( (now - scan->punch_reset_time) > 40 )
             {
                 scan->punch_retry_count++;
-                if ( scan->punch_retry_count >= PUNCH_RETRY_MAX ) {
+                if ( scan->punch_retry_count >= 3 ) {
                     traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
                                PEER_ID(mac_tmp, scan),
                                scan->punch_retry_count);
@@ -1914,34 +1839,15 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     scan = scan->next;
                     continue;
                 }
-                /* Re-punch round: bind a fresh local UDP port (new source
-                 * port -> re-rolled NAT mapping) and then re-query the
-                 * supernode so it re-advertises/re-nudges the peer. This is
-                 * the equivalent of a process restart for the NAT mapping:
-                 * every round is a genuinely new coin flip instead of
-                 * re-poking the same unchanged mapping. Data keeps flowing
-                 * over the relay the whole time.
-                 * The rebind is shared across the whole pass: see
-                 * rebound_this_pass above. Peers retrying in the same pass
-                 * reuse this round's fresh mapping instead of rolling a
-                 * second one, which would void this registration. */
-                if ( !rebound_this_pass ) {
-                    rebind_udp_local( eee );
-                    rebound_this_pass = 1;
-                } else {
-                    send_register_super( eee, &(eee->supernode), 1, 0, NULL );
-                }
-                eee->last_register_req = 0;
-                send_query_peer(eee, scan->mac_addr);
-                scan->punch_failed        = 0;
-                scan->punch_start_time    = 0;
-                scan->lan_punch_done      = 0;
-                scan->lan_punch_start     = 0;
+                scan->punch_failed = 0;
+                scan->punch_start_time = 0;
+                scan->lan_punch_done = 0;
+                scan->lan_punch_start = 0;
                 scan->register_retry_count = 0;
-                scan->psp_logged          = 0;
-                traceEvent(TRACE_NORMAL, "Retrying P2P punch for %s (attempt %u/%d)",
+                scan->psp_logged = 0;
+                traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/3)",
                            PEER_ID(mac_tmp, scan),
-                           scan->punch_retry_count, PUNCH_RETRY_MAX);
+                           scan->punch_retry_count);
                 start_punch(eee, scan);
             }
         }
@@ -3780,6 +3686,20 @@ static int send_PACKET( n2n_edge_t * eee,
             if (do_query)
                 p->last_query_sent = now;
         }
+
+        /* On-demand P2P punch: we are actually sending a unicast packet to
+         * this peer, so THIS is the moment to open a direct path (the startup
+         * PEER_INFO dump no longer punches anyone). try_send_register starts
+         * a hole-punch toward the peer unless one is already running or has
+         * failed, so repeated packets do not hammer it. The packet itself is
+         * already being relayed above, so nothing is dropped while the punch
+         * is in flight. Called with PEERS_LOCK held, matching the existing
+         * convention in handle_PACKET / the PEER_INFO handler. */
+        if (p && p->sock.family == AF_INET && eee->udp_sock != -1)
+            try_send_register(eee, 1, dstMac, &p->sock);
+        else if (p && p->sock6.family == AF_INET6 && eee->udp_sock6 != -1)
+            try_send_register(eee, 1, dstMac, &p->sock6);
+
         PEERS_UNLOCK(eee);
 
         if (do_query && p) {
@@ -5604,22 +5524,6 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
-            /* Address-refresh nudge: the SN names our OWN MAC with the
-             * NUDGE_REGISTER flag as a hint that a peer is about to punch us
-             * and wants a fresh mapping. Force an immediate re-REGISTER so the
-             * SN serves that peer a fresh address, then ignore the PEER_INFO —
-             * it carries no peer socket (it targets us, not a peer). */
-            if ( (pi.aflags & N2N_AFLAGS_NUDGE_REGISTER) &&
-                 memcmp(pi.mac, eee->device.mac_addr, N2N_MAC_SIZE) == 0 )
-            {
-                if ( eee->last_register_req != 0 )
-                {
-                    eee->last_register_req = 0; /* skip the 30s interval, re-register now */
-                    traceEvent( TRACE_DEBUG, "nudge: re-registering to refresh mapping" );
-                }
-                return 1;
-            }
-
             /* Relay: SN advertises the community relay peer. When the advertised
              * MAC is our own, the SN is designating THIS edge as the relay:
              * switch on forwarding. Otherwise the relay is another peer and we
@@ -5901,31 +5805,34 @@ process_n2n_packet:
             if (pi.os_name[0]) strncpy(pending->os_name, pi.os_name, sizeof(pending->os_name) - 1);
             pending->assigned_ip = pi.assigned_ip;
             pending->last_seen = n2n_now();
-            pending->punch_start_time = 0;
-            pending->punch_failed = 0;
-            pending->register_retry_count = 0;
-            pending->psp_logged = 0;
-            pending->p2p_logged = 0;
-
-            if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1 &&
-                eee->sn_ipv6_support) {
-                /* Dual-stack supernode: sock6 was learned via real IPv6
-                 * registration. Keep the original behaviour exactly — try
-                 * the IPv6 address directly. */
-                try_send_register(eee, 1, pi.mac, &pending->sock6);
-            } else if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1) {
-                /* IPv4-only supernode: sock6 is an edge-reported address
-                 * (extra way to obtain an IPv6 address). It must NOT change
-                 * the LAN / IPv4 direct flow — run the exact same LAN/IPv4
-                 * logic, using the reported IPv6 only as an ADDITIONAL
-                 * parallel candidate. */
-                try_peer_lan_ipv4(eee, pi.aflags, &pi.sockets[0], &pi.sockets[1],
-                                  pending, &pending->sock6);
-            } else {
-                /* No IPv6 candidate: unchanged LAN / IPv4 direct flow. */
-                try_peer_lan_ipv4(eee, pi.aflags, &pi.sockets[0], &pi.sockets[1],
-                                  pending, NULL);
+            if ( pending->punch_start_time == 0 )
+            {
+                /* This PEER_INFO carries the PUNCH flag, which the supernode
+                 * sets only in its QUERY_PEER handler — i.e. for exactly the
+                 * peer that queried us (communication demand). Startup dumps,
+                 * NAT-change pushes and relay advertisements never set PUNCH,
+                 * so punching right here targets that one peer only. Start the
+                 * round loop with the just-downloaded address. */
+                pending->punch_failed = 0;
+                pending->register_retry_count = 0;
+                pending->psp_logged = 0;
+                pending->p2p_logged = 0;
+                if (pending->sock.family == AF_INET && eee->udp_sock != -1)
+                    try_send_register(eee, 1, pi.mac, &pending->sock);
+                else if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1)
+                    try_send_register(eee, 1, pi.mac, &pending->sock6);
             }
+            else
+            {
+                /* A punch round loop is already running for this peer (e.g. the
+                 * reply to our own QUERY_PEER): just refresh the address so the
+                 * next round punches with the newest info. Never restart the
+                 * loop here, or every PEER_INFO reply would re-query the SN. */
+                MACSTR_TMP(mac_tmp);
+                traceEvent(TRACE_INFO, "PEER_INFO PUNCH for %s - punch running, sock refreshed",
+                           macaddr_str(mac_tmp, pi.mac));
+            }
+            (void)try_peer_lan_ipv4; /* keep referenced; LAN-first variant stays unused, PUNCH path mirrors send_PACKET's plain REGISTER punch */
 
             PEERS_UNLOCK(eee);
         }
