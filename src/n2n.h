@@ -303,12 +303,6 @@ struct peer_info {
      * start at the same moment. Zeroed = not waiting. */
     n2n_mac_t           punch_wait_target; /* sn: peer whose query we're waiting for */
     time_t              punch_wait_since;  /* sn: when the wait started (0 = not waiting) */
-    /* Last QUERY_PEER interest (sn-side): the peer that most recently queried
-     * about this edge. On a public-address change the sn pushes a PUNCH
-     * PEER_INFO straight to that requester so it re-punches the fresh
-     * endpoint instead of waiting for its own query round. */
-    n2n_mac_t           last_queryer;      /* sn: mac of the last edge that queried about us */
-    time_t              last_queryer_seen; /* sn: when that query arrived (0 = never) */
     time_t              relay_adv_time;    /* sn: last time this edge was advertised as the relay (throttle) */
     time_t              sn_fwd_first;      /* sn: first time this edge's unicast data was relayed via SN (0=never); gates community-relay announcement */
     uint8_t             relay_willing;     /* sn: edge's relay stance: 0=refuse,1=default,2=willing,3=force */

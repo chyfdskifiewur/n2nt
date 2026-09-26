@@ -3624,15 +3624,6 @@ static int process_udp( n2n_sn_t * sss,
         if ( !target ) return 0;   /* unknown target: nothing to report (as before) */
 
         struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
-        /* Remember the latest interest in the target: on a public-address
-         * change (NAT4 re-map during punching) the sn pushes a PUNCH
-         * PEER_INFO straight back to this requester so it re-punches the
-         * fresh endpoint right away. */
-        if ( requester && memcmp( target->mac_addr, query.srcMac, N2N_MAC_SIZE ) != 0 )
-        {
-            memcpy( target->last_queryer, query.srcMac, N2N_MAC_SIZE );
-            target->last_queryer_seen = now;
-        }
         if ( !requester )
         {
             /* Requester not registered (a punch round re-registers first, so
@@ -3641,33 +3632,22 @@ static int process_udp( n2n_sn_t * sss,
             SOCKET send_sock = (sender_sock->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
             sendto( send_sock, encbuf, encx, 0, sender_sock, sender_sock_len );
         }
-        else if ( target->punch_wait_since != 0 &&
-                  memcmp( target->punch_wait_target, query.srcMac, N2N_MAC_SIZE ) == 0 &&
-                  now - target->punch_wait_since <= PUNCH_PAIR_WINDOW )
-        {
-            /* PAIRED: the queried peer was itself waiting for us. Reply to
-             * both right now, each side gets exactly one PEER_INFO and both
-             * punch rounds start at the same moment. */
-            target->punch_wait_since    = 0;
-            requester->punch_wait_since = 0;
-            {
-                size_t encx = sn_build_punch_info( &cmn.community, target, encbuf );
-                SOCKET send_sock = (sender_sock->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
-                sendto( send_sock, encbuf, encx, 0, sender_sock, sender_sock_len );
-            }
-            sn_send_punch_to_sock( sss, &cmn.community, requester, &target->sockets[0] );
-            traceEvent( TRACE_DEBUG, "Punch-pair matched %s<->%s",
-                        macaddr_str(mac_buf, query.targetMac),
-                        macaddr_str(mac_buf2, query.srcMac) );
-        }
         else
         {
-            /* Not paired yet: hold this reply for up to PUNCH_PAIR_WINDOW and
-             * wait for the other side's query so both punch together; the
-             * timeout scan in the main loop then answers alone (plus the
-             * simultaneous-open push to the target as a fallback). */
-            memcpy( requester->punch_wait_target, query.targetMac, N2N_MAC_SIZE );
-            requester->punch_wait_since = now;
+            /* Unified initiation: the sn synchronises both sides of a punch
+             * series. Reply to the requester with the target's address AND
+             * push the requester's address to the target, so both edges start
+             * (or step) their rounds together — no waiting window, the sn is
+             * the synchroniser. The target starts punching even without its
+             * own traffic demand; once a side stops querying the other side's
+             * rounds simply continue alone. */
+            size_t encx = sn_build_punch_info( &cmn.community, target, encbuf );
+            SOCKET send_sock = (sender_sock->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
+            sendto( send_sock, encbuf, encx, 0, sender_sock, sender_sock_len );
+            sn_send_punch_to_sock( sss, &cmn.community, requester, &target->sockets[0] );
+            traceEvent( TRACE_DEBUG, "Punch initiated %s<->%s",
+                        macaddr_str(mac_buf, query.targetMac),
+                        macaddr_str(mac_buf2, query.srcMac) );
         }
     }
     else if ( msg_type == MSG_TYPE_REGISTER_SUPER )
@@ -4088,26 +4068,6 @@ static int process_udp( n2n_sn_t * sss,
             push_nat_to_community( sss,
                                    find_peer_by_mac(sss->edges, reg.edgeMac),
                                    cmn.community );
-
-        /* NAT4 re-map (is_new_edge == 3): push the fresh address as a PUNCH
-         * PEER_INFO straight to the edge that most recently queried about us
-         * (within 60s), so it immediately re-punches the new endpoint instead
-         * of punching the abandoned one for the rest of its round. */
-        if ( is_new_edge == 3 )
-        {
-            struct peer_info *chg = find_peer_by_mac( sss->edges, reg.edgeMac );
-            if ( chg && chg->last_queryer_seen != 0 &&
-                 now - chg->last_queryer_seen <= 60 )
-            {
-                struct peer_info *q = find_peer_by_mac( sss->edges, chg->last_queryer );
-                if ( q && memcmp( q->community_name, cmn.community, sizeof(n2n_community_t) ) == 0 )
-                {
-                    uint8_t punch_buf[N2N_SN_PKTBUF_SIZE];
-                    size_t  punch_encx = sn_build_punch_info( &cmn.community, chg, punch_buf );
-                    sn_send_to_peer( sss, q, punch_buf, punch_encx );
-                }
-            }
-        }
 
         /* Brand-new edge (update_edge == 1) or known edge whose public address
          * changed (== 3: its NAT mapping was recreated, so the stranger window

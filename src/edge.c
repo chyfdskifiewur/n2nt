@@ -1769,6 +1769,13 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             {
                 scan->punch_start_time = 0;
                 scan->punch_cycle = 0;
+                /* Notify the peer over the just-proven direct path: the direct
+                 * REGISTER tells it our end is established so it stops
+                 * re-mapping its own port and keeps punching the same address. */
+                if (scan->sock.family == AF_INET && eee->udp_sock != -1)
+                    send_register(eee, &scan->sock);
+                else if (scan->sock6.family == AF_INET6 && eee->udp_sock6 != -1)
+                    send_register(eee, &scan->sock6);
                 traceEvent(TRACE_INFO, "Punch for %s stopped early - direct path works",
                            PEER_ID(mac_tmp, scan));
             }
