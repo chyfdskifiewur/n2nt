@@ -846,28 +846,12 @@ typedef struct sn_stats sn_stats_t;
  * (which carries no sn1 hint and no sn2 token) is admitted when -E is set. */
 #define PROMOTED_LIST_MAX  32
 #define PROMOTED_TTL       180   /* refreshed by probes and registrations */
+#define SN_SIMULT_OPEN_INTERVAL 30 /* sec: at most one simultaneous-open push per target per interval */
 
 struct promoted_peer {
     n2n_mac_t       mac;
     n2n_community_t community;
     time_t          seen;    /* last probe/registration time (0 = free slot) */
-};
-
-/* Pending address-refresh queries. When an edge asks for a peer's address
- * (QUERY_PEER), we nudge the target to re-REGISTER so the reply carries a
- * fresh mapping instead of a stale cached one. This record holds "requester
- * A is waiting on target B" until B's REGISTER arrives (then we reply to A
- * and do the simultaneous open) or a timeout fires (then we reply with the
- * cached address so punching still proceeds). */
-#define N2N_SN_PENDING_QUERY_MAX  16
-#define N2N_SN_PENDING_QUERY_TIMEOUT 3  /* seconds before we fall back to the cached address */
-struct pending_query {
-    n2n_mac_t            requester;    /* edge that asked (gets the fresh reply) */
-    n2n_mac_t            target;       /* edge being nudged to re-REGISTER */
-    n2n_community_t      community;    /* both must be in the same community */
-    struct sockaddr_storage req_sa;    /* requester's own socket, so we can reply without a lookup */
-    socklen_t            req_sa_len;
-    time_t               requested_at; /* when QUERY_PEER arrived (0 = free slot) */
 };
 
 struct n2n_sn
@@ -897,7 +881,6 @@ struct n2n_sn
     ws_conn_t           ws_conns[N2N_SN_MAX_WS]; /* WS connection table (edge connected via WS). */
     struct peer_info *  edges;          /* Link list of registered edges. */
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
-    struct pending_query *pending_queries; /* deferred QUERY_PEER answers (address-refresh nudges) */
     int                 ipv4_available; /* 0=unavailable, 1=available */
     int                 ipv6_available; /* 0=unavailable, 1=available */
     int                 relay_advert_enabled; /* 1=advertise the community relay peer (default), 0=off */
@@ -1188,13 +1171,6 @@ static int init_sn( n2n_sn_t * sss )
     initWin32();
 #endif
     memset( sss, 0, sizeof(n2n_sn_t) );
-
-    sss->pending_queries = calloc( N2N_SN_PENDING_QUERY_MAX, sizeof(struct pending_query) );
-    if ( !sss->pending_queries )
-    {
-        traceEvent( TRACE_ERROR, "failed to allocate pending-query table" );
-        return -1;
-    }
 
     sss->daemon = 1; /* By defult run as a daemon. */
     sss->lport = N2N_SN_LPORT_DEFAULT;
@@ -3003,175 +2979,6 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
     advertise_relay_to( sss, cmn, relay, relay );
 }
 
-/* Build and send a PEER_INFO naming <peerMac> (its own cached address) with
- * the NUDGE_REGISTER flag, so that edge re-REGISTERs before punching and the
- * SN can hand out a fresh mapping. Public address only; no-op off the table. */
-static void sn_send_nudge( n2n_sn_t * sss,
-                           const n2n_community_t * community,
-                           const n2n_mac_t peerMac )
-{
-    struct peer_info *p = find_peer_by_mac( sss->edges, peerMac );
-    if ( !p || p->sock.family != AF_INET ) return;
-
-    n2n_PEER_INFO_t  pi;
-    n2n_common_t     cmn2;
-    uint8_t          encbuf[N2N_SN_PKTBUF_SIZE];
-    size_t           encx = 0;
-    struct sockaddr_storage dst;
-    socklen_t        dlen = sizeof(dst);
-
-    memset( &pi, 0, sizeof(pi) );
-    memset( &cmn2, 0, sizeof(cmn2) );
-    cmn2.ttl   = N2N_DEFAULT_TTL;
-    cmn2.pc    = n2n_peer_info;
-    cmn2.flags = N2N_FLAGS_FROM_SUPERNODE;
-    memcpy( cmn2.community, *community, sizeof(n2n_community_t) );
-
-    memcpy( pi.mac, peerMac, N2N_MAC_SIZE );
-    pi.aflags = N2N_AFLAGS_NUDGE_REGISTER;
-
-    encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
-    if ( fill_sockaddr( (struct sockaddr*)&dst, dlen, &p->sock ) == 0 )
-    {
-        SOCKET s = (p->sock.family == AF_INET6) ? sss->sock6 : sss->sock;
-        socklen_t slen = (p->sock.family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
-        sendto( s, encbuf, encx, 0, (struct sockaddr*)&dst, slen );
-        traceEvent( TRACE_DEBUG, "QUERY_PEER: nudged %s to re-register",
-                    macaddr_str( (char[18]){0}, peerMac ) );
-    }
-}
-
-/* Serve a QUERY_PEER once the target's address is as fresh as we can get:
- * push the target's address to the requester (PUNCH) and, simultaneously
- * open, push the requester's address back to the target. req_sa/req_sa_len
- * address the requester (handed to us either at query time or, in the
- * fallback after timeout, its stored copy). */
-static void sn_answer_query( n2n_sn_t * sss,
-                             const n2n_community_t * community,
-                             const n2n_mac_t requesterMac,
-                             const n2n_mac_t targetMac,
-                             const struct sockaddr * req_sa,
-                             socklen_t req_sa_len )
-{
-    struct peer_info *target    = find_peer_by_mac( sss->edges, targetMac );
-    struct peer_info *requester = find_peer_by_mac( sss->edges, requesterMac );
-    if ( !target ) return;
-
-    macstr_t mb1, mb2;
-
-    /* To the requester: the target's address, punch. */
-    {
-        n2n_PEER_INFO_t pi;
-        n2n_common_t    cmn2;
-        uint8_t         encbuf[N2N_SN_PKTBUF_SIZE];
-        size_t          encx = 0;
-
-        memset( &pi, 0, sizeof(pi) );
-        memset( &cmn2, 0, sizeof(cmn2) );
-        cmn2.ttl   = N2N_DEFAULT_TTL;
-        cmn2.pc    = n2n_peer_info;
-        cmn2.flags = N2N_FLAGS_FROM_SUPERNODE;
-        memcpy( cmn2.community, *community, sizeof(n2n_community_t) );
-
-        memcpy( pi.mac, targetMac, N2N_MAC_SIZE );
-        pi.aflags = N2N_AFLAGS_PUNCH_REQUEST;
-        if (target->num_sockets > 1 && target->sockets[1].family != 0 &&
-            target->sockets[1].port != 0)
-            pi.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
-        if (target->sock.family == AF_INET)
-            pi.sockets[0] = target->sock;
-        else if (target->sock6.family == AF_INET6)
-            pi.sockets[0] = target->sock6;
-        if (target->sock6.family == AF_INET6) {
-            pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
-            pi.sock6 = target->sock6;
-        }
-        if (target->same_lan_as_sn) pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
-        if (target->version[0]) strncpy(pi.version, target->version, sizeof(pi.version) - 1);
-        if (target->os_name[0]) strncpy(pi.os_name, target->os_name, sizeof(pi.os_name) - 1);
-        pi.assigned_ip = target->assigned_ip;
-        pi.aflags |= N2N_NAT_AFLAGS(target->nat_type);
-
-        encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
-        {
-            SOCKET send_sock = (req_sa->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
-            socklen_t slen = (req_sa->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
-            sendto( send_sock, encbuf, encx, 0, req_sa, slen );
-        }
-    }
-
-    /* Simultaneous open to the target: the requester's address, punch.
-     *
-     * Use the address this QUERY_PEER actually arrived FROM rather than the
-     * requester's cached registration entry. When the requester has just
-     * rebound its local UDP socket (punch retry) the REGISTER_SUPER carrying
-     * the new mapping and this query race each other on the wire, and UDP
-     * gives no ordering guarantee -- so the cache can still hold the OLD,
-     * now-abandoned port. Pushing that stale address would send the target at
-     * a dead port and the punch could never complete. The live source address
-     * is by definition the requester's current NAT mapping. */
-    if ( requester )
-    {
-        n2n_PEER_INFO_t pi2;
-        n2n_common_t    cmn3;
-        uint8_t         encbuf2[N2N_SN_PKTBUF_SIZE];
-        size_t          encx2 = 0;
-        struct sockaddr_storage b_addr;
-        socklen_t b_len = sizeof(b_addr);
-
-        memset( &pi2, 0, sizeof(pi2) );
-        memset( &cmn3, 0, sizeof(cmn3) );
-        cmn3.ttl   = N2N_DEFAULT_TTL;
-        cmn3.pc    = n2n_peer_info;
-        cmn3.flags = N2N_FLAGS_FROM_SUPERNODE;
-        memcpy( cmn3.community, *community, sizeof(n2n_community_t) );
-
-        n2n_sock_t live_req;
-        sock_from_sender( &live_req, req_sa );
-
-        memcpy( pi2.mac, requesterMac, N2N_MAC_SIZE );
-        pi2.aflags = N2N_AFLAGS_PUNCH_REQUEST;
-        if (live_req.family != 0)
-            pi2.sockets[0] = live_req;
-        if (requester->sock6.family == AF_INET6) {
-            pi2.aflags |= N2N_AFLAGS_IPV6_SOCKET;
-            pi2.sock6 = requester->sock6;
-        }
-        if (requester->same_lan_as_sn) pi2.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
-        if (requester->version[0]) strncpy(pi2.version, requester->version, sizeof(pi2.version) - 1);
-        if (requester->os_name[0]) strncpy(pi2.os_name, requester->os_name, sizeof(pi2.os_name) - 1);
-        pi2.assigned_ip = requester->assigned_ip;
-        pi2.aflags |= N2N_NAT_AFLAGS(requester->nat_type);
-
-        encode_PEER_INFO( encbuf2, &encx2, &cmn3, &pi2 );
-        if ( fill_sockaddr( (struct sockaddr*)&b_addr, b_len, &target->sockets[0] ) == 0 )
-        {
-            SOCKET send_sock2 = (target->sockets[0].family == AF_INET6) ? sss->sock6 : sss->sock;
-            socklen_t slen2 = (target->sockets[0].family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
-            sendto( send_sock2, encbuf2, encx2, 0, (struct sockaddr*)&b_addr, slen2 );
-        }
-    }
-
-    traceEvent( TRACE_DEBUG, "QUERY_PEER answered: %s -> %s",
-                macaddr_str( mb1, requesterMac ), macaddr_str( mb2, targetMac ) );
-}
-
-/* Serve any pending address-refresh query whose target reappeared via a
- * fresh REGISTER_SUPER. Replayed on every registration so a delayed REGISTER
- * (e.g. after failover) still completes the query. */
-static void sn_flush_pending_for( n2n_sn_t * sss, const n2n_mac_t targetMac )
-{
-    for ( int i = 0; i < N2N_SN_PENDING_QUERY_MAX; i++ )
-    {
-        struct pending_query *q = &sss->pending_queries[i];
-        if ( q->requested_at == 0 ) continue;
-        if ( memcmp( q->target, targetMac, N2N_MAC_SIZE ) != 0 ) continue;
-        sn_answer_query( sss, &q->community, q->requester, q->target,
-                         (struct sockaddr*)&q->req_sa, q->req_sa_len );
-        q->requested_at = 0;
-    }
-}
-
 /** Examine a datagram and determine what to do with it.
  *
  */
@@ -3180,7 +2987,7 @@ static int process_udp( n2n_sn_t * sss,
                                           * wanting a matching source port (alt
                                           * probes) honor it */
                         const struct sockaddr * sender_sock,
-													socklen_t sender_sock_len,
+												socklen_t sender_sock_len,
                         const uint8_t * udp_buf,
                         size_t udp_size,
                         time_t now,
@@ -3708,49 +3515,130 @@ static int process_udp( n2n_sn_t * sss,
     else if ( msg_type == n2n_query_peer )
     {
         n2n_QUERY_PEER_t  query;
+        n2n_PEER_INFO_t   pi;
+        n2n_common_t      cmn2;
+        uint8_t           encbuf[N2N_SN_PKTBUF_SIZE];
+        size_t            encx = 0;
+
         decode_QUERY_PEER( &query, &cmn, udp_buf, &rem, &idx );
 
         struct peer_info *target = find_peer_by_mac( sss->edges, query.targetMac );
         if ( target )
         {
-            /* Freshness short-circuit: if the target registered within the
-             * timeout window its cached address is already current, so go
-             * straight to the punch — no nudge, no delay. Saving that RTT on
-             * the stable (EIM) peers is what keeps hole-punch from missing
-             * its opening window. Only a target that has gone silent warrants
-             * the deferred nudge path below. */
-            if ( now - target->last_seen <= N2N_SN_PENDING_QUERY_TIMEOUT )
-            {
-                sn_answer_query( sss, &cmn.community, query.srcMac, query.targetMac,
-                                 sender_sock, sender_sock_len );
+            memset( &cmn2, 0, sizeof(cmn2) );
+            cmn2.ttl   = N2N_DEFAULT_TTL;
+            cmn2.pc    = n2n_peer_info;
+            cmn2.flags = N2N_FLAGS_FROM_SUPERNODE;
+            memcpy( cmn2.community, cmn.community, sizeof(n2n_community_t) );
+
+            memcpy( pi.mac, query.targetMac, N2N_MAC_SIZE );
+            pi.aflags = N2N_AFLAGS_PUNCH_REQUEST;
+            if (target->num_sockets > 1 &&
+                target->sockets[1].family != 0 &&
+                target->sockets[1].port != 0)
+                pi.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
+            /* Always put IPv4 in sockets[0] if available, so both addresses are carried */
+            if (target->sock.family == AF_INET)
+                pi.sockets[0] = target->sock;
+            else if (target->sock6.family == AF_INET6)
+                pi.sockets[0] = target->sock6;
+            if (pi.aflags & N2N_AFLAGS_LOCAL_SOCKET)
+                pi.sockets[1] = target->sockets[1];
+            if (target->sock6.family == AF_INET6) {
+                pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+                pi.sock6 = target->sock6;
             }
-            else
+            if (target->same_lan_as_sn) {
+                pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
+            }
+            /* Include version and os_name so edge can display them */
+            if (target->version[0] != '\0') {
+                strncpy(pi.version, target->version, sizeof(pi.version) - 1);
+                pi.version[sizeof(pi.version) - 1] = '\0';
+            }
+            if (target->os_name[0] != '\0') {
+                strncpy(pi.os_name, target->os_name, sizeof(pi.os_name) - 1);
+                pi.os_name[sizeof(pi.os_name) - 1] = '\0';
+            }
+            pi.assigned_ip = target->assigned_ip;
+            /* Carry the peer's NAT type so edge mgmt can display it */
+            pi.aflags |= N2N_NAT_AFLAGS(target->nat_type);
+
+            encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
             {
-                /* Record the deferred answer and nudge the target to re-REGISTER,
-                 * so the eventual reply carries a fresh mapping rather than a
-                 * possibly-stale cached one. The answer is served from sn_answer_query
-                 * when the target's fresh REGISTER arrives (sn_flush_pending_for) or,
-                 * if it never does, by the timeout sweep in run_loop — so punching
-                 * always proceeds, fresh when possible and with the cached address
-                 * otherwise. */
-                int slot = -1, oldest = 0;
-                for ( int i = 0; i < N2N_SN_PENDING_QUERY_MAX; i++ )
+                SOCKET send_sock = (sender_sock->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
+                socklen_t slen = (sender_sock->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+                sendto( send_sock, encbuf, encx, 0, sender_sock, slen );
+            }
+
+            /* Simultaneous open: also push A's address to B so B punches back.
+             * Throttled: push only when A's address actually changed, or when
+             * the last push is stale — one push per punch cycle is enough. */
+            struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
+            if ( requester )
+            {
+                n2n_sock_t push_sock = (requester->sock.family == AF_INET) ? requester->sock : requester->sock6;
+                if ( push_sock.family != 0 &&
+                     ( sock_equal( &push_sock, &target->last_punch_push_sock ) != 0 ||
+                       now - target->last_punch_push >= SN_SIMULT_OPEN_INTERVAL ) )
                 {
-                    if ( sss->pending_queries[i].requested_at == 0 ) { slot = i; break; }
-                    if ( sss->pending_queries[oldest].requested_at >
-                         sss->pending_queries[i].requested_at ) oldest = i;
+                    n2n_PEER_INFO_t pi2;
+                    n2n_common_t    cmn3;
+                    uint8_t         encbuf2[N2N_SN_PKTBUF_SIZE];
+                    size_t          encx2 = 0;
+                    struct sockaddr_storage b_addr;
+                    socklen_t b_len = sizeof(b_addr);
+
+                    memset( &cmn3, 0, sizeof(cmn3) );
+                    cmn3.ttl   = N2N_DEFAULT_TTL;
+                    cmn3.pc    = n2n_peer_info;
+                    cmn3.flags = N2N_FLAGS_FROM_SUPERNODE;
+                    memcpy( cmn3.community, cmn.community, sizeof(n2n_community_t) );
+
+                    memcpy( pi2.mac, query.srcMac, N2N_MAC_SIZE );
+                    pi2.aflags = N2N_AFLAGS_PUNCH_REQUEST;
+                    if (requester->num_sockets > 1 &&
+                        requester->sockets[1].family != 0 &&
+                        requester->sockets[1].port != 0)
+                        pi2.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
+                    /* Always put IPv4 in sockets[0] if available */
+                    if (requester->sock.family == AF_INET)
+                        pi2.sockets[0] = requester->sock;
+                    else if (requester->sock6.family == AF_INET6)
+                        pi2.sockets[0] = requester->sock6;
+                    if (pi2.aflags & N2N_AFLAGS_LOCAL_SOCKET)
+                        pi2.sockets[1] = requester->sockets[1];
+                    if (requester->sock6.family == AF_INET6) {
+                        pi2.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+                        pi2.sock6 = requester->sock6;
+                    }
+                    if (requester->same_lan_as_sn) {
+                        pi2.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
+                    }
+                    /* Include version and os_name so edge can display them */
+                    if (requester->version[0] != '\0') {
+                        strncpy(pi2.version, requester->version, sizeof(pi2.version) - 1);
+                        pi2.version[sizeof(pi2.version) - 1] = '\0';
+                    }
+                    if (requester->os_name[0] != '\0') {
+                        strncpy(pi2.os_name, requester->os_name, sizeof(pi2.os_name) - 1);
+                        pi2.os_name[sizeof(pi2.os_name) - 1] = '\0';
+                    }
+                    pi2.assigned_ip = requester->assigned_ip;
+                    pi2.aflags |= N2N_NAT_AFLAGS(requester->nat_type);
+
+                    encode_PEER_INFO( encbuf2, &encx2, &cmn3, &pi2 );
+                    /* Send to B via appropriate socket */
+                    if ( fill_sockaddr((struct sockaddr*)&b_addr, b_len, &target->sockets[0]) == 0 ) {
+                        SOCKET send_sock2 = (target->sockets[0].family == AF_INET6) ? sss->sock6 : sss->sock;
+                        socklen_t slen2 = (target->sockets[0].family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+                        sendto( send_sock2, encbuf2, encx2, 0, (struct sockaddr*)&b_addr, slen2 );
+                        traceEvent(TRACE_DEBUG, "Simultaneous open: pushed A's addr to B for %s",
+                                   macaddr_str(mac_buf, query.targetMac));
+                    }
+                    target->last_punch_push = now;
+                    target->last_punch_push_sock = push_sock;
                 }
-                if ( slot < 0 ) slot = oldest; /* full table: evict the oldest */
-
-                struct pending_query *q = &sss->pending_queries[slot];
-                memset( q, 0, sizeof(*q) );
-                memcpy( q->requester, query.srcMac, N2N_MAC_SIZE );
-                memcpy( q->target, query.targetMac, N2N_MAC_SIZE );
-                memcpy( q->community, cmn.community, sizeof(n2n_community_t) );
-                memcpy( &q->req_sa, sender_sock, q->req_sa_len = sender_sock_len );
-                q->requested_at = now;
-
-                sn_send_nudge( sss, &cmn.community, query.targetMac );
             }
         }
     }
@@ -4161,11 +4049,6 @@ static int process_udp( n2n_sn_t * sss,
                      now, NULL, NULL,
                      N2N_NAT_FROM_AFLAGS(reg.aflags),
                      use_request_ip, use_requested_ip );
-
-        /* A fresh REGISTER just refreshed this edge's address — complete any
-         * pending QUERY_PEER waiting on it with the new mapping (or, if a
-         * query_only probe, answer in the ack path below). */
-        sn_flush_pending_for( sss, reg.edgeMac );
 
         /* Edge metadata changed while staying in the table: give the rest of the
          * community the fresh PEER_INFO. is_new_edge == 2 = NAT type changed
@@ -4928,20 +4811,6 @@ static int run_loop( n2n_sn_t * sss )
 
         purge_expired_registrations( &(sss->edges) );
         sn_ws_purge(sss, now);
-        /* Timeout sweep for deferred QUERY_PEER answers: if a nudged target
-         * never re-REGISTERed, fall back to its cached address and let the
-         * punch proceed — always better than a query that never resolves. */
-        for ( int i = 0; i < N2N_SN_PENDING_QUERY_MAX; i++ )
-        {
-            struct pending_query *q = &sss->pending_queries[i];
-            if ( q->requested_at != 0 &&
-                 now - q->requested_at >= N2N_SN_PENDING_QUERY_TIMEOUT )
-            {
-                sn_answer_query( sss, &q->community, q->requester, q->target,
-                                 (struct sockaddr*)&q->req_sa, q->req_sa_len );
-                q->requested_at = 0;
-            }
-        }
         if (sss->traffic_stats_enabled) {
             static time_t last_stats_purge = 0;
             purge_expired_community_stats(sss, &last_stats_purge, now);

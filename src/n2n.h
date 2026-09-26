@@ -291,6 +291,8 @@ struct peer_info {
     uint8_t             register_retry_count; /* REGISTER retries after PROBE_ACK, max 3 */
     time_t              last_register_sent;   /* time last REGISTER was sent after PROBE_ACK */
     time_t              direct_seen;       /* time of last direct P2P communication with this peer; 0=never */
+    time_t              last_punch_push;    /* sn: last simultaneous-open push time for this peer (throttle) */
+    n2n_sock_t          last_punch_push_sock; /* sn: requester sock last pushed to this peer (change detection) */
     time_t              p2p_est_time;      /* time P2P was established (set_peer_operational); for transition grace */
     n2n_sock_t          temp_local_sock;   /* dynamically selected best local IP for this peer */
     uint8_t             temp_local_sock_valid; /* 1 if temp_local_sock is valid */
