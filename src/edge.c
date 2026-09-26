@@ -5687,10 +5687,8 @@ process_n2n_packet:
                     /* Principle 8: detect an address change unconditionally —
                      * a different address means the peer's NAT mapping moved
                      * (restart / CGNAT re-map) and the old direct path is
-                     * dead. A direct_seen gate here would keep sending to the
-                     * stale address while the peer has already moved; the
-                     * change itself is the signal. When nothing changed the
-                     * check is a no-op, so busy direct paths are not disturbed.
+                     * dead. No gate here: the change itself is the signal,
+                     * and a fresh direct path simply has no change to detect.
                      * Reduced from 15s to 5s previously; now unconditional. */
                     if (pi.sockets[0].family == AF_INET) {
                         if (known->sock.family != AF_INET ||
@@ -5778,17 +5776,6 @@ process_n2n_packet:
                         if (nt) pending->nat_type = nt;
                     }
                     pending->last_seen = n2n_now();
-                    /* Symmetry fix: this address change demoted the peer but
-                     * left no punch running, so only our side would re-punch
-                     * once data flows — the peer keeps its stale direct state
-                     * and the two-way punch breaks. Punch right away: the
-                     * QUERY_PEER of our first round makes the SN push a PUNCH
-                     * to the peer, so both sides re-punch in sync. */
-                    pending->punch_failed = 0;
-                    if (pending->sock.family == AF_INET && eee->udp_sock != -1)
-                        try_send_register(eee, 1, pi.mac, &pending->sock);
-                    else if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1)
-                        try_send_register(eee, 1, pi.mac, &pending->sock6);
                     PEERS_UNLOCK(eee);
                     if (eee->enable_gaming_mode && pi.assigned_ip != 0) {
                         uint8_t probe[42];
@@ -5855,36 +5842,38 @@ process_n2n_packet:
                 return 1;
             }
 
-            /* PUNCH is the SN's re-punch command (user design: SN directs,
-             * the edge obeys): clear the old relation with this peer and
-             * punch again unconditionally — no direct-seen freeze, no address
-             * comparison. If the direct path is actually still alive, the
-             * early-stop in check_punch_timeouts halts the new round on its
-             * first tick (direct_seen >= punch_start_time), costing one round
-             * at most. Metadata is refreshed by the demote path below. */
+            /* PUNCH is the SN's paired reply to a QUERY_PEER (the peer with
+             * communication demand). Obey it when the address really changed
+             * — that is the signal that the peer's mapping moved and a fresh
+             * punch round is worth its 20 tries (user: "地址变了就该尝试直连").
+             * If the address is unchanged the direct path is still alive and
+             * the PUNCH is only a confirmation of our query: refresh metadata
+             * and leave the connection alone, or every paired reply would
+             * tear a working direct path apart. */
             if (known) {
-                /* Stale-command guard: the SN cannot know a direct path was
-                 * just proven, so the PUNCH reply to the round we already
-                 * completed can still be in flight for one cycle. If this
-                 * peer's direct path is fresh (<= one punch cycle) and the
-                 * PUNCH carries the very same address, obeying it would tear
-                 * the direct connection apart for nothing — the early-stop
-                 * already ended the loop, and a direct-connected edge no
-                 * longer queries, so the SN will send no further PUNCH. Real
-                 * re-punches (address changed) and relay-only peers still
-                 * fall through and demote unconditionally below. */
-                if (known->direct_seen != 0 &&
-                    (now - known->direct_seen) < PUNCH_CYCLE_INTERVAL)
-                {
-                    int addr_same = 0;
-                    if (known->sock.family == AF_INET && pi.sockets[0].family == AF_INET)
-                        addr_same = (sock_equal(&known->sock, &pi.sockets[0]) == 0);
-                    if (!addr_same && known->sock6.family == AF_INET6 && pi.sock6.family == AF_INET6)
-                        addr_same = (sock_equal(&known->sock6, &pi.sock6) == 0);
-                    if (addr_same) {
-                        PEERS_UNLOCK(eee);
-                        return 1;
+                /* Address unchanged = direct path alive, no re-punch needed. */
+                int addr_same = 0;
+                if (known->sock.family == AF_INET && pi.sockets[0].family == AF_INET)
+                    addr_same = (sock_equal(&known->sock, &pi.sockets[0]) == 0);
+                if (!addr_same && known->sock6.family == AF_INET6 && pi.sock6.family == AF_INET6)
+                    addr_same = (sock_equal(&known->sock6, &pi.sock6) == 0);
+                if (addr_same) {
+                    if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                        pi.sockets[1].family != 0 && pi.sockets[1].port != 0) {
+                        known->sockets[1] = pi.sockets[1];
+                        known->num_sockets = 2;
                     }
+                    if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) && pi.sock6.family == AF_INET6)
+                        known->sock6 = pi.sock6;
+                    if (pi.version[0]) strncpy(known->version, pi.version, sizeof(known->version) - 1);
+                    if (pi.os_name[0]) strncpy(known->os_name, pi.os_name, sizeof(known->os_name) - 1);
+                    if (pi.assigned_ip) known->assigned_ip = pi.assigned_ip;
+                    {
+                        uint8_t nt = N2N_NAT_FROM_AFLAGS(pi.aflags);
+                        if (nt) known->nat_type = nt; /* 0 = sn did not report */
+                    }
+                    PEERS_UNLOCK(eee);
+                    return 1;
                 }
                 /* Drop any older pending entry for the same mac before
                  * demoting, or every PUNCH reply would accumulate a
