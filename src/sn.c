@@ -846,7 +846,12 @@ typedef struct sn_stats sn_stats_t;
  * (which carries no sn1 hint and no sn2 token) is admitted when -E is set. */
 #define PROMOTED_LIST_MAX  32
 #define PROMOTED_TTL       180   /* refreshed by probes and registrations */
-#define SN_SIMULT_OPEN_INTERVAL 30 /* sec: at most one simultaneous-open push per target per interval */
+
+/* How long a QUERY_PEER reply is held while waiting for the queried peer to
+ * query back (punch-pair synchronization): once both queries arrive within
+ * this window the sn replies to both at the same moment so both edges start
+ * their punch round together, each receiving exactly one PEER_INFO. */
+#define PUNCH_PAIR_WINDOW  1     /* seconds (matches the edge's 1s punch round) */
 
 struct promoted_peer {
     n2n_mac_t       mac;
@@ -2979,6 +2984,102 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
     advertise_relay_to( sss, cmn, relay, relay );
 }
 
+/** Build a PUNCH-flagged PEER_INFO describing `who` (the edge whose address
+ *  the requester needs) and encode it into encbuf. Returns the encoded size.
+ *  Shared by the QUERY_PEER reply paths and the punch-pair timeout fallback. */
+static size_t sn_build_punch_info( const n2n_community_t * community,
+                                   struct peer_info * who,
+                                   uint8_t * encbuf )
+{
+    n2n_common_t    cmn2;
+    n2n_PEER_INFO_t pi;
+    size_t          encx = 0;
+
+    memset( &cmn2, 0, sizeof(cmn2) );
+    cmn2.ttl   = N2N_DEFAULT_TTL;
+    cmn2.pc    = n2n_peer_info;
+    cmn2.flags = N2N_FLAGS_FROM_SUPERNODE;
+    memcpy( cmn2.community, community, sizeof(n2n_community_t) );
+
+    memset( &pi, 0, sizeof(pi) );
+    memcpy( pi.mac, who->mac_addr, N2N_MAC_SIZE );
+    pi.aflags = N2N_AFLAGS_PUNCH_REQUEST;
+    if ( who->num_sockets > 1 &&
+         who->sockets[1].family != 0 &&
+         who->sockets[1].port != 0 )
+        pi.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
+    /* Always put IPv4 in sockets[0] if available, so both addresses are carried */
+    if ( who->sock.family == AF_INET )
+        pi.sockets[0] = who->sock;
+    else if ( who->sock6.family == AF_INET6 )
+        pi.sockets[0] = who->sock6;
+    if ( pi.aflags & N2N_AFLAGS_LOCAL_SOCKET )
+        pi.sockets[1] = who->sockets[1];
+    if ( who->sock6.family == AF_INET6 ) {
+        pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+        pi.sock6 = who->sock6;
+    }
+    if ( who->same_lan_as_sn )
+        pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
+    if ( who->version[0] != '\0' ) {
+        strncpy( pi.version, who->version, sizeof(pi.version) - 1 );
+        pi.version[sizeof(pi.version) - 1] = '\0';
+    }
+    if ( who->os_name[0] != '\0' ) {
+        strncpy( pi.os_name, who->os_name, sizeof(pi.os_name) - 1 );
+        pi.os_name[sizeof(pi.os_name) - 1] = '\0';
+    }
+    pi.assigned_ip = who->assigned_ip;
+    pi.aflags |= N2N_NAT_AFLAGS( who->nat_type );
+
+    encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
+    return encx;
+}
+
+/** Send a PUNCH PEER_INFO describing `who` to the registered sock `dst`.
+ *  Used for the paired reply to the target and the timeout fallback. */
+static void sn_send_punch_to_sock( n2n_sn_t * sss,
+                                   const n2n_community_t * community,
+                                   struct peer_info * who,
+                                   const n2n_sock_t * dst )
+{
+    uint8_t encbuf[N2N_SN_PKTBUF_SIZE];
+    size_t  encx = sn_build_punch_info( community, who, encbuf );
+    struct sockaddr_storage addr;
+    socklen_t alen = sizeof(addr);
+
+    if ( fill_sockaddr( (struct sockaddr*)&addr, alen, dst ) == 0 ) {
+        SOCKET send_sock = (dst->family == AF_INET6) ? sss->sock6 : sss->sock;
+        socklen_t slen = (dst->family == AF_INET6) ? sizeof(struct sockaddr_in6)
+                                                   : sizeof(struct sockaddr_in);
+        sendto( send_sock, encbuf, encx, 0, (struct sockaddr*)&addr, slen );
+    }
+}
+
+/** Punch-pair wait expiry: an edge queried but its partner never queried back
+ *  within PUNCH_PAIR_WINDOW. Answer it alone and, as a fallback, push its
+ *  address to the target (simultaneous open) so the target can punch back.
+ *  Called from the main loop at the ~100ms select cadence. */
+static void sn_punch_pair_timeout( n2n_sn_t * sss, time_t now )
+{
+    struct peer_info * scan;
+    for ( scan = sss->edges; scan; scan = scan->next )
+    {
+        if ( scan->punch_wait_since == 0 )
+            continue;
+        if ( now - scan->punch_wait_since <= PUNCH_PAIR_WINDOW )
+            continue;
+
+        scan->punch_wait_since = 0;
+        struct peer_info * target = find_peer_by_mac( sss->edges, scan->punch_wait_target );
+        if ( !target )
+            continue;
+
+        sn_send_punch_to_sock( sss, &scan->community_name, target, &scan->sockets[0] );
+        sn_send_punch_to_sock( sss, &scan->community_name, scan, &target->sockets[0] );
+    }
+}
+
 /** Examine a datagram and determine what to do with it.
  *
  */
@@ -3515,131 +3616,49 @@ static int process_udp( n2n_sn_t * sss,
     else if ( msg_type == n2n_query_peer )
     {
         n2n_QUERY_PEER_t  query;
-        n2n_PEER_INFO_t   pi;
-        n2n_common_t      cmn2;
         uint8_t           encbuf[N2N_SN_PKTBUF_SIZE];
-        size_t            encx = 0;
 
         decode_QUERY_PEER( &query, &cmn, udp_buf, &rem, &idx );
 
         struct peer_info *target = find_peer_by_mac( sss->edges, query.targetMac );
-        if ( target )
+        if ( !target ) return 0;   /* unknown target: nothing to report (as before) */
+
+        struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
+        if ( !requester )
         {
-            memset( &cmn2, 0, sizeof(cmn2) );
-            cmn2.ttl   = N2N_DEFAULT_TTL;
-            cmn2.pc    = n2n_peer_info;
-            cmn2.flags = N2N_FLAGS_FROM_SUPERNODE;
-            memcpy( cmn2.community, cmn.community, sizeof(n2n_community_t) );
-
-            memcpy( pi.mac, query.targetMac, N2N_MAC_SIZE );
-            pi.aflags = N2N_AFLAGS_PUNCH_REQUEST;
-            if (target->num_sockets > 1 &&
-                target->sockets[1].family != 0 &&
-                target->sockets[1].port != 0)
-                pi.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
-            /* Always put IPv4 in sockets[0] if available, so both addresses are carried */
-            if (target->sock.family == AF_INET)
-                pi.sockets[0] = target->sock;
-            else if (target->sock6.family == AF_INET6)
-                pi.sockets[0] = target->sock6;
-            if (pi.aflags & N2N_AFLAGS_LOCAL_SOCKET)
-                pi.sockets[1] = target->sockets[1];
-            if (target->sock6.family == AF_INET6) {
-                pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
-                pi.sock6 = target->sock6;
-            }
-            if (target->same_lan_as_sn) {
-                pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
-            }
-            /* Include version and os_name so edge can display them */
-            if (target->version[0] != '\0') {
-                strncpy(pi.version, target->version, sizeof(pi.version) - 1);
-                pi.version[sizeof(pi.version) - 1] = '\0';
-            }
-            if (target->os_name[0] != '\0') {
-                strncpy(pi.os_name, target->os_name, sizeof(pi.os_name) - 1);
-                pi.os_name[sizeof(pi.os_name) - 1] = '\0';
-            }
-            pi.assigned_ip = target->assigned_ip;
-            /* Carry the peer's NAT type so edge mgmt can display it */
-            pi.aflags |= N2N_NAT_AFLAGS(target->nat_type);
-
-            encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
+            /* Requester not registered (a punch round re-registers first, so
+             * this should be rare): reply immediately, no pairing possible. */
+            size_t encx = sn_build_punch_info( &cmn.community, target, encbuf );
+            SOCKET send_sock = (sender_sock->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
+            sendto( send_sock, encbuf, encx, 0, sender_sock, sender_sock_len );
+        }
+        else if ( target->punch_wait_since != 0 &&
+                  memcmp( target->punch_wait_target, query.srcMac, N2N_MAC_SIZE ) == 0 &&
+                  now - target->punch_wait_since <= PUNCH_PAIR_WINDOW )
+        {
+            /* PAIRED: the queried peer was itself waiting for us. Reply to
+             * both right now, each side gets exactly one PEER_INFO and both
+             * punch rounds start at the same moment. */
+            target->punch_wait_since    = 0;
+            requester->punch_wait_since = 0;
             {
+                size_t encx = sn_build_punch_info( &cmn.community, target, encbuf );
                 SOCKET send_sock = (sender_sock->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
-                socklen_t slen = (sender_sock->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
-                sendto( send_sock, encbuf, encx, 0, sender_sock, slen );
+                sendto( send_sock, encbuf, encx, 0, sender_sock, sender_sock_len );
             }
-
-            /* Simultaneous open: also push A's address to B so B punches back.
-             * Throttled: push only when A's address actually changed, or when
-             * the last push is stale — one push per punch cycle is enough. */
-            struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
-            if ( requester )
-            {
-                n2n_sock_t push_sock = (requester->sock.family == AF_INET) ? requester->sock : requester->sock6;
-                if ( push_sock.family != 0 &&
-                     ( sock_equal( &push_sock, &target->last_punch_push_sock ) != 0 ||
-                       now - target->last_punch_push >= SN_SIMULT_OPEN_INTERVAL ) )
-                {
-                    n2n_PEER_INFO_t pi2;
-                    n2n_common_t    cmn3;
-                    uint8_t         encbuf2[N2N_SN_PKTBUF_SIZE];
-                    size_t          encx2 = 0;
-                    struct sockaddr_storage b_addr;
-                    socklen_t b_len = sizeof(b_addr);
-
-                    memset( &cmn3, 0, sizeof(cmn3) );
-                    cmn3.ttl   = N2N_DEFAULT_TTL;
-                    cmn3.pc    = n2n_peer_info;
-                    cmn3.flags = N2N_FLAGS_FROM_SUPERNODE;
-                    memcpy( cmn3.community, cmn.community, sizeof(n2n_community_t) );
-
-                    memcpy( pi2.mac, query.srcMac, N2N_MAC_SIZE );
-                    pi2.aflags = N2N_AFLAGS_PUNCH_REQUEST;
-                    if (requester->num_sockets > 1 &&
-                        requester->sockets[1].family != 0 &&
-                        requester->sockets[1].port != 0)
-                        pi2.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
-                    /* Always put IPv4 in sockets[0] if available */
-                    if (requester->sock.family == AF_INET)
-                        pi2.sockets[0] = requester->sock;
-                    else if (requester->sock6.family == AF_INET6)
-                        pi2.sockets[0] = requester->sock6;
-                    if (pi2.aflags & N2N_AFLAGS_LOCAL_SOCKET)
-                        pi2.sockets[1] = requester->sockets[1];
-                    if (requester->sock6.family == AF_INET6) {
-                        pi2.aflags |= N2N_AFLAGS_IPV6_SOCKET;
-                        pi2.sock6 = requester->sock6;
-                    }
-                    if (requester->same_lan_as_sn) {
-                        pi2.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
-                    }
-                    /* Include version and os_name so edge can display them */
-                    if (requester->version[0] != '\0') {
-                        strncpy(pi2.version, requester->version, sizeof(pi2.version) - 1);
-                        pi2.version[sizeof(pi2.version) - 1] = '\0';
-                    }
-                    if (requester->os_name[0] != '\0') {
-                        strncpy(pi2.os_name, requester->os_name, sizeof(pi2.os_name) - 1);
-                        pi2.os_name[sizeof(pi2.os_name) - 1] = '\0';
-                    }
-                    pi2.assigned_ip = requester->assigned_ip;
-                    pi2.aflags |= N2N_NAT_AFLAGS(requester->nat_type);
-
-                    encode_PEER_INFO( encbuf2, &encx2, &cmn3, &pi2 );
-                    /* Send to B via appropriate socket */
-                    if ( fill_sockaddr((struct sockaddr*)&b_addr, b_len, &target->sockets[0]) == 0 ) {
-                        SOCKET send_sock2 = (target->sockets[0].family == AF_INET6) ? sss->sock6 : sss->sock;
-                        socklen_t slen2 = (target->sockets[0].family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
-                        sendto( send_sock2, encbuf2, encx2, 0, (struct sockaddr*)&b_addr, slen2 );
-                        traceEvent(TRACE_DEBUG, "Simultaneous open: pushed A's addr to B for %s",
-                                   macaddr_str(mac_buf, query.targetMac));
-                    }
-                    target->last_punch_push = now;
-                    target->last_punch_push_sock = push_sock;
-                }
-            }
+            sn_send_punch_to_sock( sss, &cmn.community, requester, &target->sockets[0] );
+            traceEvent( TRACE_DEBUG, "Punch-pair matched %s<->%s",
+                        macaddr_str(mac_buf, query.targetMac),
+                        macaddr_str(mac_buf2, query.srcMac) );
+        }
+        else
+        {
+            /* Not paired yet: hold this reply for up to PUNCH_PAIR_WINDOW and
+             * wait for the other side's query so both punch together; the
+             * timeout scan in the main loop then answers alone (plus the
+             * simultaneous-open push to the target as a fallback). */
+            memcpy( requester->punch_wait_target, query.targetMac, N2N_MAC_SIZE );
+            requester->punch_wait_since = now;
         }
     }
     else if ( msg_type == MSG_TYPE_REGISTER_SUPER )
@@ -4841,6 +4860,10 @@ static int run_loop( n2n_sn_t * sss )
 
         /* Deferred full-cone N2NF probes (#2/#3, staggered). */
         fc_probes_tick( sss, now );
+
+        /* Punch-pair wait timeouts: answer held QUERY_PEER replies alone
+         * (plus the simultaneous-open push) once the pairing window passed. */
+        sn_punch_pair_timeout( sss, now );
 
         /* sn1 -> sn2 brother_reg, every 31s. */
         if (sss->backup_addr_text[0])

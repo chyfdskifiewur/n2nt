@@ -5768,6 +5768,29 @@ process_n2n_packet:
                 return 1;
             }
 
+            /* Direct connection still alive (<30s): never demote this peer to
+             * pending nor refresh its punch addresses on a PUNCH reply — a
+             * fresher (but possibly different) address must not disturb an
+             * established direct path. Only metadata is updated. */
+            if (known && known->direct_seen != 0 &&
+                (now - known->direct_seen) < 30)
+            {
+                if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                    pi.sockets[1].family != 0 && pi.sockets[1].port != 0) {
+                    known->sockets[1] = pi.sockets[1];
+                    known->num_sockets = 2;
+                }
+                if (pi.version[0]) strncpy(known->version, pi.version, sizeof(known->version) - 1);
+                if (pi.os_name[0]) strncpy(known->os_name, pi.os_name, sizeof(known->os_name) - 1);
+                if (pi.assigned_ip) known->assigned_ip = pi.assigned_ip;
+                {
+                    uint8_t nt = N2N_NAT_FROM_AFLAGS(pi.aflags);
+                    if (nt) known->nat_type = nt; /* 0 = sn did not report */
+                }
+                PEERS_UNLOCK(eee);
+                return 1;
+            }
+
             if (known) {
                 struct peer_info *prev = NULL, *scan = eee->known_peers;
                 while (scan && memcmp(scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
@@ -5831,6 +5854,21 @@ process_n2n_packet:
                 MACSTR_TMP(mac_tmp);
                 traceEvent(TRACE_INFO, "PEER_INFO PUNCH for %s - punch running, sock refreshed",
                            macaddr_str(mac_tmp, pi.mac));
+                /* Reply to our own QUERY_PEER (or a push) refreshed the address
+                 * above: probe the just-downloaded address right away so a
+                 * fresher address punches in this round instead of waiting for
+                 * the next cycle tick. Round state is left untouched (no
+                 * punch_cycle/last_punch_probe changes). */
+                if (pending->sock.family == AF_INET && eee->udp_sock != -1)
+                {
+                    send_probe(eee, &pending->sock, pending->mac_addr);
+                    send_register(eee, &pending->sock);
+                }
+                else if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1)
+                {
+                    send_probe(eee, &pending->sock6, pending->mac_addr);
+                    send_register(eee, &pending->sock6);
+                }
             }
             (void)try_peer_lan_ipv4; /* keep referenced; LAN-first variant stays unused, PUNCH path mirrors send_PACKET's plain REGISTER punch */
 

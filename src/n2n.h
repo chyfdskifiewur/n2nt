@@ -291,8 +291,6 @@ struct peer_info {
     uint8_t             register_retry_count; /* REGISTER retries after PROBE_ACK, max 3 */
     time_t              last_register_sent;   /* time last REGISTER was sent after PROBE_ACK */
     time_t              direct_seen;       /* time of last direct P2P communication with this peer; 0=never */
-    time_t              last_punch_push;    /* sn: last simultaneous-open push time for this peer (throttle) */
-    n2n_sock_t          last_punch_push_sock; /* sn: requester sock last pushed to this peer (change detection) */
     time_t              p2p_est_time;      /* time P2P was established (set_peer_operational); for transition grace */
     n2n_sock_t          temp_local_sock;   /* dynamically selected best local IP for this peer */
     uint8_t             temp_local_sock_valid; /* 1 if temp_local_sock is valid */
@@ -300,6 +298,11 @@ struct peer_info {
     uint8_t             p2p_logged;        /* 1 if P2P direct message already printed for current state */
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
+    /* Punch-pair wait (sn-side): this edge queried about a peer and is waiting
+     * up to PUNCH_PAIR_WINDOW for that peer to query back, so both punch rounds
+     * start at the same moment. Zeroed = not waiting. */
+    n2n_mac_t           punch_wait_target; /* sn: peer whose query we're waiting for */
+    time_t              punch_wait_since;  /* sn: when the wait started (0 = not waiting) */
     time_t              relay_adv_time;    /* sn: last time this edge was advertised as the relay (throttle) */
     time_t              sn_fwd_first;      /* sn: first time this edge's unicast data was relayed via SN (0=never); gates community-relay announcement */
     uint8_t             relay_willing;     /* sn: edge's relay stance: 0=refuse,1=default,2=willing,3=force */
