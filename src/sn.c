@@ -851,7 +851,7 @@ typedef struct sn_stats sn_stats_t;
  * query back (punch-pair synchronization): once both queries arrive within
  * this window the sn replies to both at the same moment so both edges start
  * their punch round together, each receiving exactly one PEER_INFO. */
-#define PUNCH_PAIR_WINDOW  1     /* seconds (matches the edge's 1s punch round) */
+#define PUNCH_PAIR_WINDOW  3     /* seconds (matches the edge's 3s punch round) */
 
 struct promoted_peer {
     n2n_mac_t       mac;
@@ -3624,6 +3624,15 @@ static int process_udp( n2n_sn_t * sss,
         if ( !target ) return 0;   /* unknown target: nothing to report (as before) */
 
         struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
+        /* Remember the latest interest in the target: on a public-address
+         * change (NAT4 re-map during punching) the sn pushes a PUNCH
+         * PEER_INFO straight back to this requester so it re-punches the
+         * fresh endpoint right away. */
+        if ( requester && memcmp( target->mac_addr, query.srcMac, N2N_MAC_SIZE ) != 0 )
+        {
+            memcpy( target->last_queryer, query.srcMac, N2N_MAC_SIZE );
+            target->last_queryer_seen = now;
+        }
         if ( !requester )
         {
             /* Requester not registered (a punch round re-registers first, so
@@ -4079,6 +4088,26 @@ static int process_udp( n2n_sn_t * sss,
             push_nat_to_community( sss,
                                    find_peer_by_mac(sss->edges, reg.edgeMac),
                                    cmn.community );
+
+        /* NAT4 re-map (is_new_edge == 3): push the fresh address as a PUNCH
+         * PEER_INFO straight to the edge that most recently queried about us
+         * (within 60s), so it immediately re-punches the new endpoint instead
+         * of punching the abandoned one for the rest of its round. */
+        if ( is_new_edge == 3 )
+        {
+            struct peer_info *chg = find_peer_by_mac( sss->edges, reg.edgeMac );
+            if ( chg && chg->last_queryer_seen != 0 &&
+                 now - chg->last_queryer_seen <= 60 )
+            {
+                struct peer_info *q = find_peer_by_mac( sss->edges, chg->last_queryer );
+                if ( q && memcmp( q->community_name, cmn.community, sizeof(n2n_community_t) ) == 0 )
+                {
+                    uint8_t punch_buf[N2N_SN_PKTBUF_SIZE];
+                    size_t  punch_encx = sn_build_punch_info( &cmn.community, chg, punch_buf );
+                    sn_send_to_peer( sss, q, punch_buf, punch_encx );
+                }
+            }
+        }
 
         /* Brand-new edge (update_edge == 1) or known edge whose public address
          * changed (== 3: its NAT mapping was recreated, so the stranger window

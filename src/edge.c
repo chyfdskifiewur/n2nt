@@ -1795,6 +1795,9 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                          * endpoint each round), fixed -p port stays the same. */
                         if (setup_sockets(eee, (int)eee->local_port) < 0)
                             traceEvent(TRACE_ERROR, "Punch round: rebind of the local port failed");
+                        traceEvent(TRACE_INFO, "Punch round %u for %s: rebound socket (port %u)",
+                                   scan->punch_cycle, PEER_ID(mac_tmp, scan),
+                                   (unsigned int)eee->local_port);
                     }
                     send_register_super( eee, &(eee->supernode), 0, 0, NULL );
                     send_query_peer( eee, scan->mac_addr );
@@ -5894,7 +5897,13 @@ process_n2n_packet:
             if (pi.version[0]) strncpy(pending->version, pi.version, sizeof(pending->version) - 1);
             if (pi.os_name[0]) strncpy(pending->os_name, pi.os_name, sizeof(pending->os_name) - 1);
             pending->assigned_ip = pi.assigned_ip;
-            pending->last_seen = n2n_now();
+            /* Once the punch was given up on, do NOT refresh last_seen on
+             * PUNCH replies: they keep flowing while punching stays abandoned
+             * (sn pushes) and a fresh last_seen would never let purge_peer_list
+             * retire the dead entry. The address is still refreshed above for
+             * the 40s retry in check_punch_timeouts. */
+            if (!pending->punch_failed)
+                pending->last_seen = n2n_now();
             if ( pending->punch_start_time == 0 )
             {
                 /* This PEER_INFO carries the PUNCH flag, which the supernode
@@ -5907,6 +5916,9 @@ process_n2n_packet:
                 pending->register_retry_count = 0;
                 pending->psp_logged = 0;
                 pending->p2p_logged = 0;
+                MACSTR_TMP(mac_tmp);
+                traceEvent(TRACE_INFO, "PUNCH for %s: starting punch round",
+                           macaddr_str(mac_tmp, pi.mac));
                 if (pending->sock.family == AF_INET && eee->udp_sock != -1)
                     try_send_register(eee, 1, pi.mac, &pending->sock);
                 else if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1)
