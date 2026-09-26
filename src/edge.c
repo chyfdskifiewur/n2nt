@@ -1714,6 +1714,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
     struct peer_info * scan = eee->pending_peers;
     struct peer_info * prev = NULL;
     MACSTR_TMP(mac_tmp);
+    int punch_swapped = 0;  /* fresh source port per tick, shared by all punching peers */
     while ( scan ) {
         /* LAN punch phase: retransmit REGISTER to LAN address */
         if ( scan->num_sockets == 2 && !scan->lan_punch_done &&
@@ -1765,14 +1766,29 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             }
             else if ( scan->punch_cycle < PUNCH_CYCLES )
             {
-                /* One round per second, as requested: re-register to the SN on
-                 * the same UDP socket (source port stays unchanged), download
-                 * the peer's latest address from the SN (the PEER_INFO reply
-                 * refreshes scan->sock in handle_PEER_INFO), then PROBE that
-                 * freshly downloaded address, then REGISTER. */
+                /* One round per second, as requested: re-register to the SN on a
+                 * freshly rebound socket (brand-new source port, brand-new NAT
+                 * mapping), download the peer's latest address from the SN (the
+                 * PEER_INFO reply refreshes scan->sock in handle_PEER_INFO), then
+                 * PROBE that freshly downloaded address, then REGISTER. */
                 time_t cycle_start = scan->punch_start_time + scan->punch_cycle * PUNCH_CYCLE_INTERVAL;
                 if ( now >= cycle_start && scan->last_punch_probe < cycle_start )
                 {
+                    /* Every punch round rebinds the socket: random-port edges
+                     * land on a brand-new source port (new NAT mapping), while
+                     * fixed-port edges (-p) keep their port unchanged and only
+                     * the peer side changes. At most once per tick so several
+                     * punching peers share the same fresh socket. */
+                    if (!eee->use_ws && !punch_swapped)
+                    {
+                        punch_swapped = 1;
+                        closesocket(eee->udp_sock);   eee->udp_sock = -1;
+                        if (eee->udp_sock6 != -1) { closesocket(eee->udp_sock6); eee->udp_sock6 = -1; }
+                        /* Rebind to the configured local port: 0 = random (new
+                         * endpoint each round), fixed -p port stays the same. */
+                        if (setup_sockets(eee, (int)eee->local_port) < 0)
+                            traceEvent(TRACE_ERROR, "Punch round: rebind of the local port failed");
+                    }
                     send_register_super( eee, &(eee->supernode), 0, 0, NULL );
                     send_query_peer( eee, scan->mac_addr );
                     scan->last_query_sent = now;
@@ -5851,24 +5867,29 @@ process_n2n_packet:
                  * reply to our own QUERY_PEER): just refresh the address so the
                  * next round punches with the newest info. Never restart the
                  * loop here, or every PEER_INFO reply would re-query the SN. */
-                MACSTR_TMP(mac_tmp);
-                traceEvent(TRACE_INFO, "PEER_INFO PUNCH for %s - punch running, sock refreshed",
-                           macaddr_str(mac_tmp, pi.mac));
-                /* Reply to our own QUERY_PEER (or a push) refreshed the address
-                 * above: probe the just-downloaded address right away so a
-                 * fresher address punches in this round instead of waiting for
-                 * the next cycle tick. Round state is left untouched (no
-                 * punch_cycle/last_punch_probe changes). */
-                if (pending->sock.family == AF_INET && eee->udp_sock != -1)
+                if (!pending->punch_failed)
                 {
-                    send_probe(eee, &pending->sock, pending->mac_addr);
-                    send_register(eee, &pending->sock);
+                    MACSTR_TMP(mac_tmp);
+                    traceEvent(TRACE_INFO, "PEER_INFO PUNCH for %s - punch running, sock refreshed",
+                               macaddr_str(mac_tmp, pi.mac));
+                    /* Reply to our own QUERY_PEER (or a push) refreshed the address
+                     * above: probe the just-downloaded address right away so a
+                     * fresher address punches in this round instead of waiting for
+                     * the next cycle tick. Round state is left untouched (no
+                     * punch_cycle/last_punch_probe changes). */
+                    if (pending->sock.family == AF_INET && eee->udp_sock != -1)
+                    {
+                        send_probe(eee, &pending->sock, pending->mac_addr);
+                        send_register(eee, &pending->sock);
+                    }
+                    else if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1)
+                    {
+                        send_probe(eee, &pending->sock6, pending->mac_addr);
+                        send_register(eee, &pending->sock6);
+                    }
                 }
-                else if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1)
-                {
-                    send_probe(eee, &pending->sock6, pending->mac_addr);
-                    send_register(eee, &pending->sock6);
-                }
+                /* punch_failed: the address was still refreshed above for the
+                 * 40s retry in check_punch_timeouts; stay silent, no probing. */
             }
             (void)try_peer_lan_ipv4; /* keep referenced; LAN-first variant stays unused, PUNCH path mirrors send_PACKET's plain REGISTER punch */
 
