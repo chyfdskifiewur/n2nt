@@ -287,6 +287,7 @@ struct peer_info {
     time_t              last_query_sent;   /* time last query_peer was sent, for rate-limiting */
     time_t              last_punch_probe;  /* time last PROBE was sent during hole-punch */
     uint8_t             punch_retry_count; /* number of punch retries, remove after max */
+    uint8_t             punch_cycle;       /* current PROBE+REGISTER round (0..PUNCH_CYCLES) in the punch loop */
     uint8_t             register_retry_count; /* REGISTER retries after PROBE_ACK, max 3 */
     time_t              last_register_sent;   /* time last REGISTER was sent after PROBE_ACK */
     time_t              direct_seen;       /* time of last direct P2P communication with this peer; 0=never */
@@ -693,13 +694,6 @@ struct n2n_edge
     /* Gaming mode (-G): actively probe peers to trigger P2P hole-punching */
     int                 enable_gaming_mode;
     int                 gaming_started;
-
-    /* One-shot: the very first registration of this process asks the SN to
-     * push the full peer list. Cleared once that request has been sent, so
-     * later re-registrations (cookie refresh, NAT rebind, retries) stay
-     * quiet. Without it a restarted edge whose previous SN entry has not
-     * expired yet is treated as a known edge and receives no peer list. */
-    int                 want_first_peer_list;
 
     /* Statistics */
     size_t              tx_p2p;
