@@ -663,12 +663,20 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
 #endif
     }
 
-    if (has_ipv4 && has_ipv6)
-        traceEvent(TRACE_NORMAL, "Edge support: IPv4+IPv6 (dual-stack)");
-    else if (has_ipv6)
-        traceEvent(TRACE_NORMAL, "Edge support: IPv6 only");
-    else
-        traceEvent(TRACE_NORMAL, "Edge support: IPv4 only");
+    /* Only log the stack support once per process: setup_sockets() runs on
+     * every punch-round rebind, and the dual-stack line would otherwise spam
+     * the log every few seconds while punching. */
+    static int support_logged = 0;
+    if (!support_logged)
+    {
+        support_logged = 1;
+        if (has_ipv4 && has_ipv6)
+            traceEvent(TRACE_NORMAL, "Edge support: IPv4+IPv6 (dual-stack)");
+        else if (has_ipv6)
+            traceEvent(TRACE_NORMAL, "Edge support: IPv6 only");
+        else
+            traceEvent(TRACE_NORMAL, "Edge support: IPv4 only");
+    }
 
     return 0;
 }
