@@ -847,12 +847,6 @@ typedef struct sn_stats sn_stats_t;
 #define PROMOTED_LIST_MAX  32
 #define PROMOTED_TTL       180   /* refreshed by probes and registrations */
 
-/* How long a QUERY_PEER reply is held while waiting for the queried peer to
- * query back (punch-pair synchronization): once both queries arrive within
- * this window the sn replies to both at the same moment so both edges start
- * their punch round together, each receiving exactly one PEER_INFO. */
-#define PUNCH_PAIR_WINDOW  3     /* seconds (matches the edge's 3s punch round) */
-
 struct promoted_peer {
     n2n_mac_t       mac;
     n2n_community_t community;
@@ -2985,8 +2979,7 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
 }
 
 /** Build a PUNCH-flagged PEER_INFO describing `who` (the edge whose address
- *  the requester needs) and encode it into encbuf. Returns the encoded size.
- *  Shared by the QUERY_PEER reply paths and the punch-pair timeout fallback. */
+ *  the requester needs) and encode it into encbuf. Returns the encoded size. */
 static size_t sn_build_punch_info( const n2n_community_t * community,
                                    struct peer_info * who,
                                    uint8_t * encbuf )
@@ -3053,30 +3046,6 @@ static void sn_send_punch_to_sock( n2n_sn_t * sss,
         socklen_t slen = (dst->family == AF_INET6) ? sizeof(struct sockaddr_in6)
                                                    : sizeof(struct sockaddr_in);
         sendto( send_sock, encbuf, encx, 0, (struct sockaddr*)&addr, slen );
-    }
-}
-
-/** Punch-pair wait expiry: an edge queried but its partner never queried back
- *  within PUNCH_PAIR_WINDOW. Answer it alone and, as a fallback, push its
- *  address to the target (simultaneous open) so the target can punch back.
- *  Called from the main loop at the ~100ms select cadence. */
-static void sn_punch_pair_timeout( n2n_sn_t * sss, time_t now )
-{
-    struct peer_info * scan;
-    for ( scan = sss->edges; scan; scan = scan->next )
-    {
-        if ( scan->punch_wait_since == 0 )
-            continue;
-        if ( now - scan->punch_wait_since <= PUNCH_PAIR_WINDOW )
-            continue;
-
-        scan->punch_wait_since = 0;
-        struct peer_info * target = find_peer_by_mac( sss->edges, scan->punch_wait_target );
-        if ( !target )
-            continue;
-
-        sn_send_punch_to_sock( sss, &scan->community_name, target, &scan->sockets[0] );
-        sn_send_punch_to_sock( sss, &scan->community_name, scan, &target->sockets[0] );
     }
 }
 
@@ -4849,10 +4818,6 @@ static int run_loop( n2n_sn_t * sss )
 
         /* Deferred full-cone N2NF probes (#2/#3, staggered). */
         fc_probes_tick( sss, now );
-
-        /* Punch-pair wait timeouts: answer held QUERY_PEER replies alone
-         * (plus the simultaneous-open push) once the pairing window passed. */
-        sn_punch_pair_timeout( sss, now );
 
         /* sn1 -> sn2 brother_reg, every 31s. */
         if (sss->backup_addr_text[0])

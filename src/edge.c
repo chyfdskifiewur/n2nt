@@ -5684,25 +5684,33 @@ process_n2n_packet:
                         return 1;
                     }
                     int addr_changed = 0;
-                    /* Principle 8: detect an address change unconditionally —
-                     * a different address means the peer's NAT mapping moved
-                     * (restart / CGNAT re-map) and the old direct path is
-                     * dead. No gate here: the change itself is the signal,
-                     * and a fresh direct path simply has no change to detect.
-                     * Reduced from 15s to 5s previously; now unconditional. */
-                    if (pi.sockets[0].family == AF_INET) {
-                        if (known->sock.family != AF_INET ||
-                            sock_equal(&known->sock, &pi.sockets[0]) != 0) {
-                            addr_changed = 1;
-                            eee->cached_dst_valid = 0;
+                    /* Only treat a differing address as a change while the
+                     * direct path is stale (or never established): a fresh
+                     * direct path must not be torn down by a metadata push
+                     * whose address differs for transient reasons (e.g. LAN
+                     * socket vs SN public view). 5s gate; 15s previously. */
+                    if (known->direct_seen == 0 || (now - known->direct_seen) >= 5) {
+                        if (pi.sockets[0].family == AF_INET) {
+                            if (known->sock.family != AF_INET ||
+                                sock_equal(&known->sock, &pi.sockets[0]) != 0) {
+                                addr_changed = 1;
+                                eee->cached_dst_valid = 0;
+                            }
+                        }
+                        if (!addr_changed && pi.sock6.family == AF_INET6) {
+                            if (known->sock6.family != AF_INET6 ||
+                                sock_equal(&known->sock6, &pi.sock6) != 0) {
+                                addr_changed = 1;
+                                eee->cached_dst_valid = 0;
+                            }
                         }
                     }
-                    if (!addr_changed && pi.sock6.family == AF_INET6) {
-                        if (known->sock6.family != AF_INET6 ||
-                            sock_equal(&known->sock6, &pi.sock6) != 0) {
-                            addr_changed = 1;
-                            eee->cached_dst_valid = 0;
-                        }
+
+                    if (addr_changed) {
+                        MACSTR_TMP(mac_tmp);
+                        traceEvent(TRACE_INFO, "Peer %s address changed to %s, demoted for re-punch",
+                                   macaddr_str(mac_tmp, pi.mac),
+                                   sock_to_cstr(sockbuf1, &pi.sockets[0]));
                     }
 
                     if (!addr_changed) {
@@ -5842,39 +5850,14 @@ process_n2n_packet:
                 return 1;
             }
 
-            /* PUNCH is the SN's paired reply to a QUERY_PEER (the peer with
-             * communication demand). Obey it when the address really changed
-             * — that is the signal that the peer's mapping moved and a fresh
-             * punch round is worth its 20 tries (user: "地址变了就该尝试直连").
-             * If the address is unchanged the direct path is still alive and
-             * the PUNCH is only a confirmation of our query: refresh metadata
-             * and leave the connection alone, or every paired reply would
-             * tear a working direct path apart. */
+            /* PUNCH is the SN's re-punch command (user design: SN directs,
+             * the edge obeys): clear the old relation with this peer and
+             * punch again unconditionally — no direct-seen freeze, no address
+             * comparison. If the direct path is actually still alive, the
+             * early-stop in check_punch_timeouts halts the new round on its
+             * first tick (direct_seen >= punch_start_time), costing one round
+             * at most. Metadata is refreshed by the demote path below. */
             if (known) {
-                /* Address unchanged = direct path alive, no re-punch needed. */
-                int addr_same = 0;
-                if (known->sock.family == AF_INET && pi.sockets[0].family == AF_INET)
-                    addr_same = (sock_equal(&known->sock, &pi.sockets[0]) == 0);
-                if (!addr_same && known->sock6.family == AF_INET6 && pi.sock6.family == AF_INET6)
-                    addr_same = (sock_equal(&known->sock6, &pi.sock6) == 0);
-                if (addr_same) {
-                    if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
-                        pi.sockets[1].family != 0 && pi.sockets[1].port != 0) {
-                        known->sockets[1] = pi.sockets[1];
-                        known->num_sockets = 2;
-                    }
-                    if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) && pi.sock6.family == AF_INET6)
-                        known->sock6 = pi.sock6;
-                    if (pi.version[0]) strncpy(known->version, pi.version, sizeof(known->version) - 1);
-                    if (pi.os_name[0]) strncpy(known->os_name, pi.os_name, sizeof(known->os_name) - 1);
-                    if (pi.assigned_ip) known->assigned_ip = pi.assigned_ip;
-                    {
-                        uint8_t nt = N2N_NAT_FROM_AFLAGS(pi.aflags);
-                        if (nt) known->nat_type = nt; /* 0 = sn did not report */
-                    }
-                    PEERS_UNLOCK(eee);
-                    return 1;
-                }
                 /* Drop any older pending entry for the same mac before
                  * demoting, or every PUNCH reply would accumulate a
                  * duplicate pending node. */
