@@ -2451,6 +2451,19 @@ void set_peer_operational( n2n_edge_t * eee,
             eee->pending_peers = scan->next;
         }
 
+        /* Drop any older known entry for the same mac before promoting,
+         * or repeated demote/promote cycles would accumulate duplicate
+         * known nodes too. */
+        struct peer_info *k_prev = NULL, *k_scan = eee->known_peers;
+        while (k_scan && memcmp(k_scan->mac_addr, mac, N2N_MAC_SIZE) != 0) {
+            k_prev = k_scan; k_scan = k_scan->next;
+        }
+        if (k_scan) {
+            if (k_prev) k_prev->next = k_scan->next;
+            else eee->known_peers = k_scan->next;
+            free(k_scan);
+        }
+
         /* Add scan to known_peers. */
         scan->next = eee->known_peers;
         eee->known_peers = scan;
@@ -4625,8 +4638,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     struct peer_info* peer = eee->pending_peers;
     int id = 1;
     while(peer) {
-        /* Skip if same virtual IP as local edge */
-        if (peer->assigned_ip == ntohl(eee->device.ip_addr)) {
+        /* Skip our own entry (compare MAC, not assigned_ip: the latter is
+         * network byte order from PEER_INFO decode, so an IP comparison
+         * against the host-order ntohl() never matched and showed ourselves). */
+        if (memcmp(peer->mac_addr, eee->device.mac_addr, N2N_MAC_SIZE) == 0) {
             peer = peer->next;
             continue;
         }
@@ -4688,8 +4703,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     peer = eee->known_peers;
     id = 1;
     while(peer) {
-        /* Skip if same virtual IP as local edge */
-        if (peer->assigned_ip == ntohl(eee->device.ip_addr)) {
+        /* Skip our own entry (compare MAC, not assigned_ip: the latter is
+         * network byte order from PEER_INFO decode, so an IP comparison
+         * against the host-order ntohl() never matched and showed ourselves). */
+        if (memcmp(peer->mac_addr, eee->device.mac_addr, N2N_MAC_SIZE) == 0) {
             peer = peer->next;
             continue;
         }
@@ -5693,6 +5710,18 @@ process_n2n_packet:
                         return 1;
                     }
 
+                    /* Drop any older pending entry for the same mac before
+                     * demoting, or every address change would accumulate a
+                     * duplicate pending node. */
+                    struct peer_info *p_prev = NULL, *p_scan = eee->pending_peers;
+                    while (p_scan && memcmp(p_scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
+                        p_prev = p_scan; p_scan = p_scan->next;
+                    }
+                    if (p_scan) {
+                        if (p_prev) p_prev->next = p_scan->next;
+                        else eee->pending_peers = p_scan->next;
+                        free(p_scan);
+                    }
                     struct peer_info *prev = NULL, *scan = eee->known_peers;
                     while (scan && memcmp(scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
                         prev = scan; scan = scan->next;
@@ -5815,6 +5844,18 @@ process_n2n_packet:
             }
 
             if (known) {
+                /* Drop any older pending entry for the same mac before
+                 * demoting, or every PUNCH reply would accumulate a
+                 * duplicate pending node. */
+                struct peer_info *p_prev = NULL, *p_scan = eee->pending_peers;
+                while (p_scan && memcmp(p_scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
+                    p_prev = p_scan; p_scan = p_scan->next;
+                }
+                if (p_scan) {
+                    if (p_prev) p_prev->next = p_scan->next;
+                    else eee->pending_peers = p_scan->next;
+                    free(p_scan);
+                }
                 struct peer_info *prev = NULL, *scan = eee->known_peers;
                 while (scan && memcmp(scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
                     prev = scan; scan = scan->next;
