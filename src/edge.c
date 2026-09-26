@@ -64,8 +64,8 @@
 #define REGISTER_SUPER_INTERVAL_MAX     120  /* sec */
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
-#define PUNCH_TIMEOUT                   18   /* sec: overall cap for one punch series */
-#define PUNCH_CYCLES                    5    /* PROBE+REGISTER rounds per punch attempt */
+#define PUNCH_TIMEOUT                   65   /* sec: overall cap for one punch series (20 rounds x 3s) */
+#define PUNCH_CYCLES                    20   /* PROBE+REGISTER rounds per punch attempt */
 #define PUNCH_CYCLE_INTERVAL            3    /* sec: per round = PROBE, +1s REGISTER, +2s to next round */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
