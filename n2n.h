@@ -287,6 +287,7 @@ struct peer_info {
     time_t              last_query_sent;   /* time last query_peer was sent, for rate-limiting */
     time_t              last_punch_probe;  /* time last PROBE was sent during hole-punch */
     uint8_t             punch_retry_count; /* number of punch retries, remove after max */
+    uint8_t             punch_cycle;       /* current PROBE+REGISTER round (0..PUNCH_CYCLES) in the punch loop */
     uint8_t             register_retry_count; /* REGISTER retries after PROBE_ACK, max 3 */
     time_t              last_register_sent;   /* time last REGISTER was sent after PROBE_ACK */
     time_t              direct_seen;       /* time of last direct P2P communication with this peer; 0=never */
@@ -629,11 +630,14 @@ struct n2n_edge
                                            alt port (lport+1): same IP, a second destination
                                            port; equal public ports prove the mapping
                                            is reused per IP (not symmetric) */
+    n2n_sock_t          nat_seen_sn_cross; /* probe echo from a second, distinct public IP
+                                           (sn2): confirmatory only, never the arbiter — a
+                                           NAT3 changes its port per destination IP by design */
     time_t              nat_probe_time; /* last one-shot symmetric check attempt */
     uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
-    uint8_t             nat_dual_ip;    /* EXPERIMENT 1: symmetric check's second observation
-                                           comes from the brother sn (different IP), deciding
-                                           cone-vs-symmetric across IPs instead of by twin ports */
+    uint8_t             nat_probe_cross;   /* 1: a cross-IP probe to sn2 (a distinct public IP)
+                                             was also fired this round, in addition to the twin
+                                             probe; routes sn2's ACK to nat_seen_sn_cross */
     uint8_t             nat_bounce_seen;   /* a helper-port delivery got through: not port-restricted */
     uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
     uint8_t             fc_window;      /* 1 until the first packet is sent to sn2 */
