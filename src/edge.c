@@ -1775,15 +1775,18 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 time_t cycle_start = scan->punch_start_time + scan->punch_cycle * PUNCH_CYCLE_INTERVAL;
                 if ( now >= cycle_start && scan->last_punch_probe < cycle_start )
                 {
-                    /* Every punch round rebinds the socket: random-port edges
-                     * land on a brand-new source port (new NAT mapping), while
-                     * fixed-port edges (-p) keep their port unchanged and only
-                     * the peer side changes. At most once per tick so several
-                     * punching peers share the same fresh socket. Skipped while
-                     * a direct P2P path is live (8s window): a rebind would
-                     * drop every established direct connection. */
+                    /* Every punch round may rebind the socket, but only for a
+                     * symmetric NAT (NAT4): it is the one type where a fresh
+                     * source port yields a brand-new mapping worth chasing.
+                     * Other NAT types (incl. unknown) never switch the port on
+                     * purpose — the peer side is the only changing endpoint.
+                     * At most once per tick so several punching peers share the
+                     * same fresh socket. Skipped while a direct P2P path is
+                     * live (300s window): a rebind would drop every established
+                     * direct connection. */
                     if (!eee->use_ws && !punch_swapped &&
-                        (now - eee->last_p2p) > 8)
+                        (now - eee->last_p2p) > 300 &&
+                        eee->nat_type == N2N_NAT_SYMMETRIC)
                     {
                         punch_swapped = 1;
                         closesocket(eee->udp_sock);   eee->udp_sock = -1;
