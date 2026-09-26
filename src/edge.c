@@ -5778,6 +5778,17 @@ process_n2n_packet:
                         if (nt) pending->nat_type = nt;
                     }
                     pending->last_seen = n2n_now();
+                    /* Symmetry fix: this address change demoted the peer but
+                     * left no punch running, so only our side would re-punch
+                     * once data flows — the peer keeps its stale direct state
+                     * and the two-way punch breaks. Punch right away: the
+                     * QUERY_PEER of our first round makes the SN push a PUNCH
+                     * to the peer, so both sides re-punch in sync. */
+                    pending->punch_failed = 0;
+                    if (pending->sock.family == AF_INET && eee->udp_sock != -1)
+                        try_send_register(eee, 1, pi.mac, &pending->sock);
+                    else if (pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1)
+                        try_send_register(eee, 1, pi.mac, &pending->sock6);
                     PEERS_UNLOCK(eee);
                     if (eee->enable_gaming_mode && pi.assigned_ip != 0) {
                         uint8_t probe[42];
@@ -5852,6 +5863,29 @@ process_n2n_packet:
              * first tick (direct_seen >= punch_start_time), costing one round
              * at most. Metadata is refreshed by the demote path below. */
             if (known) {
+                /* Stale-command guard: the SN cannot know a direct path was
+                 * just proven, so the PUNCH reply to the round we already
+                 * completed can still be in flight for one cycle. If this
+                 * peer's direct path is fresh (<= one punch cycle) and the
+                 * PUNCH carries the very same address, obeying it would tear
+                 * the direct connection apart for nothing — the early-stop
+                 * already ended the loop, and a direct-connected edge no
+                 * longer queries, so the SN will send no further PUNCH. Real
+                 * re-punches (address changed) and relay-only peers still
+                 * fall through and demote unconditionally below. */
+                if (known->direct_seen != 0 &&
+                    (now - known->direct_seen) < PUNCH_CYCLE_INTERVAL)
+                {
+                    int addr_same = 0;
+                    if (known->sock.family == AF_INET && pi.sockets[0].family == AF_INET)
+                        addr_same = (sock_equal(&known->sock, &pi.sockets[0]) == 0);
+                    if (!addr_same && known->sock6.family == AF_INET6 && pi.sock6.family == AF_INET6)
+                        addr_same = (sock_equal(&known->sock6, &pi.sock6) == 0);
+                    if (addr_same) {
+                        PEERS_UNLOCK(eee);
+                        return 1;
+                    }
+                }
                 /* Drop any older pending entry for the same mac before
                  * demoting, or every PUNCH reply would accumulate a
                  * duplicate pending node. */
