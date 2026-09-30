@@ -4371,8 +4371,9 @@ static int process_udp( n2n_sn_t * sss,
                     sock_to_cstr( sockbuf, &(ack.sock) ),
                     ws_sender ? " (ws)" : "" );
 
-        /* Push all existing peers when this is a NEW edge registration or FORCE_PEER_INFO flag is set */
-        if ( is_new_edge || force_peer_info )
+        /* Member dump only on a real registration; a QUERY_ONLY probe must
+         * not leak this community's peers to a non-member. */
+        if ( !query_only && ( is_new_edge || force_peer_info ) )
         {
             n2n_common_t    pi_cmn;
             n2n_PEER_INFO_t pi;
