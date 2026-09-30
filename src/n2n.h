@@ -206,10 +206,8 @@ struct tuntap_config {
 #define MSG_TYPE_REGISTER_SUPER_NAK     7
 #define MSG_TYPE_FEDERATION             8
 
-/* Set N2N_COMPRESSION_ENABLED to 0 to disable lzo1x compression of ethernet
- * frames. Doing this will break compatibility with the standard n2n packet
- * format so do it only for experimentation. All edges must be built with the
- * same value if they are to understand each other. */
+/* Set N2N_COMPRESSION_ENABLED to 0 to disable lzo1x compression — breaks
+ * standard packet format, experimentation only. */
 #define N2N_COMPRESSION_ENABLED 1
 
 #define DEFAULT_MTU   1350
@@ -221,15 +219,7 @@ typedef char ipstr_t[INET6_ADDRSTRLEN];
 #define N2N_MACSTR_SIZE 32
 typedef char macstr_t[N2N_MACSTR_SIZE];
 
-/* NAT type classification from dual-sn reflection (edge measures, sn displays).
- * Dual-sn reflection compares the mappings toward two destinations:
- * identical -> cone family, any difference -> symmetric. The sn bounce test
- * (helper socket with a different source port) then splits the cone family:
- * the bounce gets through on full-cone/address-restricted NATs and is
- * dropped by port-restricted ones. A brother sn plays the never-contacted
- * third IP: its N2NF probe reaching the edge proves the filter admits any
- * source -> full cone. Without a brother, full cone cannot be told apart
- * and reports as addr-restr. */
+/* NAT type from dual-sn reflection (mapping compare + helper-socket bounce + brother N2NF) */
 #define N2N_NAT_UNKNOWN        0
 #define N2N_NAT_SYMMETRIC      2
 #define N2N_NAT_FULL_CONE      3  /* N2NF probe from a never-contacted brother got through */
@@ -253,12 +243,8 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
                                  ((a) & N2N_AFLAGS_NAT_FULL_CONE) ? N2N_NAT_FULL_CONE : \
                                  ((a) & N2N_AFLAGS_NAT_SYMMETRIC) ? N2N_NAT_SYMMETRIC : N2N_NAT_UNKNOWN )
 
-/* NAT types eligible to act as the community relay peer (mini-SN):
- * can the peer be reached without punching? Only a full-cone (NAT1) or a
- * restricted-cone (NAT2) mapping -- any stricter kind (port-restricted,
- * symmetric) falls back to the plain SN relay. This single macro is the
- * SN's only relay-eligibility gate (the SN is the single authority deciding
- * which peer is eligible to be the community relay). */
+/* NAT types reachable without punching: only full-cone (NAT1) / restricted-cone
+ * (NAT2) qualify as community relay; stricter kinds fall back to the plain SN relay. */
 #define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE || \
                                    (t) == N2N_NAT_RESTRICTED )
 
@@ -307,10 +293,7 @@ struct peer_info {
     ws_conn_t *         ws;
 };
 
-/* Supernode-side punch pair: two edges both classified hard NAT (NAT3/NAT4)
- * coordinate their 2s punch rounds through the supernode — every round each
- * side re-registers, and once both have, the sn hands each the other's latest
- * address (PUNCH) so they punch simultaneously. */
+/* Hard-NAT punch pair: two edges coordinate 2s punch rounds; SN hands each the other's latest address (PUNCH) */
 #define PUNCH_PAIR_MAX  64    /* max simultaneous hard-NAT punch pairs */
 #define PUNCH_PAIR_HOLD 10    /* sec: drop a pair whose edges both stopped round-querying */
 #define PUNCH_SYNC_MIN_DIFF_MS 10 /* ms: round-latency differences below this are noise */
@@ -324,9 +307,7 @@ struct sn_punch_pair {
     time_t              b_reg;          /* last round REGISTER_SUPER time of edge_b */
     time_t              last_exchanged; /* last handoff exchange time (0 = none yet) */
     time_t              last_activity;  /* last QUERY touching this pair (purge key) */
-    /* Round-start sync: from the first handoff the sn times each side's next
-     * re-registration; the difference, halved, defers the near side's handoff
-     * so both edges receive the round punch signals simultaneously. */
+    /* Round-start sync: defer the near side so both punch together. */
     int64_t             sync_send_ms;   /* ms: first handoff send time (measurement start) */
     int64_t             sync_reg_a_ms;  /* ms: edge_a's first registration after the start */
     int64_t             sync_reg_b_ms;  /* ms: edge_b's first registration after the start */
@@ -341,21 +322,8 @@ struct sn_punch_pair {
 struct n2n_edge; /* forward declaration, defined below */
 typedef struct n2n_edge         n2n_edge_t;
 
-/* Main loop tick cadence — shared by all platforms.
- *   10 ms was chosen because it simultaneously satisfies three generic
- *   constraints that every n2n edge deployment has to handle:
- *     (1) KCP ikcp_update() runs naturally at 100 Hz,
- *     (2) ingress fds (UDP v4/v6, mgmt sock, WS, bypass proxy/conns) are
- *         polled via select(timeout=0) after every wakeup, so worst-case
- *         0-10 ms extra ingress latency — completely invisible to
- *         interactive ping (RTT >> 10 ms on any real WAN link),
- *     (3) Windows side avoids WSAEventSelect entirely — that WinSock
- *         function silently flips UDP sockets to non-blocking mode,
- *         which would destroy the SO_SNDBUF-based implicit back-pressure
- *         the single-threaded send_packet2net path relies on to auto-tune
- *         TCP cwnd to the actual uplink bandwidth with zero parameters.
- *   Same value at every bandwidth, peer count, and operating system —
- *   fully generic, no scenario-specific tuning required. */
+/* Main loop tick: 10 ms = KCP 100 Hz + select(0) poll; avoids WSAEventSelect
+ * whose non-blocking UDP flip would break SO_SNDBUF back-pressure. */
 #define N2N_MAINLOOP_TICK_MS    10
 
 
@@ -406,17 +374,7 @@ extern ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_
 extern void tuntap_close(struct tuntap_dev *tuntap);
 extern void tuntap_get_address(struct tuntap_dev *tuntap);
 #ifdef _WIN32
-/* Windows single-threaded TAP reader — overlapped I/O driven from the
- *   main loop (architecture 100% aligned with cnn2n).  Replace the
- *   blocking tunReadThread + tuntap_read pair.
- *     tuntap_read_begin_overlapped : submit async ReadFile using
- *         tuntap_dev.overlap_read + internal read_buf[2000].  Returns
- *         >0 (sync-complete, bytes in read_buf, no IRP pending),
- *         =0 (async queued, wait on overlap_read.hEvent then call
- *            complete), <0 error.
- *     tuntap_read_complete_overlapped : collect result after event
- *         signal.  Returns byte count (>0) or error (<0).  Always
- *         clears read_pending so a new read can be submitted. */
+/* Overlapped TAP reader driven from the main loop; never call GetOverlappedResult on a pending IRP */
 extern ssize_t tuntap_read_begin_overlapped(struct tuntap_dev *tuntap);
 extern ssize_t tuntap_read_complete_overlapped(struct tuntap_dev *tuntap);
 #endif
@@ -475,23 +433,16 @@ typedef char n2n_sn_name_t[N2N_EDGE_SN_HOST_SIZE];
 
 #define MAX_BROTHER_SNS         16
 
-/* Direction of a brother-SN relationship. Probing never crosses it:
- *   ROLE_MY_BIG    - this SN registered ME as its [-b] little brother
- *                    (it sent brother_reg here). It is one of my "big
- *                    brothers"; I may adopt/probe its edges when asked.
- *   ROLE_MY_LITTLE - this SN is MY [-b] configured little brother (sn2).
- *                    Only it may be asked to run full-cone probes for my
- *                    edges; I never probe its edges. */
+/* Brother-SN direction (probing never crosses it):
+ * MY_BIG = it registered ME as its little brother; MY_LITTLE = my configured little brother */
 #define N2N_BROTHER_ROLE_MY_BIG      1
 #define N2N_BROTHER_ROLE_MY_LITTLE   2
 
 typedef struct {
     n2n_sock_t   sock;         /* current socket of this brother SN (IPv4 or IPv6, whichever arrives first) */
     n2n_sock_t   sock6;        /* IPv6 socket of this brother SN (optional, family=0 if not seen on v6) */
-    n2n_sock_t   adv_sock;     /* address advertised to ask_backup lookups: the big
-                                  brother's registration source IP and source port —
-                                  that packet left its [-l] service socket, so the
-                                  source port IS its real service port. v4 family. */
+    n2n_sock_t   adv_sock;     /* advertised to ask_backup lookups: the big brother's
+                                  registration source port IS its real service port. v4 */
     n2n_sock_t   adv_sock6;    /* same as adv_sock, v6 family (or reg.own_ipv6) */
     time_t       seen;         /* last registration time (0 = never, not counted in num_brothers) */
     time_t       seen6;        /* last v6 registration time */
@@ -523,16 +474,10 @@ struct n2n_edge
     uint8_t             sn_query_index; /* index into sn_ip_array of the query channel (sn2) */
     uint8_t             sn_backup_index; /* index into sn_ip_array of the failover target */
     n2n_sock_t          sn1_probe_addr; /* last address we probed sn1 at while on the failover target */
-    uint8_t             sn_probe_cookie[N2N_COOKIE_SIZE]; /* shared cookie for both Phase-3 failback probes
-                                                              (direct sn1 probe + sn2 address query); independent
-                                                              of last_cookie so the Phase-4 rotation in the same
-                                                              tick cannot invalidate their ACKs. Generated once
-                                                              per tick; the ACK path tells the two probes apart
-                                                              by sender (sn_query vs sn1_probe_addr). */
+    uint8_t             sn_probe_cookie[N2N_COOKIE_SIZE]; /* shared cookie for Phase-3 failback probes; the ACK path tells them apart by sender */
     uint8_t             sn_probe_cookie_valid;
-    uint8_t             sn1_ever_ok;    /*=1 once sn1 accepts a registration / answers us;
-                                          gate: only ask sn2 for sn1's NEW address after this,
-                                          otherwise sn1 never worked and we switch directly */
+    uint8_t             sn1_ever_ok;    /*=1 once sn1 accepted a registration/answered us;
+                                          gate: only then ask sn2 for sn1's NEW address */
 
     size_t              sn_idx;
     size_t              sn_num;
@@ -568,50 +513,31 @@ struct n2n_edge
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
     size_t              tx_transop_idx;
 
-    /* Destination cache for the P2P send path (see edge.c send_PACKET).
-     * A cache hit avoids the per-packet peer-table scan. All access is
-     * inside PEERS_LOCK, so it is safe on Windows (TAP thread + main
-     * loop) and a no-op lock on Linux (single thread). */
+    /* Destination cache for the P2P send path: a hit avoids the per-packet
+     * peer-table scan. Accessed inside PEERS_LOCK. */
     uint8_t             cached_dst_valid;
     uint8_t             cached_dst_is_peer;
     n2n_mac_t           cached_dst_mac;
     n2n_sock_t          cached_dst_sock;
     time_t              cached_dst_time;
 
-    /* Relay client: community relay peer (mini-SN). Set when SN advertises the
-     * relay (PEER_INFO with N2N_AFLAGS_RELAY). While active, the edge registers
-     * to it so it learns our socket, and packets whose direct path is not up
-     * are dual-sent to the relay and the supernode until a frame returns
-     * through the relay (relay_proven), then sent to the relay only. Cleared
-     * once a direct P2P link is established (no more relaying needed). */
+    /* Relay client: dual-send relay+supernode until proven, then relay-only; cleared on direct P2P */
     n2n_mac_t           relay_mac;
     n2n_sock_t          relay_sock;
     uint8_t             relay_valid;
     time_t              relay_last_reg;
     time_t              relay_proven;       /* last time a frame was received THROUGH the relay; 0=never */
-    time_t              relay_last_ack;     /* last time the relay answered our REGISTER (heartbeat ACK);
-                                               0 = never / not installed. Health signal, decoupled from
-                                               data traffic like the supernode failover logic */
+    time_t              relay_last_ack;     /* last relay REGISTER ACK; liveness, decoupled from data traffic */
 
-    /* Relay server: when set, this edge acts as the relay and forwards
-     * PACKETs addressed to a peer that registered to it (mini-SN). Only a
-     * "good" peer (NAT1 + public address) self-enables this. NAT2 relays are
-     * left for the "else -> back to SN" fallback and are not implemented. */
+    /* Relay server: this edge forwards PACKETs for peers that registered to
+     * it (mini-SN). Only NAT1 + public address self-enables. */
     uint8_t             relay_mode;
 
-    /* Relay server member table (mini-SN). Unlike known_peers/pending_peers
-     * (the P2P tables this edge punches on), the relay keeps a dedicated list
-     * of peers that registered to it for forwarding; these are reachable
-     * directly (NAT1) so their socket comes from the actual REGISTER transport
-     * source. This mirrors how the SN maintains its edge list, and is
-     * independent of P2P cleanup so the relay path survives peer-table churn. */
+    /* Relay server member table: peers registered to this relay for forwarding
+     * (NAT1, sockets from the REGISTER transport). Separate from P2P tables. */
     struct peer_info *  relay_peers;
 
-    /* Relay client state: relay_last_ack is refreshed by the relay's REGISTER_ACK
-     * (our 3s heartbeat) and drives liveness: no ACK for RELAY_ACK_SECS means
-     * the relay is dead and we fall back to the supernode, retrying it every
-     * relay_probe_next period. relay_proven tracks frames received THROUGH the
-     * relay and controls send-side single/dual sending. */
+    /* No relay ACK for RELAY_ACK_SECS => relay dead, fall back to SN, retry later */
     time_t              relay_probe_next;       /* when to retry a dead relay */
     uint8_t             relay_giveup;           /* 1=relay deemed dead, stay on SN until retry */
     uint8_t             relay_willing;          /* advertised to SN for relay selection: 0/1/2/3 */
@@ -647,57 +573,32 @@ struct n2n_edge
 
     n2n_sock_t          my_public_sock;
 
-    /* NAT type detection: twin probes to the connected supernode's two ports
-     * (lport / lport+1 mapping compare) plus the sn bounce test (helper
-     * socket, different source port) for cone sub-types. */
+    /* NAT detection: twin probes to the SN's two ports + helper-socket bounce for cone sub-types */
     uint8_t             nat_type;       /* N2N_NAT_* */
     n2n_sock_t          nat_seen_sn1;   /* edge addr observed by sn1 (family=0 if none) */
-    n2n_sock_t          nat_seen_sn2;   /* edge addr observed by the twin probe's
-                                           MAIN port (second observation; in multi-sn
-                                           failover also any sn2 query-channel ACK) */
-    n2n_sock_t          nat_seen_sn2_alt; /* twin echo from the current supernode's
-                                           alt port (lport+1): same IP, a second destination
-                                           port; equal public ports prove the mapping
-                                           is reused per IP (not symmetric) */
-    n2n_sock_t          nat_seen_sn_cross; /* probe echo from a second, distinct public IP
-                                           (sn2): confirmatory only, never the arbiter — a
-                                           NAT3 changes its port per destination IP by design */
+    n2n_sock_t          nat_seen_sn2;   /* twin probe MAIN-port echo (also sn2 query ACK in failover) */
+    n2n_sock_t          nat_seen_sn2_alt; /* alt-port echo: equal public ports prove per-IP mapping reuse */
+    n2n_sock_t          nat_seen_sn_cross; /* echo from a distinct public IP; confirmatory only (NAT3 varies port per destination) */
     time_t              nat_probe_time; /* last one-shot symmetric check attempt */
     uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
-    uint8_t             nat_probe_cross;   /* 1: a cross-IP probe to sn2 (a distinct public IP)
-                                             was also fired this round, in addition to the twin
-                                             probe; routes sn2's ACK to nat_seen_sn_cross */
+    uint8_t             nat_probe_cross;   /* 1: cross-IP probe to sn2 fired this round; routes its ACK to nat_seen_sn_cross */
     uint8_t             nat_bounce_seen;   /* a helper-port delivery got through: not port-restricted */
     uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
     uint8_t             fc_window;      /* 1 until the first packet is sent to sn2 */
-    time_t              fc_arm_time;    /* when the stranger window was last (re-)armed:
-                                           the one-shot symmetric check is spent 12s
-                                           later, once the window has served its purpose */
+    time_t              fc_arm_time;    /* last (re-)arm of the stranger window; the one-shot symmetric check spends it 12s later */
     uint8_t             nat_sym_tries;  /* attempts spent on the one-shot symmetric check */
-    uint8_t             nat_final;      /* 1: verdict frozen, the one-shot twin check
-                                          is spent (cleared on restart / mapping
-                                          change only) */
-    uint8_t             nat_reprobe;    /* one-shot: next sn1 registration asks the SN to
-                                           re-trigger the brother's N2NF probe (mgmt "n") */
-    uint8_t             punch_round_reg; /* one-shot: next send_register_super carries the
-                                           punch-round flag (hard-NAT round re-registration) */
-    time_t              nat_revert_at;  /* mgmt "n" in fixed-port mode: rebind the configured
-                                           local port again once this time is reached (0 = none) */
-    time_t              nat_refresh_start; /* mgmt "n": when the refresh began. Independent of
-                                           fc_arm_time (which is re-armed on extension): the hard
-                                           cap that eventually forces a freeze/restore even if
-                                           sn2 never answers. 0 = none */
-    uint8_t             nat_rebuild_tries; /* "one more round" rebuilds already run for the current
-                                           refresh; capped so a sick environment eventually freezes
-                                           instead of rebuilding forever */
+    uint8_t             nat_final;      /* 1: verdict frozen, twin check spent (cleared on restart / mapping change) */
+    uint8_t             nat_reprobe;    /* one-shot: next sn1 registration re-triggers the brother's N2NF probe */
+    uint8_t             punch_round_reg; /* one-shot: next registration carries the punch-round flag */
+    time_t              nat_revert_at;  /* mgmt "n" fixed-port: rebind the local port at this time (0 = none) */
+    time_t              nat_refresh_start; /* mgmt "n" refresh start; hard cap forces freeze/restore even if sn2 never answers */
+    uint8_t             nat_rebuild_tries; /* rebuilds already run; capped so a sick environment eventually freezes */
     uint8_t             nat_suppress_remap; /* one-shot: next ACK-remap only updates
                                            my_public_sock, keeps the fresh NAT verdict */
     time_t              nat_autorecover_at; /* last automatic UDP socket rebuild (every
                                            supernode silent); 0 = never */
 
-    n2n_sock_t          own_ipv6;       /* routable global IPv6 (GUA) of this edge,
-                                           reported to supernode for IPv6 hole-punching
-                                           when the supernode is IPv4-only. family==0 if none. */
+    n2n_sock_t          own_ipv6;       /* routable global IPv6, reported for IPv6 hole-punching; family==0 if none */
 
     n2n_sock_t          local_sock;
     int                 local_sock_ena;

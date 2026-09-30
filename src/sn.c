@@ -13,17 +13,10 @@
 #include "n2n_wire.h"
 #include <fcntl.h>
 
-/* Community-relay announcement gate: only announce the community relay peer
- * once a member's unicast data has been relayed by this supernode for at
- * least this many seconds. The first few seconds of hole-punching traffic
- * are expected (punches always start out via the SN) and must not trigger
- * the announcement. */
+/* Relay-advert gate: announce only after a member's unicast has been relayed here this long (hole-punch traffic starts via SN) */
 #define SN_RELAY_ADVERT_ACTIVE_SECS  5
 
-/** Seconds: an edge whose unicast was relayed through this sn within this
- * window counts as "communicating" with its last relayed counterpart. When
- * such a pair's address changes, the sn punches that counterpart directly
- * instead of the plain (non-PUNCH) broadcast. */
+/** An edge relayed here within this window is "communicating": its pair's address change gets a direct PUNCH */
 #define SN_FWD_PUNCH_ACTIVE_SECS    30
 
 /** maximum length of command line arguments */
@@ -91,10 +84,7 @@ static int sn_get_device_mac(n2n_mac_t out_mac);
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-/* <net/if.h> intentionally not included: n2n.h already pulls in
- * <linux/if.h> on Linux and redefinition of IFF_* / struct ifreq
- * would break compilation. SIOCGIFHWADDR, struct ifreq and IFNAMSIZ
- * are therefore already available via n2n.h. */
+/* <net/if.h> excluded: n2n.h already pulls <linux/if.h>; including both redefines IFF_* / struct ifreq */
 #define SOCKET_INVALID -1
 #define CLOSE_SOCKET(s) close(s)
 #endif
@@ -411,9 +401,7 @@ struct community_stats {
     uint32_t next_ip;           /* host byte order, 0 = not yet initialised */
     struct mac_ip_entry *mac_ip_map; /* MAC -> IP cache for this community */
 
-    /* Cache for compact broadcast optimization: all_compact == 1 means every edge in this
-     * community is compact_capable, so SN can skip broadcast conversion check.
-     * false means there's at least one legacy edge, need check or force conversion. */
+    /* all_compact: every edge here is compact_capable, so broadcast conversion checks can be skipped */
     int             all_compact;
 
     struct community_stats *next;
@@ -477,11 +465,10 @@ static void advance_30d_buckets(struct community_stats *s, time_t now)
     }
 }
 
-/* Advance expired 24-hour minute buckets: roll the sliding window forward to
- * now so last_24h_bytes decays even while a community is idle or throttled.
- * This is what prevents the rate limit from dead-locking a community that has
- * exhausted its 24h quota: without traffic there is no update_community_traffic
- * call, so only periodic advancement (purge/load) can shrink last_24h_bytes. */
+/* Advance expired 24-hour minute buckets: roll the sliding window forward so
+ * last_24h_bytes decays even while idle/throttled — without traffic there is no
+ * update_community_traffic call, so only periodic advancement can shrink an
+ * exhausted 24h quota. */
 static void advance_24h_buckets(struct community_stats *s, time_t now)
 {
     if (s->last_minute > now) {
@@ -599,12 +586,8 @@ static int rate_admit(struct community_stats *s, size_t bytes)
     if (s->max_24h_bytes > 0 && s->last_24h_bytes >= s->max_24h_bytes) {
         if (s->rate_limit_bps == 0)
             return 0; /* hard block */
-        /* Throttle via token bucket with overdraft (credit): the bucket may
-         * go negative down to RATE_DEBT_SECONDS worth of tokens. Short bursts
-         * borrow from future tokens instead of delaying packets; once the
-         * credit is exhausted try_forward parks packets in the shaper queue
-         * instead of dropping them, so TCP sees no loss and keeps its
-         * congestion window. */
+        /* Token bucket with overdraft credit: short bursts borrow; when credit runs out,
+         * packets park in the shaper queue instead of dropping (TCP sees no loss) */
         uint64_t max_tokens = token_bucket_max(s);
         int64_t debt_max = (int64_t)(s->rate_limit_bps * RATE_DEBT_SECONDS);
         if (debt_max < 16384) debt_max = 16384;
@@ -870,17 +853,12 @@ struct n2n_sn
     SOCKET              sock6;
     n2n_sock_t          my_ipv6;        /* first non-link-local IPv6 GUA on this host (used for brother_reg.own_ipv6) */
     /* brothers[] - active brother SNs discovered via brother_reg.
-     * Indexed by MAC so multiple sn1 peers can register against this sn2
-     * and each slot holds its own v4/v6 socket + last-seen timestamp. */
+     * Indexed by MAC so multiple sn1 peers can register against this sn2;
+     * each slot holds its own v4/v6 socket + last-seen timestamp. */
     n2n_brother_entry_t    brothers[MAX_BROTHER_SNS];
     SOCKET              mgmt_sock;      /* management socket. */
-    SOCKET              bounce_sock;    /* NAT bounce-test helper socket (random
-                                         * source port, outbound-only; replies
-                                         * "N2NB" to edges requesting a bounce). */
-    SOCKET              alt_sock;       /* second UDP port (lport+1) answering NAT
-                                         * probes from a different destination port
-                                         * of the same IP (dual-port mapping check).
-                                         * -1 = unavailable / disabled. */
+    SOCKET              bounce_sock;    /* NAT bounce helper socket (random source port; replies "N2NB") */
+    SOCKET              alt_sock;       /* UDP port lport+1: NAT probes from a second destination port (dual-port check); -1 = unavailable */
     SOCKET              ws_listen_sock; /* TCP listen socket for WebSocket (same as lport). */
 #define N2N_SN_MAX_WS 64
     ws_conn_t           ws_conns[N2N_SN_MAX_WS]; /* WS connection table (edge connected via WS). */
@@ -906,9 +884,7 @@ struct n2n_sn
     time_t                 backup_resolved_time;  /* when the cache was filled */
     time_t                 last_brother_seen;
     n2n_mac_t              device_mac;       /* local NIC MAC used as SN identity in brother_reg */
-    /* Deferred full-cone probes: N2NF #1 fires on FCP arrival, #2/#3 are
-     * staggered so a re-mapped edge has already re-armed its stranger
-     * window (its own ACK wins the race against probe #1). */
+    /* Deferred full-cone probes: #2/#3 staggered so a re-mapped edge re-arms its stranger window first */
 #define FC_PROBE_MAX 16
 #define FC_PROBE_SPREAD 2   /* seconds between the 3 sends */
     struct { n2n_sock_t target; time_t due; uint8_t left; } fc_probes[FC_PROBE_MAX];
@@ -957,9 +933,8 @@ static void save_community_stats(n2n_sn_t *sss, time_t now)
                 s->min_idx, (int64_t)s->last_minute);
         for (int i = 0; i < COMM_STATS_DAYS; i++)
             fprintf(fp, "%" PRIu64 "%c", s->bytes_30d[i], i == COMM_STATS_DAYS-1 ? '\n' : ' ');
-        /* 24h minute buckets: 6 rows x 240 values each.
-         * Must be persisted, otherwise the sliding window cannot decay
-         * across restarts and the 24h rate limit would hit permanently. */
+        /* 24h minute buckets: must be persisted, else the sliding window
+         * cannot decay across restarts and the 24h rate limit would stick. */
         for (int i = 0, c = 0; i < COMM_STATS_MINUTES; i++) {
             fprintf(fp, "%" PRIu64 "%c", s->bytes_1440[i], c == 239 ? '\n' : ' ');
             if (++c == 240) c = 0;
@@ -1065,9 +1040,8 @@ static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, t
         }
 
         /* Refresh rate limit rules and advance expired 24h/30d buckets so
-         * quotas decay while idle/throttled. Periodic refresh makes config
-         * changes take effect for communities that never go idle long enough
-         * to hit the lazy first-use path. */
+         * quotas decay while idle/throttled; also picks up config changes
+         * for communities that never hit the lazy first-use path. */
         apply_rules_to_stats(s, sss->rate_rules);
         advance_24h_buckets(s, now);
         advance_30d_buckets(s, now);
@@ -1558,11 +1532,10 @@ static int update_edge( n2n_sn_t * sss,
             /* sock6 remains 0 from calloc */
         }
 
-        /* Edge-reported global IPv6 (GUA). An IPv4-only supernode cannot
-         * observe our IPv6, so it uses this address to hand to peers for
-         * IPv6 hole-punching. A dual-stack supernode observes sock6 itself
-         * (more authoritative, it is the NAT egress), so only fall back to
-         * the reported address when no IPv6 was observed. */
+        /* Edge-reported global IPv6 (GUA): an IPv4-only supernode cannot observe
+         * our IPv6, so it uses this address for IPv6 hole-punching. A dual-stack
+         * supernode's own observation (NAT egress) is authoritative, so only
+         * fall back to the reported address when no IPv6 was observed. */
         if (scan->sock6.family != AF_INET6 && report_ipv6 && report_ipv6->family == AF_INET6)
             memcpy(&(scan->sock6), report_ipv6, sizeof(n2n_sock_t));
 
@@ -1630,12 +1603,8 @@ static int update_edge( n2n_sn_t * sss,
     {
         /* Known */
 
-        /* Refresh identity/metadata on every registration regardless of
-         * address changes. Repeat registrations carry a stable IP:port
-         * (the edge socket does not move), so the addr_changed guard below
-         * would otherwise skip this block and a NAT type learned later
-         * (after the first, NAT-less registration) would never land on
-         * this edge. */
+        /* Refresh identity/metadata even without an address change (else a NAT type
+         * learned after the first registration never lands on this edge). */
         if (version) {
             strncpy(scan->version, version, sizeof(scan->version) - 1);
             scan->version[sizeof(scan->version) - 1] = '\0';
@@ -1697,10 +1666,9 @@ static int update_edge( n2n_sn_t * sss,
                     existing_family = AF_INET6;
             }
 
-            /* Alt-family registration: update address.
-             * Keep connect_family as primary registration's family.
-             * sn_send_to_peer dual-sends to both IPv4 and IPv6, so
-             * connect_family no longer needs switching. */
+            /* Alt-family registration: update address. Keep connect_family as
+             * the primary registration's family; the dual-send to both IPv4 and
+             * IPv6 makes switching unnecessary. */
             if (existing_family != 0 && sender_sock->family != existing_family) {
                 if (sender_sock->family == AF_INET6) {
                     int had_sock6 = (scan->sock6.family == AF_INET6);
@@ -1869,16 +1837,12 @@ static ssize_t sn_send_to_peer(n2n_sn_t * sss,
                                const uint8_t * pktbuf,
                                size_t pktsize) {
     if (peer->ws && peer->ws->state == WS_OPEN) {
-        /* ws_send failure drops only this packet, does not mark CLOSED — connection
-         * liveness is determined by ws_recv, to avoid TCP buffer full (EAGAIN)
-         * incorrectly closing the connection and leaving peer->ws dangling. */
+        /* ws_send failure drops the packet only — never CLOSE: TCP-buffer-full (EAGAIN)
+         * must not kill the connection; liveness is ws_recv's job. */
         return ws_send(peer->ws, pktbuf, pktsize);
     }
-    /* UDP routing: dual-send to both IPv4 and IPv6 if available.
-     * UDP sendto always succeeds (packet accepted by kernel) even when the
-     * peer's NAT mapping is stale, so primary/fallback based on sendto return
-     * value never triggers. Send to both paths so the peer receives data on
-     * whichever path is actually reachable. */
+    /* UDP: dual-send v4+v6 — sendto succeeds even on a stale NAT mapping, so a
+     * return-value based fallback never triggers; both paths keep data flowing. */
     {
         ssize_t r = -1;
         if (peer->sock.family != 0)
@@ -1977,10 +1941,8 @@ static ssize_t sendto_sock(n2n_sn_t * sss,
 }
 
 /* ===== Compromise shaper: small FIFO queue instead of drops =====
- * While throttled, packets that exceed the token credit are parked here
- * (SHAPER_SLOTS x ~2KB ~ 16KB, ~140ms at 115KB/s) and released FIFO as the
- * bucket refills. TCP sees no loss, avoiding retransmission storms; the cost
- * is added queueing latency. One queue per community, lazily allocated. */
+ * Throttled packets beyond token credit are parked (SHAPER_SLOTS x ~2KB) and
+ * released FIFO as the bucket refills; TCP sees no loss, at queueing latency. */
 static int shaper_enqueue(struct community_stats *s,
                           const n2n_mac_t mac,
                           const uint8_t *pktbuf, size_t pktsize)
@@ -2256,10 +2218,8 @@ static int process_mgmt( n2n_sn_t * sss,
         r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
         if (r <= 0) return -1;
 
-        /* A peer once advertised as the community relay keeps its '*' forever
-         * (last state preserved). Pre-scan whether any peer in this community
-         * has ever been used: only then does a forced relay (-Z 3) stay hidden
-         * behind the actually-used one. */
+        /* '*' sticks once advertised; only pre-scan used peers so a forced
+         * relay (-Z 3) stays hidden behind the actually-used one. */
         int community_has_sticky = 0;
         {
             struct peer_info *scan = sss->edges;
@@ -2520,11 +2480,8 @@ static int try_broadcast( n2n_sn_t * sss,
 
     traceEvent( TRACE_DEBUG, "try_broadcast" );
 
-    /* Broadcast throttle policy (B1 simple gate): broadcasts never enter the
-     * token bucket (a per-member charge would dead-lock them), instead their
-     * fan-out is capped by bc_gate while the community is over its 24h cap.
-     * Accounting still records what is actually sent, so broadcast traffic
-     * keeps counting towards the 24h quota. */
+    /* Broadcast throttle (B1 gate): cap fan-out via bc_gate while over the
+     * 24h cap; accounting still counts what is actually sent. */
     if (sss->traffic_stats_enabled) {
         cs = get_community_stats(&sss->comm_stats,
                                                       cmn->community, now);
@@ -2585,22 +2542,14 @@ static int try_broadcast( n2n_sn_t * sss,
 }
 
 /* ------------------------------------------------------------------ */
-/* Full-cone probe (plan C): the edge's NAT filter whitelist is per
- * mapping and starts empty. A source the edge has NEVER contacted can
- * therefore only get through a full-cone NAT. When a brother SN forwards
- * a brand-new edge mapping ("N2NF" + mac + IPv4 + port, 16 raw bytes),
- * we fire tiny "N2NF" datagrams at it — by construction never-contacted
- * sources. The edge accepts the probe only from its sn2 query channel IP,
- * and reads it as full cone only while it has not contacted that channel.
- * One probe leaves from the bounce helper socket instead (same IP, a
- * source port the edge never uses as a destination): that one still rules
- * out a port-restricted NAT after the edge has contacted the channel. */
+/* Full-cone probe (plan C): the edge's NAT whitelist starts empty, so a
+ * never-contacted source only gets through a full-cone NAT. The brother SN
+ * fires tiny "N2NF" datagrams at the brand-new mapping (never-contacted by
+ * construction); a bounce-helper probe (source port never used as
+ * destination) still rules out port-restricted NAT after contact. */
 
-/* Fire the probe at a forwarded edge mapping. Sender must be a live BIG
- * brother entry (ROLE_MY_BIG): big brothers registered me as their [-b]
- * little brother, so when they forward one of their own children I adopt
- * and probe it. My little brother, strangers and (to keep the hierarchy)
- * any non-brother are never accepted here. */
+/* Probe a forwarded edge mapping; only a live BIG brother is accepted
+ * (little brother / strangers / non-brothers are never probed). */
 static void handle_fc_probe_request( n2n_sn_t *sss,
                                      const struct sockaddr *sender_sock,
                                      const uint8_t *udp_buf,
@@ -2642,16 +2591,13 @@ static void handle_fc_probe_request( n2n_sn_t *sss,
     if ( is_private_ipv4( target.addr.v4 ) )
         return; /* probes only cross a NAT; never send to private addresses */
 
-    /* #1 now; #2/#3 staggered (fc_probes, ticked by the main loop). On a
-     * re-mapped edge the ACK that re-arms its stranger window beats probe
-     * #1 — the later probes are the ones that land in the open window. */
+    /* #1 now; #2/#3 staggered so a re-mapped edge's ACK (re-arming its
+     * stranger window) beats probe #1 — later probes land in the window. */
     sendto_sock( sss, &target, msg, sizeof(msg) );
 
-    /* One extra probe from the bounce helper socket: same IP, but a source
-     * port the edge has never used as a destination. While the edge has not
-     * contacted us it proves full cone just like the probes above; once it
-     * has (that port is then whitelisted), a delivery still proves the
-     * filter is not port-restricted. */
+    /* Bounce-helper probe: same IP, source port never used as destination.
+     * Before contact it proves full cone; after (port whitelisted), a
+     * delivery still proves the filter is not port-restricted. */
     if ( sss->bounce_sock >= 0 )
     {
         struct sockaddr_in tgt;
@@ -2693,9 +2639,8 @@ static void fc_probes_tick( n2n_sn_t * sss, time_t now )
 }
 
 /* Forward a brand-new edge mapping to our [-b] little brother (sn2) so IT
- * can act as the never-contacted source for a full-cone probe. Big brothers
- * and strangers are never asked: only my little brother adopts my edges
- * (handles their own children through the fc-probe flow on themselves). */
+ * can act as the never-contacted full-cone source. Big brothers and
+ * strangers are never asked. */
 static void send_fc_probe_request( n2n_sn_t *sss,
                                    const n2n_mac_t edgeMac,
                                    const n2n_sock_t *edge_sock,
@@ -2751,11 +2696,8 @@ static void sn_send_punch_info( n2n_sn_t * sss, const n2n_community_t community,
                                 const struct peer_info * self,
                                 const struct peer_info * other );
 
-/* push_nat_to_community: an edge's reported NAT type changed (update_edge
- * returned 2) while its address stayed the same — nobody else would learn
- * it (PEER_INFO pushes otherwise fire only on new/addr-changed edges).
- * Send one PEER_INFO about the changed edge to every other community
- * member so their mgmt "nat" column stays fresh. */
+/* push_nat_to_community: broadcast the changed edge's PEER_INFO to every
+ * community member; communicating counterparts get a PUNCH instead. */
 static void push_nat_to_community( n2n_sn_t *sss,
                                    struct peer_info *changed,
                                    const n2n_community_t community,
@@ -2810,15 +2752,13 @@ static void push_nat_to_community( n2n_sn_t *sss,
     encode_PEER_INFO(pibuf, &pix, &pi_cmn, &pi);
 
     time_t now = time(NULL);
-    /* First the communicating counterpart gets a PUNCH right away: its
-     * address just changed, so both sides must re-punch immediately
-     * (principle 8). */
+    /* First the communicating counterpart gets a PUNCH right away: its address
+     * just changed, so both sides must re-punch immediately. */
     for ( p = sss->edges; p; p = p->next )
     {
         if ( p == changed ) continue;
         if ( memcmp(p->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
-        /* A communicating counterpart (unicast relayed between these two
-         * recently) gets a PUNCH instead of the plain broadcast. */
+        /* A communicating counterpart (recent relayed unicast either way) gets a PUNCH instead of the plain broadcast. */
         int communicating = ( addr_changed &&
                               ((p->last_fwd_time != 0 &&
                                 (now - p->last_fwd_time) < SN_FWD_PUNCH_ACTIVE_SECS &&
@@ -2869,17 +2809,11 @@ static int is_relay_capable( const struct peer_info * peer )
     return !is_private_ipv4(peer->sock.addr.v4);
 }
 
-/* Pick the community's relay among the registered edges. Excludes a given MAC
- * (e.g. the registering party) so the relay never relays for itself. A -Z 3
- * (force) member is always used as-is and never filtered by NAT/public state
- * -- if it cannot relay, the edge's 5s relay_proven fallback routes back
- * through the SN. When several forcing members exist, exactly one is chosen at
- * random and given a single chance (no rotation) -- this is an edge case and
- * is intentionally rough. Only when nobody forces does the normal priority
- * apply: willing (2) over default (1); a refusing peer (-Z 0) is never picked,
- * and when relay is globally off (force_only) nobody forces means no relay at
- * all. Newest peer first (edges list is latest-first). Returns NULL if none
- * eligible. */
+/* Pick the community's relay among registered edges (excludes a given MAC so
+ * the relay never relays for itself). A -Z 3 force is used as-is, never
+ * NAT-filtered (failure falls back via the edge's 5s relay_proven); else
+ * willing (2) over default (1); refusing never picked; force-only with no
+ * forcing member => no relay. Newest first; NULL if none eligible. */
 static struct peer_info * find_community_relay( n2n_sn_t *sss,
                                                 const n2n_community_t community,
                                                 const n2n_mac_t exclude_mac,
@@ -2975,11 +2909,10 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
                                      const n2n_mac_t tgt_mac )
 {
     int force_only;
-    /* Whole-relay feature switch: when the admin disabled community relay
-     * advertisement (sn -Z 0), stay on plain SN relay UNLESS a member forces
-     * (edge -Z 3) -- a forcing member turns the group relay back on and is then
-     * used as-is (SN never checks its NAT/public state); if it cannot relay,
-     * the edge's 5s relay_proven fallback routes back through the SN. */
+    /* Whole-relay switch: with -Z 0 plain SN relay stays on UNLESS a member
+     * forces (-Z 3) — that member turns the group relay back on and is used
+     * as-is; if it cannot relay, the edge's 5s relay_proven fallback routes
+     * back through the SN. */
     force_only = !sss->relay_advert_enabled;
 
     struct peer_info * req = find_peer_by_mac( sss->edges, req_mac );
@@ -2987,11 +2920,9 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
 
     time_t now = time(NULL);
 
-    /* Sustained-traffic gate: every member punches through this supernode
-     * for the first few seconds, and that initial burst must not trigger
-     * the community-relay announcement. Once a member's unicast data has
-     * been relayed here continuously for SN_RELAY_ADVERT_ACTIVE_SECS its
-     * hole-punching has apparently not succeeded — only then announce. */
+    /* Sustained-traffic gate: the initial punch burst through this SN must
+     * not trigger the announcement — only after a member has been relayed
+     * here for SN_RELAY_ADVERT_ACTIVE_SECS is punching deemed failed. */
     if ( req->sn_fwd_first == 0 )
         req->sn_fwd_first = now;
     if ( (now - req->sn_fwd_first) < SN_RELAY_ADVERT_ACTIVE_SECS )
@@ -3009,9 +2940,7 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
     advertise_relay_to( sss, cmn, req, relay );
     if ( tgt )
     {
-        /* Same sustained-traffic gate on the target side: if its own punching
-         * is still in its first seconds (barely relayed through here), do not
-         * burden it with the announcement yet. */
+        /* Same sustained-traffic gate on the target side. */
         if ( tgt->sn_fwd_first == 0 )
             tgt->sn_fwd_first = now;
         if ( (now - tgt->sn_fwd_first) >= SN_RELAY_ADVERT_ACTIVE_SECS )
@@ -3024,15 +2953,13 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
 }
 
 /* ---- punch pair coordination ----
- * Every QUERY_PEER forms or touches a pair. The pair punches in 2s rounds;
- * every round each side re-registers and the sn waits for both, then hands
- * each the other's latest address (PUNCH) so they punch simultaneously.
- * While those handoffs are live (last_exchanged fresh) the QUERY_PEER
- * replies are suppressed; the pair is dropped once round querying stops. */
+ * Every QUERY_PEER forms/touches a pair; 2s rounds re-register per side and
+ * the sn hands each the other's latest address (PUNCH) so they punch
+ * simultaneously. Live handoffs suppress QUERY replies; the pair drops once
+ * round querying stops. */
 
-/* sec: a QUERY_PEER reply fires only when the pair is new or its last handoff
- * is at least this old — within the 2s rounds the handoff already refreshes
- * both edges each round, so an extra reply would just duplicate the PUNCH. */
+/* sec: reply only when the pair is new or the last handoff is this old —
+ * within the 2s rounds the handoff already refreshes both edges. */
 #define PUNCH_QUERY_REFRESH_SECS 3
 
 static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
@@ -3177,13 +3104,10 @@ static void sn_send_punch_info( n2n_sn_t * sss, const n2n_community_t community,
     }
 }
 
-/* REGISTER_SUPER hook: update this edge's round-registration time; once both
- * edges of a pair have re-registered since the last exchange, hand each the
- * other's latest address (PUNCH) so the round punches simultaneously. Only
- * punch-round re-registrations (N2N_AFLAGS_PUNCH_ROUND) drive the handoff:
- * the edges' plain periodic re-registrations are ignored, otherwise the sn
- * would keep pushing PUNCHes forever once punching stopped (relay-only edges
- * still re-register on their ~30s keepalive cadence). */
+/* REGISTER_SUPER hook: when both pair edges re-registered since the last
+ * exchange, hand each the other's latest address (PUNCH) for the round.
+ * Only PUNCH_ROUND re-registrations drive the handoff — plain periodic ones
+ * are ignored, else the sn would push PUNCHes forever after punching stops. */
 static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
                                  const n2n_community_t community, time_t now,
                                  int punch_round )
@@ -3210,9 +3134,7 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
             p->a_reg = now;
         else
             p->b_reg = now;
-        /* Round-start sync: from the first handoff, time each side's next
-         * re-registration; the difference, halved, defers the near side's
-         * handoff so both edges receive the round punch signals together. */
+        /* Round-start sync: defers the near side's handoff so both punch together. */
         if ( p->sync_send_ms != 0 && !p->sync_armed )
         {
             if ( is_a && p->sync_reg_a_ms == 0 )
@@ -3226,10 +3148,8 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
             int64_t diff = (p->sync_reg_a_ms > p->sync_reg_b_ms)
                          ? p->sync_reg_a_ms - p->sync_reg_b_ms
                          : p->sync_reg_b_ms - p->sync_reg_a_ms;
-            /* Ignore sub-10ms differences: at the 100ms loop tick these are
-             * quantization noise, not a real route asymmetry. And skip
-             * compensation above 1s: the delay would push the near side's
-             * round past the next 2s round window, aligning nothing. */
+            /* Sub-10ms differences are tick quantization noise; >1s gaps mean
+             * hopelessly asymmetric routes, skip compensation. */
             p->sync_delay_ms = ( diff >= PUNCH_SYNC_MIN_DIFF_MS &&
                                  diff <  PUNCH_SYNC_MAX_DIFF_MS ) ? diff / 2 : 0;
             p->sync_near_a   = (p->sync_reg_a_ms <= p->sync_reg_b_ms);
@@ -3239,8 +3159,7 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
                         macaddr_str(mac_buf_a,
                                     p->sync_near_a ? p->edge_a : p->edge_b) );
         }
-        /* The later registrant triggers: both reg times newer than the last
-         * exchange means both sides are ready for this round. */
+        /* The later registrant triggers: both reg times newer than the last exchange = both sides ready. */
         if ( (is_a ? p->b_reg : p->a_reg) > p->last_exchanged )
         {
             struct peer_info *ea = find_peer_by_mac( sss->edges, p->edge_a );
@@ -3249,8 +3168,7 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
             {
                 if ( p->sync_armed && p->sync_delay_ms > 0 )
                 {
-                    /* Far side immediately, near side after the measured
-                     * half-difference, so both punches land together. */
+                    /* Far side immediately, near side after the measured half-difference. */
                     struct peer_info *far_peer, *near_peer;
                     if ( p->sync_near_a )
                     {
@@ -3505,16 +3423,9 @@ static int process_udp( n2n_sn_t * sss,
             encx = udp_size;
         }
 
-        /* Common section to forward the final product.
-         * Before forwarding, check if any receiver is legacy (doesn't support compact).
-         * If so, convert compact→legacy so old edges can still receive the packet.
-         * For unicast, we also keep dest around so the conversion block can use
-         * dest->transform_id as a fallback if sender_peer->transform_id is 0.
-         *
-         * Broadcast uses a community-level cache (all_compact) to avoid scanning
-         * all peers on every packet: once a legacy PACKET is seen in the community,
-         * all_compact is set to 0 and all subsequent broadcasts are converted
-         * conservatively. This eliminates O(N) scanning per broadcast packet. */
+        /* Forward the final product: if any receiver is legacy (no compact
+         * support) convert compact→legacy. Broadcast uses the community-level
+         * all_compact cache to avoid scanning every peer per packet. */
         {
             int all_receivers_compact = 0;
             struct peer_info *dest = NULL; /* used by unicast path + conversion fallback */
@@ -3533,9 +3444,8 @@ static int process_udp( n2n_sn_t * sss,
             }
             else
             {
-                /* Broadcast: use community-level cache instead of scanning all peers.
-                 * all_compact=1 means ALL peers are compact-capable → no conversion.
-                 * all_compact=0 means at least one legacy peer exists → convert conservatively. */
+                /* Broadcast: community-level cache — all_compact=1 means ALL
+                 * peers are compact-capable (no conversion), else convert. */
                 struct community_stats *cs = get_community_stats(&sss->comm_stats, cmn.community, now);
                 if ( cs && cs->all_compact )
                     all_receivers_compact = 1;
@@ -3691,12 +3601,8 @@ static int process_udp( n2n_sn_t * sss,
             /* Copy the original payload unchanged */
             encode_buf( encbuf, &encx, (udp_buf + idx), (udp_size - idx ) );
 
-            /* Update sender's edge address in the edge table so the
-             * supernode can forward replies to the correct address.
-             * Without this, after a WiFi switch (NAT address change),
-             * the supernode would forward replies to the old address
-             * until the next REGISTER_SUPER (up to 30s + 3×12s retries).
-             * Only update if the family matches the existing registration. */
+            /* Update the sender's edge address from the PACKET transport source
+             * (family-matched) so replies reach the new NAT endpoint after a WiFi switch. */
             {
                 struct peer_info *sender_edge = find_peer_by_mac(sss->edges, pkt.srcMac);
                 if (sender_edge) {
@@ -3739,13 +3645,9 @@ static int process_udp( n2n_sn_t * sss,
         /* Common section to forward the final product. */
         if ( unicast )
         {
-            /* Relay: the supernode relaying member-to-member data is a clear
-             * sign direct failed; push the community relay peer so the members
-             * can switch to it. */
+            /* Relaying member data means direct failed; advertise the community relay peer. */
             advertise_relay_on_pair( sss, &cmn, pkt.srcMac, pkt.dstMac );
-            /* Track the communicating pair: unicast relayed through the sn
-             * means the two edges are talking (relay state). A later address
-             * change on either side then punches the counterpart directly. */
+            /* Track the communicating pair so a later address change punches the counterpart directly. */
             {
                 struct peer_info *fwd_src = find_peer_by_mac( sss->edges, pkt.srcMac );
                 if ( fwd_src )
@@ -3880,24 +3782,16 @@ static int process_udp( n2n_sn_t * sss,
         struct peer_info *target = find_peer_by_mac( sss->edges, query.targetMac );
         if ( target )
         {
-            /* Punch pair: the first QUERY_PEER forms the pair (and wakes the
-             * target); after that each round both edges re-register and the
-             * per-round handoff in sn_pair_on_register exchanges their latest
-             * addresses. While those handoffs are live the direct reply and
-             * the wake-up are suppressed — replying to every QUERY would double
-             * the PUNCH traffic (most visible while a NAT type is still
-             * unknown, where every query used to draw a reply plus a wake-up).
-             * A stale pair (punches stopped) gets its reply back, waking the
-             * target into a fresh round. */
+            /* Punch pair: the first QUERY forms the pair; while handoffs are
+             * live the direct reply is suppressed (double PUNCH traffic).
+             * A stale pair (punches stopped) gets its reply back, waking a
+             * fresh round. */
             struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
             int pair_new = sn_pair_touch( sss, cmn.community,
                                           query.srcMac, query.targetMac, now );
             if ( pair_new )
             {
-                /* The requester's round-0 re-registration arrived before the
-                 * pair existed (register precedes query on the wire), so fold
-                 * it in now: this lets the round-0 handoff fire when the other
-                 * side re-registers and anchors the round-latency sync. */
+                /* Fold in the round-0 re-registration that arrived before the pair existed. */
                 struct sn_punch_pair *pp = sn_pair_find( sss, cmn.community,
                                                          query.srcMac, query.targetMac );
                 if ( pp )
@@ -4038,7 +3932,7 @@ static int process_udp( n2n_sn_t * sss,
         /* NAT bounce test: the edge asks us to reply from the helper socket
          * (different source port) so it can tell restricted (IP-gated, any
          * port allowed) from port-restricted NATs. Purely outbound, 4-byte
-         * magic, no state; sender's IP is re-checked by the edge. */
+         * magic, no state; the edge re-checks the sender IP. */
         if ( (reg.aflags & N2N_AFLAGS_NAT_BOUNCE) &&
              sender_sock->sa_family == AF_INET &&
              sss->bounce_sock >= 0 )
@@ -4061,8 +3955,8 @@ static int process_udp( n2n_sn_t * sss,
                 return 0;
             }
 
-            /* Find slot by MAC; if not found, fill first empty slot;
-             * if all full, replace the slot whose seen is the oldest. */
+            /* Find slot by MAC; if not found fill the first empty slot, else
+             * replace the slot whose seen is the oldest. */
             uint8_t zero[6] = {0,0,0,0,0,0};
             int slot = -1, oldest_slot = -1;
             time_t oldest_seen = (time_t)(~(time_t)0);
@@ -4094,11 +3988,8 @@ static int process_udp( n2n_sn_t * sss,
             {
                 be->sock = sender_n2n;
                 be->seen = now;
-                /* adv_* = the big brother's address ADVERTISED to ask_backup
-                 * lookups: the registration's source IP and source port.
-                 * The packet left sn1's [-l] service socket (sendto_sock
-                 * sends from sss->sock), so that source port IS sn1's -l
-                 * port — exactly where its edges must re-register. */
+                /* adv_* = the registration's source ip:port — it left sn1's [-l]
+                 * service socket, so the source port IS its -l port. */
                 be->adv_sock = sender_n2n;
                 be->adv_sock6.family = 0;
             }
@@ -4111,15 +4002,10 @@ static int process_udp( n2n_sn_t * sss,
             }
             sss->last_brother_seen = now;
 
-            /* Direction of the relationship — circular [-b] is withdrawn.
-             * Whoever REGISTERS to me (a plain brother_reg) is my BIG
-             * brother: I back it up when it goes away. The only way to
-             * become my LITTLE brother is to ANSWER my own registration:
-             * a BROTHER_REPLY whose source matches my [-b] target, and it
-             * backs me up. An SN that points [-b] at me AND registers
-             * here stays BIG — the packet direction decides, not the
-             * address. SNs I have no direct exchange with never enter
-             * this table and are never contacted. */
+            /* Direction decides the relationship (circular [-b] is withdrawn):
+             * whoever REGISTERS to me is my BIG brother; only answering my own
+             * registration (a BROTHER_REPLY from my [-b] target) makes them my
+             * LITTLE brother — not the address. */
             {
                 int is_little = 0;
                 if ( reg.aflags & N2N_AFLAGS_BROTHER_REPLY )
@@ -4145,22 +4031,16 @@ static int process_udp( n2n_sn_t * sss,
                                slot, sock_to_cstr(sockbuf, &sender_n2n));
             }
 
-            /* Refresh IPv6 entry from reg.own_ipv6 whenever sn1 provides one.
-             * The own_ipv6 GUA is what sn1 currently uses for incoming IPv6
-             * traffic, so its port follows sn1's -l value. Update every
-             * brother_reg so a port change on sn1 is reflected here. */
+            /* Refresh IPv6 from reg.own_ipv6: it is sn1's current IPv6 ingress (port = sn1's -l). */
             if ((reg.aflags & N2N_AFLAGS_IPV6_SOCKET) &&
                 reg.own_ipv6.family == AF_INET6)
             {
                 be->sock6 = reg.own_ipv6;
                 be->seen6 = now;
             }
-            /* Reply to a big brother. It only ever sends brother_reg, so it
-             * holds no entry of its own for us and could never show our
-             * address, version or OS. A packet that is itself a reply is
-             * never answered, which is what keeps the two SNs from
-             * ping-ponging when the reply's source port differs from the
-             * receiver's [-b] port and its role check therefore misses. */
+            /* Reply to a big brother (it only sends brother_reg, so it has no entry of
+             * ours to see our address/version). Never answer a reply — that is what
+             * stops the two SNs ping-ponging when role checks miss. */
             if ( be->role == N2N_BROTHER_ROLE_MY_BIG &&
                  !(reg.aflags & N2N_AFLAGS_BROTHER_REPLY) &&
                  sender_n2n.family != 0 )
@@ -4182,16 +4062,11 @@ static int process_udp( n2n_sn_t * sss,
         if (community_denied(sss->rate_rules, cmn.community))
             return 0;
 
-        /* Edge registration: validate peer_token (if configured).
-         * Brother-trusted source: if the edge arrives from a registered
-         * brother sn1 (recently seen, sender matches its sock), the peer is
-         * admitted without token verification. The edge carries no sn2
-         * token because the user only configured sn1's -T.
-         * Ask-backup probes carry desired_sn1_mac; a match against the
-         * brother table proves the edge belongs to sn1 — record it in the
-         * promoted list and admit the probe (the probe itself is not
-         * registered). After the failover switch the real registration
-         * carries neither hint nor token and is admitted via the list. */
+        /* Edge registration: validate peer_token (if configured). Brother-trusted
+         * source: edges arriving from a registered brother sn1 are admitted without
+         * token (they carry no sn2 token — only sn1's -T is configured). Ask-backup
+         * probes matching desired_sn1_mac are recorded in the promoted list and
+         * admitted likewise; the probe itself is not registered. */
         if (sss->peer_token_set)
         {
             int brother_alive = (sss->last_brother_seen != 0) &&
@@ -4251,13 +4126,12 @@ static int process_udp( n2n_sn_t * sss,
 
         /* Advertise sn2 to it inside the ACK when we know a configured -b string
          * or have a live brother within 180s. The edge uses sn_bak_str (the
-         * verbatim DNS-style string from sn1's -b argument) so it stays
-         * stable across DNS changes. sn_bak / sn_bak_v6 are kept zero and
-         * ignored on the edge. Do NOT touch num_sn here: sn_bak_str is
-         * encoded independently of it (wire.c encode_REGISTER_SUPER_ACK),
-         * so the domain string travels without forcing a zero sn_bak onto
-         * the wire. num_sn is set below only when the ask_backup lookup
-         * actually matched a live brother address. */
+         * verbatim DNS-style string from sn1's -b argument) so it stays stable
+         * across DNS changes; sn_bak / sn_bak_v6 are kept zero and ignored on
+         * the edge. Do NOT touch num_sn here: sn_bak_str is encoded
+         * independently (wire.c encode_REGISTER_SUPER_ACK), so the domain
+         * string travels without forcing a zero sn_bak onto the wire; num_sn
+         * is set below only when the ask_backup lookup matched a live brother. */
         if (sss->backup_addr_text[0] != 0)
         {
             size_t slen = strlen(sss->backup_addr_text);
@@ -4267,19 +4141,18 @@ static int process_udp( n2n_sn_t * sss,
             ack.sn_bak_str[slen] = '\0';
         }
 
-        /* ask_backup lookup: if the registering edge supplied desired_sn1_sock
-         * and we have a brother SN whose IP matches (port-agnostic since
-         * the very point of this lookup is sn1 changed its port), return
-         * that brother's current resolved IP and MAC so the edge can
-         * reconnect to sn1 at its new address and track sn1 identity. */
+        /* ask_backup lookup: if the edge supplied desired_sn1_sock and we have
+         * a brother SN whose IP matches (port-agnostic — the point of this
+         * lookup is sn1 changed its port), return that brother's current
+         * resolved IP and MAC so the edge can reconnect to sn1 and track its
+         * identity. */
         uint8_t ask_zero[6] = {0,0,0,0,0,0};
 
         /* Not an ask_backup probe: a normal edge is registering with us.
          * Advertise our own SN identity (MAC + global IPv6) — the same
-         * identity brother_reg carries to the brother SN — so a newly
-         * started edge learns sn1's MAC/IPv6 right from its first ACK.
-         * Hint presence is tested by port: a zero-encoded sock decodes as
-         * AF_INET with port 0, so family cannot distinguish "no hint". */
+         * identity brother_reg carries — so a newly started edge learns
+         * sn1's MAC/IPv6 from its first ACK. Hint presence is tested by
+         * port: a zero-encoded sock decodes as AF_INET port 0. */
         if (reg.desired_sn1_sock.port == 0 &&
             memcmp(reg.desired_sn1_mac, ask_zero, 6) == 0)
         {
@@ -4295,8 +4168,7 @@ static int process_udp( n2n_sn_t * sss,
          * IP); fall back to IP when the edge has no sn1 MAC yet. */
         int want_mac = (memcmp(reg.desired_sn1_mac, ask_zero, 6) != 0);
         /* Hint presence is detected by port (a real sn1 sock always has a
-         * port); a zero-encoded sock decodes as AF_INET with port 0, so
-         * checking family here would fire on every normal registration. */
+         * port); a zero-encoded sock decodes as AF_INET port 0, so a family check would fire every time. */
         if ((reg.desired_sn1_sock.port != 0 || want_mac) &&
             sss->last_brother_seen != 0 &&
             (now - sss->last_brother_seen <= 180))
@@ -4323,17 +4195,13 @@ static int process_udp( n2n_sn_t * sss,
                 if (bb->adv_sock.family != 0)
                 {
                     ack.sn_bak = bb->adv_sock;
-                    /* num_sn gates the on-wire encoding of sn_bak in
-                     * REGISTER_SUPER_ACK. Without setting it here the
-                     * matched brother address is filled in memory but
-                     * never sent, and the edge sees an empty answer. */
+                    /* num_sn gates the on-wire encoding of sn_bak: without it the
+                     * matched address is never sent and the edge sees an empty answer. */
                     ack.num_sn = 1;
                 }
                 else if (bb->sock.family != 0)
                 {
-                    /* No [-b] port available to rebuild the advertised addr
-                     * (should not happen for a registering brother); fall
-                     * back to the raw source socket. */
+                    /* No [-b] port to rebuild the advertised addr: fall back to the raw source socket. */
                     ack.sn_bak = bb->sock;
                     ack.num_sn = 1;
                 }
@@ -4352,12 +4220,9 @@ static int process_udp( n2n_sn_t * sss,
         if (sss->ipv4_available) ack.sn_caps |= N2N_SN_CAPS_IPV4;
         if (sss->ipv6_available) ack.sn_caps |= N2N_SN_CAPS_IPV6;
 
-        /* sn1's identity reaches the edge from two sources, both derived
-         * from the same device_mac: the self-advertisement above (normal
-         * registrations) and the ask_backup lookup above reporting the
-         * brother record's MAC. The edge adopts them only from genuine sn1
-         * sources (its own ACK while on sn1, or sn_bak-carrying replies), so
-         * a failover target's own identity never overwrites sn1's. */
+        /* sn1's identity reaches the edge from genuine sn1 sources only (its own
+         * ACK while on sn1, or sn_bak-carrying replies), so a failover target's
+         * identity never overwrites sn1's. */
 
         traceEvent( TRACE_DEBUG, "Rx REGISTER_SUPER for %s %s",
                     macaddr_str( mac_buf, reg.edgeMac ),
@@ -4366,14 +4231,11 @@ static int process_udp( n2n_sn_t * sss,
         uint32_t use_requested_ip = reg.dev_addr.net_addr;
         uint8_t use_request_ip = 1; /* always assign IP (auto-assign if net_addr==0) */
 
-        /* QUERY_ONLY: edge is asking us (as the brother/query channel) for
-         * sn1's current address via a one-shot probe. Answer with the ACK
-         * (including the sn1 brother lookup) but do NOT register/persist
-         * this edge as a peer, so it never shows up in / clogs our table.
-         * Registrations carrying an sn1 hint (ask_backup probe: sock or
-         * MAC) count as queries too — the probing edge still belongs to
-         * sn1 and is only promoted into the table when it really
-         * registers here after the failover switch. */
+        /* QUERY_ONLY: one-shot probe for sn1's address — answer the ACK
+         * (incl. sn1 lookup) but do NOT register/persist the edge (it never
+         * shows up / clogs the table). Registrations carrying an sn1 hint
+         * (ask_backup probe) count as queries too until the edge really
+         * registers after the failover switch. */
         int query_only = (reg.aflags & N2N_AFLAGS_QUERY_ONLY) ? 1 : 0;
         if (!query_only &&
             (reg.desired_sn1_sock.port != 0 ||
@@ -4429,33 +4291,21 @@ static int process_udp( n2n_sn_t * sss,
                      N2N_NAT_FROM_AFLAGS(reg.aflags),
                      use_request_ip, use_requested_ip );
 
-        /* Hard-NAT punch pair: refresh this edge's round-registration time
-         * and, when both pair edges have re-registered since the last
-         * exchange, hand each the other's latest address (PUNCH) so the
-         * round punches simultaneously. */
+        /* Refresh the punch-pair reg time; both sides re-registered => exchange PUNCH (see sn_pair_on_register). */
         if ( !query_only )
             sn_pair_on_register( sss, reg.edgeMac, cmn.community, now,
                                  (reg.aflags & N2N_AFLAGS_PUNCH_ROUND) != 0 );
 
-        /* Edge metadata changed while staying in the table: give the rest of the
-         * community the fresh PEER_INFO. is_new_edge == 2 = NAT type changed
-         * with unchanged address; == 3 = known edge whose address changed
-         * (mgmt "n" refresh, CGNAT re-map). Without this push every peer
-         * keeps pointing at the abandoned endpoint — the SN would show the
-         * edge while nobody can reach it. */
+        /* NAT type/address changed with a stable registration: push the fresh
+         * PEER_INFO to the community, else peers keep pointing at the abandoned endpoint. */
         if ( is_new_edge == 2 || is_new_edge == 3 )
             push_nat_to_community( sss,
                                    find_peer_by_mac(sss->edges, reg.edgeMac),
                                    cmn.community, is_new_edge == 3 );
 
-        /* Brand-new edge (update_edge == 1) or known edge whose public address
-         * changed (== 3: its NAT mapping was recreated, so the stranger window
-         * is open again) — or an edge that explicitly asked for a manual NAT
-         * re-probe (mgmt "n" / edge restart, N2N_AFLAGS_NAT_REPROBE): one-shot
-         * chance for the brother SN to full-cone-probe it as a
-         * never-contacted source. (is_new_edge == 2, NAT type changed with an
-         * unchanged address, does NOT re-probe: the mapping never changed, so
-         * an out-of-window probe would buy nothing.) */
+        /* New edge (==1) or recreated mapping (==3) gets one full-cone probe
+         * chance; ==2 (NAT type change, same address) does NOT re-probe:
+         * the mapping never changed, an out-of-window probe buys nothing. */
         if ( is_new_edge == 1 || is_new_edge == 3 || (reg.aflags & N2N_AFLAGS_NAT_REPROBE) )
             send_fc_probe_request( sss, reg.edgeMac, &(ack.sock), now );
 
@@ -4496,21 +4346,17 @@ static int process_udp( n2n_sn_t * sss,
         /* Fill sn_version so edge can display supernode version */
         strncpy(ack.sn_version, n2n_sw_version_full, sizeof(ack.sn_version) - 1);
 
-        /* WS mode: the sender address is the TCP peer (edge's public IP with
-         * its TCP source port), not its UDP NAT mapping. Echoing it back would
-         * make the edge record a bogus public address and mis-classify its NAT
-         * type — two supernodes always report different TCP ports, which reads
-         * as symmetric. WS has no UDP path, so report nothing (family 0). */
+        /* WS: the sender address is the TCP peer, not its UDP NAT mapping —
+         * echoing it would record a bogus public address (different TCP ports
+         * read as symmetric). Report nothing (family 0). */
         if (ws_sender)
             memset(&ack.sock, 0, sizeof(n2n_sock_t));
 
         encode_REGISTER_SUPER_ACK( ackbuf, &encx, &cmn2, &ack );
 
 
-        /* Reply ACK: WS via ws_send, alt-port probes from the same alt
-         * socket (the edge's NAT whitelist admits exactly that source port,
-         * and the twin ACK shows a second destination-port mapping), every
-         * other UDP reply via the matching v4/v6 socket */
+        /* Reply ACK: WS via ws_send; alt-port probes from the same alt socket (the
+         * edge's NAT whitelist admits that source port); else via the matching socket. */
         if (ws_sender) {
             ws_send(ws_sender, ackbuf, encx);
         } else if ( rx_sock == sss->alt_sock ) {
@@ -4826,23 +4672,18 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         sss.sock = open_socket(sss.lport, 1 /*bind ANY*/ );
         if (sss.sock != -1) {
             ipv4_available = 1;
-            /* supernode uses a small SNDBUF (256KB) instead of edge's 2MB:
-             * the kernel auto-doubles the requested size, so this still leaves
-             * plenty of headroom for forwarding bursts to many peers without
-             * holding large per-socket memory pools. */
+            /* Small SNDBUF (256KB): the kernel auto-doubles it, leaving
+             * headroom for forwarding bursts without big per-socket pools. */
             { int snd = 256 * 1024;
               setsockopt(sss.sock, SOL_SOCKET, SO_SNDBUF, (const char*)&snd, sizeof(snd)); }
-            /* NAT bounce-test helper socket: random source port, no firewall
-             * inbound needed (the edge never connects to it; the sn only
-             * sends "N2NB" out and replies ride the conntrack entry). */
+            /* NAT bounce-test helper: random source port, no inbound needed
+             * (replies ride the conntrack entry). */
             sss.bounce_sock = open_socket(0 /* any port */, 1 /*bind ANY*/ );
             if (sss.bounce_sock == -1) {
                 traceEvent( TRACE_WARNING, "NAT bounce socket failed; bounce tests disabled" );
             }
-            /* Alt UDP port (lport+1): echoes NAT probes from a second
-             * destination port of the same IP, letting an edge tell a reused
-             * (per-IP) mapping from a symmetric one. A bind failure only
-             * disables that refinement; the main port keeps working. */
+            /* Alt UDP port (lport+1): twin probe distinguishes per-IP reuse
+             * from symmetric mapping. Bind failure only disables that. */
             sss.alt_sock = open_socket((uint16_t)(sss.lport + 1), 1 /*bind ANY*/ );
             if (sss.alt_sock == -1)
                 traceEvent( TRACE_WARNING, "alt port %u bind failed; dual-port NAT check off",
@@ -5128,20 +4969,8 @@ static int run_loop( n2n_sn_t * sss )
                 }
             }
 
-            /* WebSocket: process data from connected edges.
-             *
-             * KNOWN LIMITATION (fairness under many concurrent WS conns):
-             * ws_send uses a BLOCKING send bounded by 3s (SO_SNDTIMEO, see
-             * ws_send_all in ws.c). If one WS peer stops reading (its TCP
-             * window stays 0), forwarding to it can block this
-             * single-threaded main loop for up to 3s, briefly stalling the
-             * other 63 WS connections. This is acceptable for the common
-             * 1-edge-per-SN deployment (a stalled peer is purged after 60s
-             * by sn_ws_purge), but if a future deployment runs dozens of WS
-             * edges with poor downlinks, revisit: switch to a truly
-             * non-blocking send (per-conn TX queue + select writable event
-             * drive, no blocking send at all) so one slow peer cannot delay
-             * the others. */
+            /* KNOWN LIMITATION: ws_send BLOCKS up to 3s when a WS peer stalls, stalling the loop;
+             * OK for 1-edge-per-SN; revisit with a non-blocking TX queue for many slow edges */
             {
                 int wi;
                 for (wi = 0; wi < N2N_SN_MAX_WS; wi++) {
@@ -5149,12 +4978,8 @@ static int run_loop( n2n_sn_t * sss )
                     if (wc->state != WS_OPEN || wc->fd < 0) continue;
                     if (!FD_ISSET(wc->fd, &socket_mask)) continue;
 
-                    /* Drain the WS connection like the UDP path does
-                     * (128-frame cap): ws_recv decodes ONE complete n2n
-                     * frame per call, so without a loop every select tick
-                     * (~10 ms) forwards just one frame per connection —
-                     * capping WS relay throughput at ~1 Mbps regardless of
-                     * link speed. */
+                    /* Drain like UDP (128-frame cap): ws_recv decodes one
+                     * frame per call, a loop keeps throughput high. */
                     for (int _wi = 0; _wi < 128; _wi++) {
                         uint8_t wbuf[N2N_SN_PKTBUF_SIZE];
                         ssize_t n = ws_recv(wc, wbuf, sizeof(wbuf));
@@ -5242,13 +5067,9 @@ static int run_loop( n2n_sn_t * sss )
             }
         }
 
-        /* Keep brother entries while any sn1 peer may still need them:
-         * the promoted list (edges registered through sn1's identity) is
-         * refreshed by every probe/registration, so its newest "seen" is
-         * the liveness signal. Once no sn1 peer has been active for an
-         * hour the entries are no longer needed and are dropped. The
-         * ask_backup lookup itself only trusts the address while
-         * brother_alive (180s) so stale entries stay harmless. */
+        /* Keep brother entries while sn1 peers may still need them: the
+         * promoted list's newest "seen" is the liveness signal; drop when
+         * idle for an hour (stale entries stay harmless via brother_alive). */
         {
             static time_t last_brother_purge = 0;
             if (now - last_brother_purge >= 30)

@@ -555,15 +555,9 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
     eee->udp_sock6 = open_socket6(local_port, 1 /*bind ANY*/);
 
 #ifdef _WIN32
-    /* Bind a WSA event to each UDP socket so the main loop can
-     *   WaitForMultipleObjects() on them alongside the TAP overlapped
-     *   event.  The event fires for FD_READ | FD_CLOSE; the loop drains
-     *   via the same FD_ISSET/select(timeout=0) path so we never need
-     *   WSAEnumNetworkEvents.
-     *
-     *   Race: if a previous socket was closed (e.g. supernode reconnect
-     *   path) its old event handle is leaked — guard against that by
-     *   closing the previous one before re-binding. */
+    /* Bind a WSA event per UDP socket so the main loop can WaitForMultipleObjects()
+     * on them; the event fires for FD_READ | FD_CLOSE, drained via select(0).
+     * Close the previous event handle before re-binding (supernode reconnect). */
     if (eee->device.udp_sock_event) {
         WSAEventSelect(eee->udp_sock, NULL, 0);
         CloseHandle(eee->device.udp_sock_event);
@@ -1320,22 +1314,14 @@ static int sn_is_ack_brother( n2n_edge_t * eee, int slot )
     return slot >= 0 && slot < (int)eee->sn_num && eee->sn_ack_backup[slot];
 }
 
-/** Persist sn1's current address learned from an sn2 ask_backup reply.
- * Prefers the DNS-style string (stable across DNS changes) and falls back
- * to formatting the binary sock when sn2 has no -b. Syncs sn1_current_addr
- * so the -Q display, later probes and the failback all follow sn1's newest
- * IP/port instead of the stale -l config. NOTE: sn_ip_array[0] is left
- * untouched (still the -l domain name) so check_supernode_domain_and_update
- * can keep re-resolving the domain every 5 min and correct any bad cache
- * value (wrong port learned from an ask_backup reply) via DNS. */
+/** Persist sn1's current address from an sn2 ask_backup reply (string or binary
+ * sock); leaves sn_ip_array[0] (-l domain) untouched for DNS re-resolve. */
 static void cache_sn1_addr( n2n_edge_t * eee,
                             const char *str, uint16_t str_len,
                             const n2n_sock_t *bin )
 {
-    /* sn1 configured as a literal IP: the -l parameter is the most
-     * authoritative. sn2's brother table may hold an unreachable NATed
-     * address (the public IP:port sn2 saw), which would poison every later
-     * probe - never let it overwrite the cache. */
+    /* sn1 configured as a literal IP is authoritative: sn2's observed (possibly
+     * NATed) address would poison later probes — never overwrite the cache. */
     if ( !eee->re_resolve_supernode_ip )
         return;
 
@@ -1359,14 +1345,9 @@ static void cache_sn1_addr( n2n_edge_t * eee,
 }
 
 /** Send a REGISTER_SUPER packet.
- *  cookie_mode 0: normal registration (cookie per force_new_cookie).
- *  cookie_mode 1: sn1 failback probe (sn1 token).
- *  cookie_mode 2: "ask sn2 for sn1's current address" query (sn1 token,
- *   sn1_hint lookup hints, QUERY_ONLY; sn2 answers in ACK.sn_bak without
- *   registering us). Probes use sn_probe_cookie — shared by both probes,
- *   generated once per Phase-3 tick by the caller, independent of
- *   last_cookie so the Phase-4 rotation in the same tick cannot invalidate
- *   their ACKs. The ACK path tells them apart by sender. */
+ *  cookie_mode 0: normal registration, 1: sn1 failback probe, 2: "ask sn2 for
+ *  sn1's current address" query (QUERY_ONLY; sn2 answers in ACK.sn_bak).
+ *  Probes share sn_probe_cookie, generated once per Phase-3 tick. */
 static void send_register_super( n2n_edge_t * eee,
                                  const n2n_sock_t * supernode,
                                  int force_new_cookie,
@@ -1450,8 +1431,7 @@ static void send_register_super( n2n_edge_t * eee,
             reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
         }
 
-        /* Report the NAT type measured via reflection + bounce test so the
-         * supernode can show it per edge in its mgmt list. */
+        /* Report our measured NAT type so the SN can display it per edge. */
         switch ( eee->nat_type )
         {
         case N2N_NAT_FULL_CONE:     reg.aflags |= N2N_AFLAGS_NAT_FULL_CONE; break;
@@ -1460,18 +1440,15 @@ static void send_register_super( n2n_edge_t * eee,
         case N2N_NAT_SYMMETRIC:     reg.aflags |= N2N_AFLAGS_NAT_SYMMETRIC; break;
         }
 
-        /* Hard-NAT punch-round re-registration (consumed on use): the sn
-         * triggers the pair handoff only when both edges registered with
-         * this bit, so plain periodic re-registrations stay quiet. */
+        /* Hard-NAT punch-round re-registration (consumed on use): the sn hands
+         * off only when both edges set this bit, so plain registrations stay quiet. */
         if ( eee->punch_round_reg )
         {
             reg.aflags |= N2N_AFLAGS_PUNCH_ROUND;
             eee->punch_round_reg = 0;
         }
 
-        /* One-shot manual NAT re-probe (mgmt "n"): ask the SN to re-trigger
-         * the brother's N2NF probe even though this registration is not a
-         * new/remapped edge. */
+        /* One-shot manual NAT re-probe (mgmt "n"). */
         if ( eee->nat_reprobe )
         {
             reg.aflags |= N2N_AFLAGS_NAT_REPROBE;
@@ -1490,10 +1467,8 @@ static void send_register_super( n2n_edge_t * eee,
     else if ( eee->relay_willing == 3 )
         reg.aflags |= N2N_AFLAGS_RELAY_WILLING_FORCE;
 
-    /* Ask for a NAT bounce test on every registration until one has actually
-     * been received; the sn replies from its helper socket before ACKing.
-     * A lost bounce (UDP) must be retried — stopping at the first attempt
-     * would silently record a cone NAT as port-restricted. */
+    /* Ask for a NAT bounce test until one is received (a lost UDP bounce must
+     * be retried, else a cone NAT reads as port-restricted). */
     if ( !eee->use_ws &&
          !eee->nat_bounce_seen )
         reg.aflags |= N2N_AFLAGS_NAT_BOUNCE;
@@ -1521,17 +1496,11 @@ static void send_register_super( n2n_edge_t * eee,
         eee->gaming_started = 1;
     }
 
-    /* Fresh process: the peer table starts empty, so the first registration
-     * asks SN to push the whole member list — a restarted edge with unchanged
-     * MAC+address would otherwise stay blind (SN sees no change and pushes
-     * nothing). The dump is non-PUNCH: it only fills the table, punching
-     * stays demand-driven. */
+    /* Empty peer table (fresh start): ask the SN to push all peers */
     if ( cookie_mode == 0 && !eee->known_peers && !eee->pending_peers )
         reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
 
-    /* When this packet goes to the fixed query channel (sn2) and that
-     * channel is NOT the current supernode, it is a one-shot address lookup,
-     * not a real registration — ask sn2 not to register us as a peer. */
+    /* Packet to sn2 (not the current supernode) is a one-shot lookup: ask it not to register us. */
     if ( cookie_mode == 0 &&
          sock_equal( supernode, &(eee->sn_query) ) == 0 &&
          sock_equal( &(eee->sn_query), &(eee->supernode) ) != 0 )
@@ -1553,17 +1522,13 @@ static void send_register_super( n2n_edge_t * eee,
                                : sock_to_cstr( sockbuf, supernode ) );
     }
 
-    /* edge_send_to_sn always targets eee->supernode (sn1); when this packet
-     * is meant for another supernode (e.g. the sn2 MAC lookup / ask_backup
-     * probe), send directly to the requested address instead. */
+    /* edge_send_to_sn targets sn1; for other supernodes (sn2 lookup) send directly. */
     if ( supernode == &(eee->supernode) )
         edge_send_to_sn(eee, pktbuf, idx);
     else
         sendto_sock( sock_for_dest(eee, supernode), pktbuf, idx, supernode );
 
-    /* Also register via alternate address family so supernode knows both our addresses.
-     * WS mode only uses a single WS connection, skip alt family registration.
-     * Only send if alternate family differs from primary to avoid duplicate registrations. */
+    /* Also register via the alternate address family so the supernode knows both (skip in WS mode). */
     if (cookie_mode == 0 && !eee->use_ws && eee->supernode_alt.family != 0 && eee->supernode_alt.family != supernode->family) {
         SOCKET alt_sock = (eee->supernode_alt.family == AF_INET6) ? eee->udp_sock6 : eee->udp_sock;
         if (alt_sock != -1) {
@@ -1688,11 +1653,7 @@ static void send_probe_ack( n2n_edge_t * eee,
 static int is_empty_ip_address( const n2n_sock_t * sock );
 
 /** One punch round: PROBE+REGISTER back-to-back at the peer's latest known
- *  address. IPv6 wins only when both sides really have a usable IPv6 — our
- *  own reportable GUA (own_ipv6) and the peer's valid non-empty sock6;
- *  without that precondition the IPv6 route is not satisfied, so we fall
- *  back to IPv4. The sn handoff (PUNCH) refreshes the address between
- *  rounds. */
+ *  address (IPv6 only when both sides have a usable IPv6, else IPv4). */
 static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
 {
     int we_have_ipv6 = (eee->own_ipv6.family == AF_INET6);
@@ -1717,9 +1678,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
-    /* Every pair punches with the 5 rounds x 2s method: each round punches
-     * right away with the latest known address, then re-registers; the sn
-     * handoff (PUNCH) refreshes the address for the next round. */
+    /* 5 rounds x 2s: punch, then re-register so the PUNCH handoff refreshes the address. */
     int can_punch = ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) ||
                     ( peer->sock6.family == AF_INET6 &&
                       !is_empty_ip_address(&peer->sock6) &&
@@ -1737,9 +1696,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     send_query_peer(eee, peer->mac_addr);
 }
 
-/** Check punch progress in pending_peers: drive the 5 rounds x 2s punch
- *  cadence and, after a give-up, retry every 40s in case NAT conditions
- *  change. */
+/** Drive the 5 rounds x 2s punch cadence; after a give-up retry every 40s. */
 static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 {
     struct peer_info * scan = eee->pending_peers;
@@ -1778,11 +1735,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* Rounds: every 2s round punches right away with the latest
-             * known address, then re-registers so the sn can refresh it
-             * through the PUNCH handoff. A missing handoff (partner gave
-             * up or its rounds drift) never blocks the punch — the known
-             * address is enough to fire every round. */
+            /* Punch with the latest known address; a missing PUNCH handoff never blocks. */
             if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
             {
                 if ( scan->punch_round >= PUNCH_ROUNDS - 1 )
@@ -1863,15 +1816,8 @@ static void update_peer_address(n2n_edge_t * eee,
                                 const n2n_sock_t * peer,
                                 time_t when);
 
-/** @brief Check peer liveness and fall back to relay if P2P is dead.
- *
- *  For each peer in known_peers with established P2P (direct_seen > 0):
- *  - If edge-level data is flowing (total TX/RX changed), skip keepalive.
- *  - If idle too long, send PROBE directly to peer's P2P address.
- *  - After KEEPALIVE_MAX_FAILS consecutive failures, clear P2P state
- *    (direct_seen=0) so find_peer_destination falls back to relay.
- *  - Peer stays in known_peers — relay works immediately while
- *    QUERY_PEER re-establishes P2P in the background. */
+/** Check peer liveness: probe idle P2P peers; after KEEPALIVE_MAX_FAILS
+ *  clear direct_seen so the path falls back to relay. */
 static void check_keepalive( n2n_edge_t * eee, time_t now )
 {
     struct peer_info *scan = eee->known_peers;
@@ -1881,18 +1827,11 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
     if (eee->use_ws)
         return;
 
-    /* Per-peer keepalive: each peer is checked individually based on its own
-     * last_seen time. A peer actively receiving traffic will not receive probes. */
-
     while ( scan ) {
         struct peer_info *next = scan->next;
         time_t idle = now - scan->last_seen;
 
-        /* Only run keepalive for peers that have established P2P.
-         * For such peers: skip keepalive if direct P2P traffic is flowing.
-         * direct_seen is updated by P2P packets only (handle_PACKET), so
-         * relay traffic and other peers' activity do NOT mask this peer's
-         * silence — each peer pair is kept alive independently. */
+        /* direct_seen is updated only by direct P2P packets (handle_PACKET). */
         if (scan->direct_seen > 0) {
             if ((now - scan->direct_seen) < KEEPALIVE_IDLE_SECONDS) {
                 /* Recent direct traffic: peer is alive, skip probe */
@@ -1900,14 +1839,7 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                 continue;
             }
         } else {
-            /* Relay peer: detect broken relay path.
-             * Since PEER_INFO no longer updates last_seen, this correctly
-             * reflects the time since we last received a packet FROM the peer.
-             * If idle > 60s and we haven't recently re-registered (30s rate
-             * limit), force supernode re-registration + query peer to
-             * re-discover the peer's status.
-             * While relayed, send periodic gratuitous ARP (~10s) to keep
-              * NAT mappings fresh on intermediate routers (gaming mode only). */
+            /* Relay peer: idle > 60s -> re-query the SN; gaming mode sends GARP every 10s to keep NAT fresh. */
              if (eee->enable_gaming_mode && idle >= 10 &&
                  (scan->last_probe_sent == 0 || (now - scan->last_probe_sent) >= 10)) {
                 /* Send GARP through relay to keep NAT alive */
@@ -1984,12 +1916,7 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                            macaddr_str(mac_tmp, scan->mac_addr), (long)idle);
             }
         } else {
-            /* Probe already sent: check if a DIRECT reply came back.
-             * Only a P2P packet (which updates direct_seen) counts as the
-             * direct path being alive. Relay packets must NOT count —
-             * they update last_seen but come via the supernode, so they
-             * would falsely reset the probe while the direct path is
-             * actually dead (e.g. peer lost its NAT mapping). */
+            /* Only a direct P2P packet (updating direct_seen) counts as a reply — relayed packets must not. */
             if ( scan->direct_seen >= scan->last_probe_sent ) {
                 /* Got a direct reply: reset */
                 scan->last_probe_sent = 0;
@@ -2006,12 +1933,7 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                 if ( scan->keepalive_fails >= KEEPALIVE_MAX_FAILS ) {
                     traceEvent(TRACE_NORMAL, "Keepalive: peer %s unreachable, clearing P2P state for relay",
                                PEER_ID(mac_tmp, scan));
-                    /*
-                     * Stay in known_peers — do NOT move to pending.
-                     * Clearing direct_seen causes find_peer_destination to
-                     * fall back to relay, which keeps the data path alive
-                     * while we re-punch in the background via QUERY_PEER.
-                     */
+                    /* Stay in known_peers: relay keeps data flowing while QUERY_PEER re-punches. */
                     scan->direct_seen        = 0;
                     scan->punch_start_time   = 0;
                     scan->punch_failed       = 0;
@@ -2023,11 +1945,7 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                     scan->last_probe_sent    = 0;
                     send_query_peer(eee, scan->mac_addr);
                     start_punch(eee, scan);
-                    /* Force immediate supernode re-registration so the
-                     * supernode gets our current NAT address. Without this,
-                     * relayed replies from the peer would be forwarded to
-                     * our old address until the next periodic re-registration
-                     * (up to 30s + 3×12s retries). */
+                    /* Re-register now: otherwise relayed replies go to our old NAT address for up to 30s. */
                     eee->last_register_req = 0;
                     /* Keep scan in known_peers — relay works immediately */
                     scan = next;
@@ -2040,24 +1958,12 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
     }
 }
 
-/* Relay-client lifecycle: while a community relay peer is advertised, keep our
- * socket fresh at the relay by re-registering to it periodically. As soon as a
- * direct P2P link to some other data peer is established the relay is no longer
- * needed, so we stop servicing it and let the relay's own copy age out
- * (design: "direct success -> leave the relay"). */
+/* Relay-client lifecycle: re-register to the relay while advertised; leave it once any direct P2P link is up. */
 
-/* The edge registers itself to the relay every 3s and the relay answers with
- * REGISTER_ACK. This heartbeat is traffic-independent: if we stop hearing the
- * relay's ACK for this long the relay is assumed dead and the edge falls back
- * to the supernode (and periodically retries). Mirror of the supernode
- * failover logic (REGISTER_SUPER / ACK), so it cannot false-trigger on idle
- * or one-way flows. */
+/* Relay heartbeat: no REGISTER_ACK for RELAY_ACK_SECS => relay dead, fall back to SN (mirror of SN failover). */
 #define RELAY_ACK_SECS   15
 
-/* How long a frame actually received THROUGH the relay keeps the relay path
- * "proven" for send-side decisions: while proven we single-send via the relay,
- * otherwise we dual-send relay+supernode. This is a data-path window only and
- * is unrelated to liveness detection (RELAY_ACK_SECS). */
+/* Frames received THROUGH the relay keep the path proven for this long (single-send vs dual-send window). */
 #define RELAY_PROVEN_SECS  5
 
 /* Virtual IP of the current community relay (resolved from the relay peer's
@@ -2076,12 +1982,8 @@ static const char * relay_virt_ip_str( n2n_edge_t * eee, char * buf, size_t n )
     return buf;
 }
 
-/* True if <p> is the community relay peer itself or an alias of it: same MAC,
- * or a peer whose known socket is exactly the relay's forwarding endpoint. The
- * relay was chosen exactly because it is directly reachable (NAT1/2), so a
- * "direct P2P link" to it is just the relay path itself and must NEVER be
- * taken as proof of group-wide direct connectivity. Only a genuine direct link
- * to some other data peer may disarm the relay. */
+/* True if <p> is the relay itself (same MAC or its forwarding endpoint): a "direct"
+ * link to it is just the relay path, never proof of group-wide direct connectivity. */
 static int peer_is_the_relay( const n2n_edge_t * eee, const struct peer_info * p )
 {
     if ( memcmp( p->mac_addr, eee->relay_mac, N2N_MAC_SIZE ) == 0 ) return 1;
@@ -2095,9 +1997,7 @@ static int peer_is_the_relay( const n2n_edge_t * eee, const struct peer_info * p
 
 static void check_relay( n2n_edge_t * eee, time_t now )
 {
-    /* Relay server side: age out stale members from the dedicated table, mirroring
-     * how the SN expires its edge list. Clients refresh their REGISTER every 3s, so
-     * a member silent for 60s is assumed gone. Independent of the client side. */
+    /* Relay server: age out members silent > 60s (they refresh every 3s). */
     if ( eee->relay_mode )
     {
         PEERS_LOCK(eee);
@@ -2126,14 +2026,9 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         int nonrelay = 0;
         int need_relay = 0;
         PEERS_LOCK(eee);
-        /* Only leave the relay when the known set actually contains at least
-         * one non-relay peer AND every one of them has a confirmed direct
-         * path, AND no pending peer still needs the relay. An empty
-         * known_peers (nothing promoted yet) must NOT count as "everything
-         * is direct" — the vacuous case previously triggered
-         * 'P2P direct up - leaving relay' with zero direct peers. Pending
-         * peers have no confirmed direct path (Principle 4: direct must be
-         * confirmed by the peer), so they keep the relay alive as well. */
+        /* Leave the relay only when >=1 non-relay peer is present and all are
+         * direct; an empty known_peers must not count as "all direct". Pending
+         * peers (no confirmed direct path) keep the relay alive. */
         for (scan = eee->known_peers; scan; scan = scan->next)
         {
             if (peer_is_the_relay( eee, scan )) continue;
@@ -2151,19 +2046,12 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         }
     }
 
-    /* Relay-liveness detection (mirror of supernode failover): the relay answers
-     * our REGISTER every 3s with a REGISTER_ACK which refreshes relay_last_ack.
-     * If no ACK has been heard for RELAY_ACK_SECS, the relay is dead (process
-     * down, link lost, NAT rebound) -> fall back to the supernode and stop using
-     * it. Data traffic is deliberately NOT consulted: idle and one-way flows
-     * must never look like a dead relay. The 35s re-probe below gives the relay
-     * a chance to come back. */
+    /* Relay liveness: no REGISTER_ACK for RELAY_ACK_SECS => relay dead, fall back
+     * to SN. Data traffic deliberately not consulted (idle/one-way flows). */
     if ( eee->relay_last_ack > 0 &&
          (now - eee->relay_last_ack) > RELAY_ACK_SECS )
     {
-        /* Log and latch the giveup state exactly once per transition.
-         * Without the guard, every tick while the relay stays silent
-         * would re-hit the condition and spam the log line below. */
+        /* Latch the giveup state: log once per transition, not every tick. */
         if ( !eee->relay_giveup )
         {
             eee->relay_giveup  = 1;
@@ -2183,9 +2071,7 @@ static void check_relay( n2n_edge_t * eee, time_t now )
         }
     }
 
-    /* Keep the relay's copy of our socket alive (also registers us to it
-     * initially). No heartbeat log here — relay state transitions are logged
-     * once at the switch points (enable / prove / fallback / retry), not every 3s. */
+    /* Re-register to the relay every 3s to keep our socket fresh there. */
     if ( eee->relay_sock.family != 0 && (now - eee->relay_last_reg) >= 3 )
     {
         eee->relay_last_reg = now;
@@ -2472,9 +2358,8 @@ void set_peer_operational( n2n_edge_t * eee,
         traceEvent( TRACE_INFO, "Operational peers list size=%u",
                     (unsigned int)peer_list_size( eee->known_peers ) );
 
-        /* Start bypass negotiation for this peer if applicable.
-         * Delayed by 2 seconds after P2P establishment (principle 10):
-         * the actual check happens in the main loop via check_delayed_bypass(). */
+        /* Start bypass negotiation for this peer 2s after P2P establishment
+         * (actual check via check_delayed_bypass). */
 
     } else {
         /* Peer not in pending_peers - check if already in known_peers (late REGISTER_ACK) */
@@ -2539,13 +2424,8 @@ static int is_empty_ip_address( const n2n_sock_t * sock )
     return 1;
 }
 
-/** Keep the known_peers list straight.
- *
- *  Ignore broadcast L2 packets, and packets with invalid public_ip.
- *  If the dst_mac is in known_peers make sure the entry is correct:
- *  - if the public_ip socket has changed, erase the entry
- *  - if the same, update its last_seen = when
- */
+/** Keep the known_peers list straight: ignore broadcast/invalid public_ip;
+ *  erase entries whose socket changed, else refresh last_seen. */
 static void update_peer_address(n2n_edge_t * eee,
                                 uint8_t from_supernode,
                                 const n2n_mac_t mac,
@@ -2605,11 +2485,8 @@ static void update_peer_address(n2n_edge_t * eee,
     int incoming_is_ipv4 = (peer->family == AF_INET);
     
     if (active_is_ipv4 != incoming_is_ipv4) {
-        /* Incoming packet uses different protocol than established connection.
-         * This can happen if:
-         * 1. Packet relayed via supernode (different path)
-         * 2. Peer's address changed
-         * Ignore it to maintain single-channel policy. */
+        /* Different protocol family than the established connection (relayed or
+         * address changed): ignore to maintain single-channel policy. */
         traceEvent(TRACE_DEBUG, "Ignoring %s packet from %s (peer uses %s)",
                    incoming_is_ipv4 ? "IPv4" : "IPv6",
                    macaddr_str(mac_buf, mac),
@@ -2708,54 +2585,27 @@ static void sn_switch_to( n2n_edge_t * eee, size_t idx )
 }
 
 /* ------------------------------------------------------------------ */
-/* NAT type detection via dual-sn reflection + sn bounce test.
- * Both supernodes echo the source address they observed (ACK.sock is
- * filled from the received packet's sender). Sending REGISTER_SUPER
- * probes from the SAME local socket to two different destinations and
- * comparing the echoed observations classifies the NAT:
- *   identical ip:port -> Cone; any difference -> Symmetric
- * Registrations carry a bounce request (N2N_AFLAGS_NAT_BOUNCE) while the
- * type is not final; the sn replies from an extra helper socket (same IP,
- * different source port, 4-byte magic "N2NB") BEFORE ACKing. A delivered
- * bounce proves the NAT is not port-restricted -> restricted; no bounce
- * with cone confirmed -> port-restricted.
- * Full cone needs a source the edge NEVER contacted: on each fresh mapping
- * the brother sn (sn2, never contacted until the first query-channel probe)
- * fires a "N2NF" probe at the edge's mapped address; delivered -> full cone.
- * sn2 can play the stranger only once per mapping generation, so the second
- * observation (which needs us to contact it) is spent last, as a single
- * one-shot symmetric check; after it the verdict is frozen until the mapping
- * changes. Apart from that check the edge never contacts sn2 while sn1 is
- * healthy (sn2 stays a stranger for the next generation).
- * Observations made by an in-LAN sn (private source address) cannot
- * reveal the NAT mapping; a public bounce still narrows the type down,
- * otherwise the type stays unknown. All observations and probes are
- * IPv4-only by design: IPv6 reflections are ignored (a dual-stack
- * host's family flip must never look like a NAT re-map). */
-/* One-shot symmetric check timing: the stranger window stays open this long
- * (the brother's N2NF x3 land within the first seconds), then the single
- * second-observation probe is spent - at most NAT_SYM_MAX_TRIES attempts,
- * NAT_SYM_RETRY_SECS apart, before the verdict is frozen as measured. */
+/* NAT type detection via dual-sn reflection + sn bounce: both supernodes echo
+ * the observed source (ACK.sock); identical -> Cone, difference -> Symmetric.
+ * A helper-socket bounce before the ACK proves not port-restricted; full cone
+ * needs a never-contacted source (brother sn's N2NF probe, once per mapping).
+ * IPv4-only: IPv6 reflections are ignored so a family flip never looks like a re-map. */
+/* One-shot symmetric check: the stranger window stays open NAT_STRANGER_SECS,
+ * then the second-observation probe is spent (at most NAT_SYM_MAX_TRIES). */
 #define NAT_STRANGER_SECS   12
 #define NAT_SYM_RETRY_SECS  5
 #define NAT_SYM_MAX_TRIES   3
 
-/* Fixed-port refresh ("n"): how long to stay on a fresh random port before
- * rebinding the configured port. Detection can outlast the first probe
- * round (brother N2NF delayed/lost, sn2 slow to echo), so an unfinished
- * verdict extends the window instead of freezing "unknown" prematurely —
- * but only up to a hard cap, so a silent environment eventually gives up
- * and restores the fixed port anyway. */
+/* Fixed-port refresh ("n"): stay on a fresh random port until the verdict is
+ * final, but cap the extension so a silent environment restores the fixed port. */
 #define NAT_REVERT_RETRY_SECS   20  /* re-arm the fixed-port revert delay */
 #define NAT_REVERT_MAX_SECS     90  /* absolute cap since fc_arm_time */
 #define NAT_REBUILD_MAX_TRIES   1   /* cap on "one more round" rebuilds per refresh */
 
-/* Re-run the whole NAT refresh from scratch — the shared entry of mgmt "n"
- * and of the "one more round" rebuild: reset every classification field,
- * rebuild the socket on a brand-new random mapping (empty filter whitelist =
- * the brother's N2NF probe is a true stranger again), re-fire that probe and
- * arm the window timer in both port modes. Returns 0 on success, -1 if the
- * rebuild failed (the configured port, if any, is then restored). */
+/* Re-run the whole NAT refresh from scratch (mgmt "n" and "one more round"
+ * rebuild): reset all classification fields, rebuild the socket on a fresh
+ * random mapping (empty filter whitelist = brother's N2NF probe is a stranger
+ * again), re-fire the probe and arm the window timer. Returns 0 on success. */
 static int nat_refresh_rebuild( n2n_edge_t * eee )
 {
     eee->nat_type = N2N_NAT_UNKNOWN;
@@ -2822,18 +2672,13 @@ static void nat_classify( n2n_edge_t * eee )
     pub2 = ( eee->nat_seen_sn2.family == AF_INET &&
              !nat_addr_private( eee->nat_seen_sn2.addr.v4 ) );
 
-    /* reuse2: the dual-port probe echoed the same public port from two ports
-     * of one IP. Within-IP reuse is the reliable NAT3/NAT4 arbiter — reuse
-     * punches fine (NAT3), churn is endpoint-dependent (NAT4). */
+    /* Within-IP port reuse is the reliable NAT3/NAT4 arbiter (NAT3 reuses, NAT4 churns). */
     int reuse2 = ( eee->nat_seen_sn2.family == AF_INET &&
                    eee->nat_seen_sn2_alt.family == AF_INET &&
                    eee->nat_seen_sn2.port == eee->nat_seen_sn2_alt.port );
 
-    /* cross_diff: the same socket got a different public port at sn2, a
-     * distinct IP. A NAT3 changes port per destination by design, so it
-     * never alone implies NAT4 (reuse2 stays the arbiter); but it does veto
-     * NAT1 — a port that changes across destinations is endpoint-dependent,
-     * which no full-cone mapping is, regardless of fc_seen. */
+    /* Port differs toward sn2, a distinct IP: NAT3 changes port per destination by
+     * design, so this never implies NAT4 alone (reuse2 stays arbiter), but it vetoes NAT1. */
     int cross_diff = ( eee->nat_seen_sn_cross.family == AF_INET &&
                        eee->nat_seen_sn2.family == AF_INET &&
                        eee->nat_seen_sn_cross.port != eee->nat_seen_sn2.port );
@@ -2843,30 +2688,25 @@ static void nat_classify( n2n_edge_t * eee )
              eee->nat_seen_sn2.port != eee->nat_seen_sn2_alt.port ) ||
            memcmp( eee->nat_seen_sn1.addr.v4, eee->nat_seen_sn2.addr.v4, IPV4_SIZE ) != 0 ||
            eee->nat_seen_sn1.port != eee->nat_seen_sn2.port ) )
-        /* Twin observations disagree: endpoint-dependent -> symmetric. It
-         * outranks the N2NF probe on purpose: endpoint-independent filtering
-         * with endpoint-dependent mapping must not read as full cone. */
+        /* Twin observations disagree: endpoint-dependent mapping -> symmetric
+         * (outranks the N2NF probe: endpoint-independent filtering with
+         * endpoint-dependent mapping must not read as full cone). */
         new_type = N2N_NAT_SYMMETRIC;
     else if ( eee->fc_seen && !cross_diff )
-        /* A stranger probe from the never-contacted brother crossed: filter
-         * is open -> full cone. cross_diff vetoes: nothing with a mapping
-         * dependent on the destination IP is a full cone. */
+        /* A stranger probe from the never-contacted brother crossed: filter open -> full cone. */
         new_type = N2N_NAT_FULL_CONE;
     else if ( pub1 && pub2 )
     {
         if ( eee->nat_bounce_seen )
             new_type = N2N_NAT_RESTRICTED;
         else
-            /* Cone confirmed but the helper-port bounce never got through
-             * (every registration carried one) -> port-restricted. */
+            /* Cone confirmed, helper-port bounce never delivered -> port-restricted. */
             new_type = N2N_NAT_PORT_RESTRICT;
     }
     else if ( eee->nat_bounce_seen )
     {
-        /* An in-LAN (or missing) second observation cannot compare
-         * mappings, but a public helper bounce that got through proves
-         * the NAT is not port-restricted. Full cone behaves like
-         * restricted through known IPs and reports here too. */
+        /* No comparable second observation, but a public helper bounce proves
+         * the NAT is not port-restricted (full cone reports here too). */
         new_type = N2N_NAT_RESTRICTED;
     }
     else
@@ -2878,11 +2718,8 @@ static void nat_classify( n2n_edge_t * eee )
                     "full cone vetoed if the brother probe had reached us)",
                     N2N_NAT_NAME( new_type ) );
 
-    /* A partial observation set (e.g. right after the fixed-port restore of
-     * an "n" refresh, while only one mapping's echo has returned) derives
-     * UNKNOWN — never let that erase a verdict the edge already holds. A
-     * genuine mapping change already reset nat_type to UNKNOWN itself before
-     * re-classification, so real transitions are unaffected. */
+    /* A partial observation set derives UNKNOWN — never let that erase a verdict
+     * the edge already holds (a real mapping change reset nat_type itself). */
     if ( new_type == N2N_NAT_UNKNOWN && eee->nat_type != N2N_NAT_UNKNOWN )
         return;
 
@@ -2895,39 +2732,22 @@ static void nat_classify( n2n_edge_t * eee )
 
     traceEvent( TRACE_NORMAL, "NAT type (RFC 3489): %s -> %s", old, new );
 
-    /* Push the freshly classified NAT type to the SN right away so its
-     * relay-eligibility decision (who is qualified to relay for the group)
-     * never lags the edge's real, up-to-date type. send_register_super
-     * carries the type in aflags.
-     * The edge never judges eligibility itself: NAT being NAT1/2 already
-     * implies a public address, and acting as relay is decided solely by the
-     * SN (which designates us via PEER_INFO RELAY for our own MAC). */
+    /* Push the fresh NAT type to the SN right away so its relay-eligibility
+     * decision never lags. The SN alone decides who relays (PEER_INFO RELAY). */
     if ( eee->supernode.family != 0 )
         send_register_super( eee, &(eee->supernode), 1, 0, NULL );
-    /* Pushing this to the sn2 query channel would be the edge's FIRST
-     * contact with sn2 in the current mapping's lifetime — the very event
-     * that closes the full-cone stranger window (fc_window). While the
-     * stranger test is still pending (window open), sn2 must stay
-     * untouched so its N2NF probes still prove full cone; sn2 picks our
-     * type up from the failover registrations anyway. Only once the window
-     * is closed (an ask_backup dual probe or a failover contact spent it;
-     * the twin check itself only ever touches the current supernode) is
-     * contacting sn2 harmless. */
+    /* Never contact sn2 while the full-cone stranger window (fc_window) is still
+     * open — that first contact would close it and break its N2NF probes. */
     if ( !eee->fc_window &&
          eee->sn_query.family != 0 &&
          memcmp( &eee->sn_query, &eee->supernode, sizeof(eee->sn_query) ) != 0 )
         send_register_super( eee, &(eee->sn_query), 1, 0, NULL );
 }
 
-/* A packet from a helper source port got through: we never used that port
- * as a destination, so the NAT filter is not port-restricted. Shared by the
- * sn1 bounce and the sn2 helper-port probe.
- * A frozen verdict is never re-measured, with one exception: a
- * port-restricted label written while no helper delivery had ever arrived
- * said "unproven", not "proven port-restricted" (the bounce packet can
- * simply have been lost). Re-running the classifier on the evidence already
- * collected can then only make the verdict more specific, and it sends no
- * packet. Nothing else can move after the freeze. */
+/* A helper-source packet proves the NAT filter is not port-restricted. A frozen
+ * verdict is never re-measured, except a port-restricted label written before
+ * any helper delivery ("unproven", the bounce may have been lost): re-running
+ * the classifier on existing evidence only makes it more specific. */
 static void nat_note_helper_port( n2n_edge_t * eee )
 {
     if ( eee->nat_bounce_seen )
@@ -2949,9 +2769,8 @@ static void nat_note_helper_port( n2n_edge_t * eee )
     eee->nat_final = 1;
 }
 
-/* Bounce reply from a sn's helper socket arrived. Only public sources
- * count: a bounce from an in-LAN sn never crosses the NAT. The helper's
- * source port is random, so match by IP against the configured sns. */
+/* Bounce reply from an sn helper socket: only public sources count (an in-LAN
+ * sn never crosses the NAT); the random helper port is matched by IP. */
 static void handle_nat_bounce( n2n_edge_t * eee, const n2n_sock_t * sender )
 {
     if ( sender->family != AF_INET || nat_addr_private( sender->addr.v4 ) )
@@ -2966,16 +2785,10 @@ static void handle_nat_bounce( n2n_edge_t * eee, const n2n_sock_t * sender )
     nat_note_helper_port( eee );
 }
 
-/* Full-cone probe ("N2NF", 4 raw bytes) from the sn2 query channel.
- * Counts as full cone only while the edge has NEVER sent anything to sn2
- * in this mapping lifetime (fc_window): sn2's address is then a
- * never-contacted source, so delivery proves the NAT filter admits ANY
- * source. After that first contact the same packet proves nothing (a cone
- * NAT and a port-restricted one both admit our own destination), but a
- * probe from a source port we never used as a destination still rules out
- * a port-restricted NAT. That is weak evidence only: it never upgrades the
- * verdict to full cone and never erases what was measured before.
- * Public sources only, matched by IP against the sn2 query channel. */
+/* Full-cone probe ("N2NF") from sn2 counts only while the edge never sent sn2
+ * anything this mapping lifetime (fc_window): a never-contacted source proves
+ * the filter admits ANY source; after first contact it only rules out
+ * port-restricted (weak evidence, never an upgrade). Public sources only. */
 static void handle_nat_fc( n2n_edge_t * eee, const n2n_sock_t * sender )
 {
     if ( sender->family != AF_INET || nat_addr_private( sender->addr.v4 ) )
@@ -3003,20 +2816,12 @@ static void handle_nat_fc( n2n_edge_t * eee, const n2n_sock_t * sender )
 }
 
 /* ------------------------------------------------------------------ */
-/* nat_autorecover: rebuild the UDP socket when every supernode is silent.
- *
- * Silence here means our registrations still reach the SN (it keeps listing us
- * as online) while nothing at all comes back, so the NAT mapping on the return
- * path is dead and re-registering on the same socket can never recover it.
- * Rebuild the socket the way a restart does -- rebind the configured local port
- * and re-register at once -- and deliberately nothing else: no NAT re-probe and
- * no verdict reset. The mgmt "n" command does both, but those only make sense
- * when a human asks for a fresh measurement.
- *
- * Rate limited, and skipped entirely while a peer is still reaching us
- * directly: rebinding changes our source port and drops every established P2P
- * direct path, so a supernode that is genuinely down must not make us churn
- * through mappings. */
+/* nat_autorecover: rebuild the UDP socket when every supernode is silent —
+ * our registrations reach the SN but nothing returns, so the mapping on the
+ * return path is dead and re-registering on the same socket never recovers.
+ * Rebuild like a restart (rebind configured port + re-register), deliberately
+ * no NAT re-probe / verdict reset. Rate limited, and skipped while a peer still
+ * reaches us directly: rebinding drops every established P2P path. */
 static void nat_autorecover( n2n_edge_t * eee )
 {
     time_t now = n2n_now();
@@ -3042,10 +2847,8 @@ static void nat_autorecover( n2n_edge_t * eee )
     traceEvent(TRACE_WARNING,
                "Every supernode is silent - rebuilding the UDP socket to refresh the NAT mapping");
 
-    /* Re-resolve the active supernode from its configured -l parameter: the
-     * address may have drifted (DDNS, the SN relaunched on a new IP) while we
-     * kept silently failing on the cached one. The original -l string is the
-     * authority here -- nothing is guessed, nothing cached. */
+    /* Re-resolve the active supernode from its -l parameter: the address may
+     * have drifted (DDNS, SN relaunched); -l is authoritative, nothing cached. */
     {
         n2n_sock_t fresh;
         memset(&fresh, 0, sizeof(fresh));
@@ -3064,9 +2867,7 @@ static void nat_autorecover( n2n_edge_t * eee )
                 if ( ( alt_af == AF_INET6 ) ? ( eee->udp_sock6 != -1 ) : ( eee->udp_sock != -1 ) )
                     supernode2addr( &eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx] );
             }
-            /* Purge the periodic-resolve cache so check_supernode_domain_and_update
-             * compares against this fresh value next round instead of
-             * mis-reporting an "address updated" against the old cache. */
+            /* Purge the periodic-resolve cache so the next round re-resolves against this fresh value. */
             memset( &eee->last_resolved_supernode, 0, sizeof(n2n_sock_t) );
         }
     }
@@ -3092,16 +2893,9 @@ static void nat_autorecover( n2n_edge_t * eee )
 
 /* ------------------------------------------------------------------ */
 /* update_supernode_reg: supernode periodic registration + failover.
- * Failover flow (CHANGES_MasterBackup_v3):
- *   sn1 fails 3 times -> ask_backup -> dual probe (sn1 old address + sn2)
- *     sn1 old address responds (address unchanged) -> switch to sn2
- *     sn2 ACK carries sn1 new address              -> replace supernode,
- *                                                   give sn1 new address 3 tries
- *     sn2 ACK address invalid                      -> stay on sn1 old address
- *   sn1+sn2 both unreachable (sn_idx=1 fails 3 times)
- *     -> sn_all_failed=1, fall back to sn1
- *   sn_all_failed 5 min cooldown -> re-enter ask_backup and try sn2 again
- */
+ * Flow: sn1 fails 3x -> ask_backup (dual probe sn1-old + sn2); sn2 ACK carries
+ * sn1's new address -> replace supernode; address invalid -> stay on sn1.
+ * Both unreachable -> sn_all_failed, fall back to sn1; 5-min cooldown retries. */
 static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 {
     n2n_sock_str_t sockbuf;
@@ -3167,28 +2961,11 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         return;
     }
 
-    /* Phase 2.5: one-shot symmetric check (normal mode).
-     * The verdict needs a SECOND observation: one QUERY_ONLY probe to the
-     * current supernode (sn1) echoes the mapping seen from that
-     * destination, and a twin probe to its alt port (lport+1) echoes the
-     * same IP at a second destination port. Equal public ports from the
-     * twin prove the mapping is reused per IP (NAT3-style); disagreeing
-     * ports prove an endpoint-dependent mapping (NAT4-symmetric). The
-     * check is spent exactly once per mapping generation,
-     * NAT_STRANGER_SECS after the window was armed - late enough for the
-     * brother's N2NF x3 to have landed (multi-sn only), early enough for
-     * the mgmt display to settle. The verdict is then frozen (nat_final)
-     * until the mapping changes, so the answer never wobbles afterwards.
-     * Targeting the connected supernode keeps detection self-contained:
-     * a single-sn setup gets the exact same twin measurement, with no
-     * second supernode required (the full-cone/bounce sub-classes still
-     * need sn2's stranger probes, which only exist when sn_num >= 2).
-     * Skipped while failover/ask_backup is active (those paths already
-     * measure against the failover target), and spent only once the first
-     * observation (Test I) exists: on a slow start the single second
-     * observation must not be burned before the edge has seen any mapping
-     * at all, or nothing is measured and the verdict gets frozen at
-     * "unknown". */
+    /* Phase 2.5: one-shot symmetric check (normal mode). Twin probe to the
+     * supernode's main + alt port (same IP, two destination ports): equal
+     * public ports prove per-IP reuse (NAT3), disagreeing ports prove
+     * endpoint-dependent mapping (NAT4/symmetric). Frozen until the mapping
+     * changes; skipped during failover; waits for Test I. */
     if ( !eee->use_ws && eee->sn_idx == 0 &&
          !eee->sn_ask_backup && !eee->sn_all_failed &&
          eee->supernode.family != 0 &&
@@ -3215,11 +2992,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
             eee->sn_probe_cookie_valid = 1;
 
             /* Twin probe to the current supernode's main + alt port (lport,
-             * lport+1): the same IP at two destination ports. Equal public
-             * ports prove the mapping is reused WITHIN an IP -> a
-             * per-IP-reuse cone (NAT3) that punches fine. This is the
-             * reliable NAT3/NAT4 arbiter and is kept in every configuration
-             * (a single-sn setup gets the exact same measurement). */
+             * lport+1): equal public ports prove per-IP reuse -> NAT3 (punches
+             * fine); this is the reliable NAT3/NAT4 arbiter, kept everywhere. */
             send_register_super( eee, &(eee->supernode), 0, 2, NULL );
             if ( eee->supernode.family == AF_INET &&
                  eee->supernode.port != 0xFFFF )
@@ -3229,16 +3003,9 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
                 send_register_super( eee, &snq_alt, 0, 2, NULL );
             }
 
-            /* Cross-IP probe: when a second supernode (sn2/sn2+) is
-             * configured on a distinct public IP and the full-cone window has
-             * served (no NAT1 verdict yet), also probe sn2 so we can compare
-             * the public port this ONE socket got toward two different IPs.
-             * This is CONFIRMATORY only: a NAT3 changes its port per
-             * destination IP by design, so cross-IP difference by itself
-             * must never upgrade a device to NAT4 (the within-IP reuse
-             * evidence above is the arbiter). It runs at NAT_STRANGER_SECS
-             * and is skipped once fc_seen (NAT1) is decided, so NAT1
-             * detection is never broken. */
+            /* Cross-IP probe to sn2 (distinct public IP, no NAT1 verdict yet):
+             * confirmatory only — cross-IP difference must never upgrade to NAT4
+             * (the within-IP reuse evidence above is the arbiter). */
             int cross_probe = ( eee->sn_num >= 2 &&
                              eee->sn_query.family == AF_INET &&
                              eee->supernode.family == AF_INET &&
@@ -3256,10 +3023,9 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
     }
 
     /* Phase 3: while on the failover target, every 30s probe for sn1 recovery:
-     * 1) ask the sn2 query channel for sn1's CURRENT address (covers a changed
-     *    IP/port on sn1); the ACK only refreshes our cache, it does NOT switch.
-     * 2) heartbeat sn1 directly at the last-known address; failback to sn1
-     *    happens only when sn1 ITSELF answers (handled in the ACK path). */
+     * 1) ask the sn2 query channel for sn1's CURRENT address (refresh only,
+     *    does NOT switch), 2) heartbeat sn1 at the last-known address (only
+     *    sn1's own ACK triggers failback). */
     if ( eee->sn_num >= 2 && eee->sn_idx == eee->sn_backup_index &&
          !eee->use_ws && eee->sn_query.family != 0 &&
          nowTime > eee->last_primary_probe + 30 )
@@ -3275,21 +3041,17 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 
         if ( !eee->re_resolve_supernode_ip )
         {
-            /* sn1 is a literal IP: the -l parameter is the most authoritative
-             * (sn2's brother table may hold an unreachable NATed public
-             * address). Drop any sn2-learned value, skip the sn2 lookup
-             * entirely and just heartbeat the original address — sn1's own
-             * ACK to this probe is what triggers failback. */
+            /* sn1 is a literal IP: -l is authoritative (sn2 may only know an
+             * unreachable NATed address), so skip the sn2 lookup and just
+             * heartbeat the original address — sn1's own ACK triggers failback. */
             eee->sn1_current_addr[0] = '\0';
             supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
         }
         else
         {
-            /* The sn1 cache was last written from sn2's ask_backup answer (a
-             * binary IP text), so the -l domain would never be looked at again.
-             * Every ~5 min drop the cache; the existing resolution below then
-             * falls back to sn_ip_array[0] (the original -l domain), and this
-             * round's sn2 reply re-caches whatever is freshest. */
+            /* The sn1 cache was written from sn2's ask_backup answer (binary IP),
+             * so the -l domain would never be looked at again. Drop the cache
+             * every ~5 min so resolution falls back to the -l domain. */
             if ( nowTime > eee->last_failover_dns + 300 )
             {
                 eee->last_failover_dns = nowTime;
@@ -3301,10 +3063,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
             if ( sn1addr.family == 0 )
                 supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
 
-            /* ask the sn2 query channel for sn1's current address (updates
-             * sn1_current_addr). Always sent — even when the query channel IS
-             * the current failover target, this is what lets us follow a
-             * port/IP change on sn1 and fail back. */
+            /* ask the sn2 query channel for sn1's current address (refreshes
+             * sn1_current_addr), even when it IS the current failover target. */
             send_register_super( eee, &(eee->sn_query), 0, 2, &sn1addr );
         }
 
@@ -3341,11 +3101,9 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
     {
         if ( eee->sn_idx == 0 && eee->sn_num >= 2 )
         {
-            /* sn1 is a domain: ask sn2 for its newest address first — it may
-             * have moved and be reachable at a new one. sn1 configured as a
-             * literal IP falls through with the never-up case: the -l
-             * parameter is authoritative (sn2 may only know an unreachable
-             * NATed address), so there is nothing to look up. */
+            /* sn1 is a domain: ask sn2 for its newest address first — it may have
+             * moved. A literal -l IP falls through with the never-up case: -l is
+             * authoritative (sn2 may only know an unreachable NATed address). */
             if ( eee->sn1_ever_ok && eee->re_resolve_supernode_ip )
             {
                 /* sn1 worked before but now is silent: it may have changed
@@ -3354,9 +3112,7 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
                 eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
                 traceEvent(TRACE_WARNING,
                            "sn1 not responding - asking sn2 for sn1's newest address");
-                /* Fire the first dual probe immediately instead of waiting for
-                 * the next Phase-2 tick: one fresh cookie shared by both
-                 * probes, then Phase 2 takes over the 30s cadence. */
+                /* Fire the first dual probe now (one fresh cookie), then Phase 2 keeps the 30s cadence. */
                 send_register_super( eee, &(eee->sn_query), 1, 0, NULL );
                 send_register_super( eee, &(eee->supernode), 0, 0, NULL );
                 eee->sn_wait = 1;
@@ -3365,10 +3121,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
             }
             else
             {
-                /* sn1 was never up (bad token / wrong port / offline since
-                 * start), or sn1 is a literal IP: no earlier address to
-                 * rediscover, so skip the sn2 lookup and go straight to the
-                 * failover target. */
+                /* sn1 never worked (bad token/wrong port/offline) or is a literal IP:
+                 * no earlier address to rediscover — go straight to the failover target. */
                 traceEvent(TRACE_WARNING,
                            "sn1 not responding - switching directly to sn%u",
                            (unsigned int)(eee->sn_backup_index + 1));
@@ -3434,27 +3188,20 @@ static int find_peer_destination(n2n_edge_t * eee,
                 break;
             }
 
-            /* P2P establishment grace period: for the first P2P_EST_GRACE seconds
-             * after set_peer_operational, continue using relay. The first few P2P
-             * packets may be lost before the direct path stabilizes (NAT mapping);
-             * this gives the P2P path time to settle before we rely on it. */
+            /* Grace period: let the direct path settle (NAT mapping) before relying on it. */
             if ((now - scan->p2p_est_time) < P2P_EST_GRACE) {
                 traceEvent(TRACE_DEBUG, "find_peer_destination: P2P established %lus ago, grace, relay",
                            (unsigned long)(now - scan->p2p_est_time));
                 break;
             }
 
-            /* If keepalive probe is pending and total timeout exceeded, fall back to relay.
-             * Uses direct_seen (P2P packets only) — relay packets must not extend the
-             * probe window, otherwise a dead direct path is never abandoned. */
+            /* Uses direct_seen (P2P packets only) — relay packets must not extend the probe window. */
             if (scan->last_probe_sent > 0 && (now - scan->direct_seen) > KEEPALIVE_TOTAL_TIMEOUT) {
                 traceEvent(TRACE_DEBUG, "find_peer_destination: keepalive failed, using relay");
                 break;
             }
 
-            /* Keepalive is not probing (last_probe_sent == 0) — P2P path is alive.
-             * Use the direct P2P address regardless of direct_seen age.
-             * This keeps data and keepalive on the same path. */
+            /* Not probing => P2P alive; use the direct address regardless of direct_seen age. */
             if (scan->sock.family == AF_INET && eee->udp_sock != -1) {
                 memcpy(destination, &scan->sock, sizeof(n2n_sock_t));
             } else if (scan->sock6.family == AF_INET6 && eee->udp_sock6 != -1) {
@@ -3520,30 +3267,19 @@ static int send_PACKET( n2n_edge_t * eee,
 
     now = n2n_now();
 
-    /* No destination cache: look up the current destination on every packet.
-     * The peer table always holds the freshest address (updated by the main
-     * loop via PACKET piggybacking / REGISTER), so a restarted or NAT-mapped
-     * peer is reached immediately, without waiting for a stale cache to expire.
-     *
-     * WS mode: completely disable P2P, force relay via supernode.
-     *
-     * Windows: TAP thread briefly blocks on PEERS_LOCK if the main loop
-     * holds it — contention windows are microseconds (find_peer_destination
-     * is a short list scan). Blocking is preferable to relaying: dropping a
-     * packet to relay on lock contention would corrupt the P2P path. The
-     * actual UDP send happens after the lock is released. */
+    /* No destination cache: look up the current destination every packet — the
+     * peer table holds the freshest address (PACKET piggyback / REGISTER), so a
+     * restarted or NAT-mapped peer is reached immediately. WS mode: no P2P,
+     * force relay via supernode. Windows: the TAP thread briefly blocks on
+     * PEERS_LOCK — preferable to dropping the packet on lock contention. */
     int probing = 0;
     if (eee->use_ws) {
         dest = 0;
         destination = eee->supernode;
         ++(eee->tx_sup); eee->super_tx_bytes += pktlen;
     } else {
-        /* Destination cache: a hit avoids the peer-table scan on every
-         * packet. The cache is keyed by dstMac and has a short TTL so a
-         * NAT-mapped / restarted peer is re-resolved quickly. All reads
-         * and writes happen under PEERS_LOCK, keeping it race-free on
-         * Windows (TAP thread + main loop) and a no-op on Linux (single
-         * thread). */
+        /* Destination cache (keyed by dstMac, short TTL): avoids the peer-table
+         * scan; all access under PEERS_LOCK keeps it race-free on Windows. */
         PEERS_LOCK(eee);
         struct peer_info *dst_peer = NULL;
         if (eee->cached_dst_valid && eee->cached_dst_is_peer &&
@@ -3593,12 +3329,10 @@ static int send_PACKET( n2n_edge_t * eee,
         }
     } else {
         /* No direct P2P to this MAC. If a community relay is assigned and the
-         * target is not broadcastable, route via relay. While the relay path is
-         * unproven (or recently silent) we dual-send relay+SN so no data is lost;
-         * once a frame actually comes back through relay (relay_proven window) we
-         * use relay only. A dead relay is detected by the REGISTER_ACK heartbeat
-         * in check_relay (RELAY_ACK_SECS), which flags giveup and falls back to
-         * SN. Relay send failure here also falls back to SN. */
+         * target is not broadcastable, route via relay: dual-send relay+SN
+         * while unproven, relay-only once a frame came back (relay_proven);
+         * a dead relay is detected by the REGISTER_ACK heartbeat in check_relay
+         * (RELAY_ACK_SECS) -> giveup -> fall back to SN. */
         int via_relay = (eee->relay_valid && !is_multi_broadcast(dstMac));
         if (via_relay && !eee->relay_giveup)
         {
@@ -3672,13 +3406,11 @@ static int send_PACKET( n2n_edge_t * eee,
                 p->last_query_sent = now;
         }
 
-        /* No on-demand punch here: starting the WAN punch loop from this
-         * packet would set punch_start_time before the QUERY_PEER reply
-         * arrives, and the PUNCH handler (LAN-first) would then take its
-         * "already running" branch and skip the LAN phase. Keep LAN ahead of
-         * WAN: the QUERY below brings the PUNCH reply, the PUNCH handler
-         * opens the LAN phase (same public IP) or starts the WAN punch, and
-         * the LAN timeout in check_punch_timeouts falls back to WAN. */
+        /* No on-demand punch here: starting the WAN punch loop from this packet
+         * would set punch_start_time before the QUERY_PEER reply arrives, and
+         * the PUNCH handler would take its "already running" branch and skip
+         * the LAN phase. Keep LAN ahead of WAN; the LAN timeout in
+         * check_punch_timeouts falls back to WAN. */
         PEERS_UNLOCK(eee);
 
         if (do_query && p) {
@@ -3997,17 +3729,9 @@ static int handle_PACKET( n2n_edge_t * eee,
 
     from_supernode= cmn->flags & N2N_FLAGS_FROM_SUPERNODE;
 
-    /* Relay mode: acting as the community relay peer (mini-SN). If this PACKET
-     * is aimed at a member that registered to us (not at ourselves), relay the
-     * already encrypted payload to that member unchanged — the relay never
-     * decrypts, so the e2e community transform is preserved.
-     *
-     * Forwarding is deliberately near zero-cost: the frame is NOT re-encoded
-     * and the payload is NOT copied. We only decrement the TTL (supernode
-     * behaviour) and set N2N_FLAGS_FROM_RELAY in place inside the received
-     * datagram, which is enough for the destination to classify it as relayed.
-     * raw_hdr is NULL for locally reconstructed frames (compact) which cannot
-     * be forwarded in place — they are skipped here. */
+    /* Relay mode (mini-SN): pass the already-encrypted payload through
+     * unchanged — never decrypt (e2e preserved) — TTL-1 + FROM_RELAY flag in
+     * place; locally reconstructed (compact) frames (raw_hdr NULL) skip here. */
     if ( eee->relay_mode &&
          raw_hdr != NULL &&
          !is_multi_broadcast(pkt->dstMac) &&
@@ -4016,9 +3740,8 @@ static int handle_PACKET( n2n_edge_t * eee,
         struct peer_info *dst = NULL;
         n2n_sock_t *dst_sock = NULL;
         PEERS_LOCK(eee);
-        /* Prefer the dedicated member table (mini-SN). Fall back to the P2P
-         * tables only if the registrant has not arrived via REGISTER yet
-         * (e.g. the first frame before registration completes). */
+        /* Prefer the dedicated member table (mini-SN); fall back to the P2P
+         * tables if the registrant has not arrived via REGISTER yet. */
         dst = find_peer_by_mac(eee->relay_peers, pkt->dstMac);
         if (dst && dst->sock.family != 0)
             dst_sock = &dst->sock;
@@ -4076,14 +3799,10 @@ static int handle_PACKET( n2n_edge_t * eee,
         return retval;
     }
 
-    /* Relay: a frame marked N2N_FLAGS_FROM_RELAY was forwarded by the
-     * community relay peer (mini-SN). A frame whose transport source is the
-     * relay socket is kept as a compatibility fallback for older relays that
-     * have not been upgraded to set the flag. Classify either like a
-     * supernode-relayed frame below so we never mis-mark the data peer as
-     * directly connected (which would disarm the relay / black-hole traffic).
-     * A frame reaching us through the relay also proves the relay path end to
-     * end — the sender may then drop the supernode copy. */
+    /* FROM_RELAY frame (or transport source = relay socket, for older
+     * relays): classify like a supernode-relayed frame — never mis-mark the
+     * data peer as directly connected (disarms the relay). A relayed frame
+     * also proves the path end to end, so drop the supernode copy. */
     uint8_t from_relay = ( cmn->flags & N2N_FLAGS_FROM_RELAY ) ? 1 : 0;
     if ( !from_relay && eee->relay_valid && tx_sender &&
          sock_equal( &eee->relay_sock, tx_sender ) == 0 )
@@ -4093,8 +3812,7 @@ static int handle_PACKET( n2n_edge_t * eee,
         /* First frame actually delivered back through the community relay:
          * the relay path is proven end to end. Same wording as the historical
          * punch-failure marker so P2P-direct / edge-relay / supernode states
-         * read side by side in the log; the acting relay itself is marked
-         * with '*' on the management page. */
+         * read side by side; the acting relay is marked '*' on the mgmt page. */
         eee->relay_proven = now;
         uint32_t pip = 0;
         n2n_mac_t pmac;
@@ -4115,12 +3833,8 @@ static int handle_PACKET( n2n_edge_t * eee,
     else if (from_relay)
         eee->relay_proven = now;
 
-    /* A frame routed through R proves the relay is alive. This must clear
-     * relay_giveup immediately: otherwise check_relay's silent-5s fallback keeps
-     * giveup stuck at 1 (we keep sending via SN while still receiving via R),
-     * and the 35s retry re-toggles it -- the "falling back <-> path proven"
-     * flapping in the log. Restore relay-only forwarding on any real relay
-     * frame. */
+    /* A frame routed through R proves the relay is alive: clear relay_giveup
+     * immediately, else the silent-5s fallback and 35s retry keep flapping. */
     if (from_relay && eee->relay_giveup)
     {
         eee->relay_giveup = 0;
@@ -4181,25 +3895,14 @@ static int handle_PACKET( n2n_edge_t * eee,
                         p->sockets[0] = *orig_sender;
                         p->num_sockets = 1;
                         peer_list_add(&eee->pending_peers, p);
-                        /* Metadata-only first contact: a relayed broadcast is
-                         * not communication. peer_list_add() above force-fills
-                         * last_seen; backdate it just outside the
-                         * PUNCH_ACTIVE_WINDOW so the PEER_INFO address-change
-                         * gate does not read this peer as "communicating"
-                         * (now - last_seen <= 30s) and restart a hole-punch at
-                         * startup with zero real traffic. Not 0: purge keeps
-                         * peers with last_seen < now-1800, so 0 would free the
-                         * entry on the next purge cycle. Real data flows
-                         * refresh last_seen as usual. */
+                        /* Metadata-only first contact: relayed broadcasts are not
+                         * communication. Backdate last_seen outside the punch
+                         * window so the gate never reads this peer as active;
+                         * 0 would trip the purge (last_seen < now-1800). */
                         p->last_seen = n2n_now() - PUNCH_ACTIVE_WINDOW - 1;
                         traceEvent(TRACE_DEBUG, "handle_PACKET: saved relayed peer %s",
                                    macaddr_str(mac_buf, pkt->srcMac));
-                        /* Relayed first contact (a fresh peer's startup
-                         * ARP/GARP broadcasts or any sn-forwarded traffic)
-                         * only updates local info — no REGISTER/punch here.
-                         * Punching starts on demand only: our own QUERY for
-                         * the peer brings a PUNCH reply, or the peer's
-                         * direct REGISTER arrives. */
+                        /* Relayed first contact only updates local info — punching starts on demand (QUERY/PUNCH or direct REGISTER). */
                         scan = p; /* reuse for assigned_ip extraction below */
                     }
                 }
@@ -4234,13 +3937,8 @@ static int handle_PACKET( n2n_edge_t * eee,
                         *active_sock = pkt->sock;
                     }
                 }
-                /* Only a frame addressed directly to us counts as
-                 * communication. Startup ARP/GARP broadcasts relayed via the
-                 * supernode would otherwise refresh last_seen and make the
-                 * PEER_INFO address-change gate (was_communicating) read the
-                 * peer as "communicating" - starting a hole-punch at startup
-                 * with zero real traffic. Real relay unicast keeps refreshing
-                 * as before. */
+                /* Only frames addressed to us count: relayed startup broadcasts must
+                 * not refresh last_seen (would false-arm the punch gate). */
                 if (memcmp(pkt->dstMac, eee->device.mac_addr, N2N_MAC_SIZE) == 0)
                     scan->last_seen = now;
             }
@@ -4268,9 +3966,9 @@ static int handle_PACKET( n2n_edge_t * eee,
                     int need_resp = bypass_handle_probe_frame(eee->bp, eth_payload, eth_size, is_ack, orig_sender);
                     if (need_resp && !is_ack) {
                         /* Send PROBE_ACK directly to the sender's P2P address,
-                         * bypassing find_peer_destination's relay-via-supernode logic.
-                         * This prevents "Relayed packet: addr changed" on the peer side
-                         * when the peer is still in pending_peers. */
+                         * bypassing find_peer_destination's relay-via-supernode
+                         * logic (avoids "Relayed packet: addr changed" while the
+                         * peer is still in pending_peers). */
                         uint8_t probe_ack[19];
                         size_t pa_len = bypass_build_probe_frame(probe_ack, eee->device.ip_addr, 1, 0);
                         memcpy(probe_ack + 6, eee->device.mac_addr, 6); /* src MAC */
@@ -4506,10 +4204,9 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                        (struct sockaddr*) &sender_sock, i);
                 return;
             }
-            /* Refresh behaves like a restart: rebuild the socket on a
-             * brand-new random mapping (empty filter whitelist = the
-             * brother's N2NF probe is a true stranger again) and re-run the
-             * full detection from scratch. */
+            /* Refresh behaves like a restart: rebuild the socket on a brand-new
+             * random mapping (empty filter whitelist = the brother's N2NF probe
+             * is a true stranger again) and re-run the full detection. */
             eee->nat_rebuild_tries = 0; /* fresh retest budget for this refresh */
             if (nat_refresh_rebuild( eee ) < 0)
                 msg_len += snprintf((char*)(udp_buf + msg_len), (N2N_PKT_BUF_SIZE - msg_len),
@@ -4670,9 +4367,9 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             peer = peer->next;
             continue;
         }
-        /* Peers that register to this relay are listed in the Relay: section
-         * (whether or not they also have a direct path); P2P_with keeps
-         * only peers with no relay relationship, so nothing is duplicated. */
+        /* Peers that register to this relay are listed in the Relay: section;
+         * P2P_with keeps only peers with no relay relationship, so nothing
+         * is duplicated. */
         if (eee->relay_peers != NULL &&
             find_peer_by_mac(eee->relay_peers, peer->mac_addr)) {
             peer = peer->next;
@@ -4779,19 +4476,17 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
         size_t disp = 0;   /* sequential label across shown rows (hide jump numbers) */
         for (size_t sn_i = 0; sn_i < eee->sn_num && sn_i < N2N_EDGE_NUM_SUPERNODES; sn_i++)
         {
-            /* Only show the two failover endpoints: the primary (sn1, index 0)
-             * and the current failover target (sn_backup_index). The pure
-             * query channel (sn2) does not take part in switching, so hide it
-             * from the display when it is not itself the failover target. */
+            /* Show only the two failover endpoints: the primary (sn1, index 0)
+             * and the current failover target. The pure query channel (sn2) is
+             * hidden when it is not itself the failover target. */
             if ( sn_i != 0 && sn_i != eee->sn_backup_index )
                 continue;
 
             disp++;
 
             /* Left column: the active one shows '*' INSTEAD of the number (same
-             * style as the P2P_with relay '*'); others their sequential
-             * label. Each string carries its own width (" *" / "%2u") so
-             * the column aligns exactly like the edge list above. */
+             * style as the P2P_with relay '*'); others their sequential label,
+             * each string carrying its own width for column alignment. */
             char marker[8];
             if ( sn_i == eee->sn_idx )
                 snprintf(marker, sizeof(marker), " *");
@@ -4800,9 +4495,7 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             const char *tok_str = (eee->token_configured && eee->sn_tokens[sn_i].toksize > 0) ? "Pass" : "NoTok";
             const char *b_marker = "";
             /* '-b' on the primary (sn1) row means "sn1 has a little brother
-             * (sn2, learned from the sn1 ACK), i.e. this SN is configured via
-             * -b". It stays shown as long as that sibling exists, regardless
-             * of which supernode is active. */
+             * (sn2, learned from the sn1 ACK)", shown as long as it exists. */
             if ( sn_i == 0 &&
                  eee->sn_query_index < eee->sn_num &&
                  eee->sn_ack_backup[eee->sn_query_index] )
@@ -4810,10 +4503,9 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             const char *mac_str = "-";
             if (sn_i == 0 && mac_nonzero(eee->sn1_mac))
                 mac_str = macaddr_str(mac_buf, eee->sn1_mac);
-            /* Host: when sn1's IPv6 is known, print both stacks with the port
-             * once at the end ("v4/[v6]:port") since IPv4 and IPv6 share it.
-             * Worst case is 15 + 1 + 41 + 6 = 63 chars, inside the 65-wide
-             * column, so no truncation is needed. */
+            /* Host: with sn1 IPv6 known, print both stacks with the port once
+             * at the end ("v4/[v6]:port"); worst case 63 chars fits the 65-wide
+             * column. */
             const char *sn_host = eee->sn_ip_array[sn_i];
             /* ACK-learned brother: show the masked display copy instead */
             if ( sn_is_ack_brother(eee, sn_i) && eee->sn_bak_masked[0] )
@@ -4842,16 +4534,12 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
                     sn_host = host;
                 }
             }
-            /* Fixed column widths -> fixed left edges for every group.
-             * Over-long content is truncated (like the sample layout):
-             * marker 2, mac 17, host 65, version 7, tok 7, -b. The version
-             * and token columns land on the "ver" and "os" header columns. */
+            /* Fixed column widths -> fixed left edges: marker 2, mac 17, host
+             * 65, version 7, tok 7, -b; version/token land on the header columns. */
             char ver_field[8];
             char tok_row[8];
-            /* For the ACK-learned brother the row carries no real data of its
-             * own: it was never configured via -l, never registered to, so its
-             * version/token values would be fabricated. Dash them, same as the
-             * MAC/host. */
+            /* The ACK-learned brother row carries no real data (never configured via
+             * -l, never registered to): dash version/token like the MAC/host. */
             if ( eee->sn_ack_backup[sn_i] ) {
                 snprintf(ver_field, sizeof(ver_field), "-");
                 snprintf(tok_row, sizeof(tok_row), "-");
@@ -4947,16 +4635,10 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
            (struct sockaddr*) &sender_sock, i);
 }
 
-/** Attempt LAN / IPv4 direct registration for a peer described by a PEER_INFO.
- *
- * This is the shared LAN/IPv4 flow used when there is no IPv6 candidate
- * (original behaviour) AND when there is an IPv6 candidate from an IPv4-only
- * supernode (edge-reported address). When \p ipv6_candidate is non-NULL and
- * valid, the IPv6 address is additionally tried as a parallel candidate — the
- * LAN/IPv4 flow itself is left completely unchanged so that an IPv4-only
- * supernode never degrades LAN / IPv4 direct connectivity.
- *
- * Must be called with PEERS_LOCK held. */
+/** Attempt LAN / IPv4 direct registration for a peer described by a PEER_INFO:
+ *  the shared LAN/IPv4 flow, with \p ipv6_candidate tried in parallel when a
+ *  valid one exists (edge-reported, IPv4-only supernode). Must be called with
+ *  PEERS_LOCK held. */
 static void try_peer_lan_ipv4( n2n_edge_t * eee,
                                uint16_t aflags,
                                const n2n_sock_t * pub_sock,
@@ -4992,16 +4674,9 @@ static void try_peer_lan_ipv4( n2n_edge_t * eee,
         try_send_register(eee, 1, pending->mac_addr, ipv6_candidate);
 }
 
-/** Stop any running hole-punch for a peer and start a brand-new, complete
- *  punch from scratch against its freshly-learned address. This is the
- *  single response to a peer address change (principle: either side of a
- *  communicating pair moved => stop the old punch and start over, whatever
- *  the transport state — relay or direct — and whatever the previous punch
- *  outcome). LAN-first: try_peer_lan_ipv4 starts the same-LAN phase and the
- *  LAN REGISTER; the WAN punch is started by check_punch_timeouts when the
- *  LAN phase times out, or immediately by try_send_register for the
- *  different-public-IP path. No-op in WS mode (no P2P punching there).
- *  Must be called with PEERS_LOCK held. */
+/** Stop any running punch and start a brand-new complete punch against a
+ *  peer's freshly-learned address. LAN-first via try_peer_lan_ipv4; WAN punch
+ *  follows on LAN timeout. No-op in WS mode. Must be called with PEERS_LOCK held. */
 static void restart_punch_for_peer( n2n_edge_t * eee,
                                     struct peer_info * pending,
                                     uint16_t aflags,
@@ -5019,23 +4694,18 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
     pending->punch_round_time = 0;
     pending->lan_punch_start = 0;
     pending->lan_punch_done = 0;
-    /* Clean WAN-only state: a previous same-LAN phase (num_sockets == 2)
-     * must not leak its stale sockets[1] into the new punch. The LAN path
-     * rebuilds both via try_send_register_lan. */
+    /* Drop stale LAN sockets[1] from a previous same-LAN phase; the LAN path rebuilds both. */
     pending->num_sockets = 1;
 
     if ( pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1 &&
          eee->sn_ipv6_support )
     {
-        /* Dual-stack supernode: sock6 was learned via real IPv6
-         * registration — try the IPv6 address directly. */
+        /* Dual-stack supernode: sock6 came from a real IPv6 registration. */
         try_send_register( eee, 1, pending->mac_addr, &pending->sock6 );
     }
     else if ( pending->sock6.family == AF_INET6 && eee->udp_sock6 != -1 )
     {
-        /* IPv4-only supernode: sock6 is an edge-reported address.
-         * Keep the LAN/IPv4 direct flow, IPv6 as a parallel
-         * candidate only. */
+        /* IPv4-only supernode: sock6 is edge-reported; IPv6 stays a parallel candidate only. */
         try_peer_lan_ipv4( eee, aflags, pub_sock, lan_sock, pending, &pending->sock6 );
     }
     else
@@ -5363,11 +5033,8 @@ process_n2n_packet:
                  0 == memcmp(reg.dstMac, "\x00\x00\x00\x00\x00\x00", 6) )
             {
                 PEERS_LOCK(eee);
-                /* Relay mode (mini-SN): when this edge acts as the community
-                 * relay, remember the registrant in a dedicated member table
-                 * for forwarding, independent of the P2P peer tables. The
-                 * registrant reaches the relay directly (NAT1), so use the
-                 * REGISTER transport source. */
+                /* Relay mode (mini-SN): record the registrant in the dedicated relay
+                 * member table; it reaches us directly (NAT1), so use the transport source. */
                 if (eee->relay_mode && sender.family != 0) {
                     struct peer_info *rp = find_peer_by_mac(eee->relay_peers, reg.srcMac);
                     if (!rp) {
@@ -5382,9 +5049,7 @@ process_n2n_packet:
                         if (sender.family == AF_INET) rp->sock = sender;
                         else rp->sock6 = sender;
                         rp->last_seen = n2n_now();
-                        /* Enrich the member entry with the info R already has
-                         * about this MAC (from SN PEER_INFO) so the management
-                         * page can show its virtual IP / version / OS / NAT. */
+                        /* Enrich with known_peers info (from SN PEER_INFO) for the mgmt display. */
                         struct peer_info *kn = find_peer_by_mac(eee->known_peers, reg.srcMac);
                         if (kn) {
                             rp->assigned_ip = kn->assigned_ip;
@@ -5436,10 +5101,7 @@ process_n2n_packet:
                         strncpy(scan->os_name, reg.os_name, sizeof(scan->os_name) - 1);
                         scan->os_name[sizeof(scan->os_name) - 1] = '\0';
                     }
-                    /* Peer already in known_peers - don't reset bypass state.
-                     * If peer restarted with different bypass preference,
-                     * it will be detected via PROBE timeout (peer won't reply).
-                     * This preserves existing bypass connections. */
+                    /* Don't reset bypass state here — a restarted peer with a different preference surfaces via PROBE timeout. */
                 }
                 PEERS_UNLOCK(eee);
             }
@@ -5448,7 +5110,6 @@ process_n2n_packet:
         }
         else if(msg_type == MSG_TYPE_REGISTER_ACK)
         {
-            /* Peer edge is acknowledging our register request */
             n2n_REGISTER_ACK_t ra;
 
             decode_REGISTER_ACK( &ra, &cmn, udp_buf, &rem, &idx );
@@ -5464,11 +5125,7 @@ process_n2n_packet:
                        sock_to_cstr(sockbuf1, &sender),
                        sock_to_cstr(sockbuf2, orig_sender) );
 
-            /* Heartbeat: a REGISTER_ACK from the community relay (R) is the
-             * relay's liveness answer to our every-3s REGISTER. Refresh the
-             * health timestamp and clear any gave-up state so we resume R.
-             * Mirrors how REGISTER_SUPER_ACK keeps the active supernode alive;
-             * traffic is never consulted here. */
+            /* REGISTER_ACK from the community relay (R) = its liveness answer to our 3s REGISTER. */
             if ( eee->relay_valid &&
                  memcmp( ra.srcMac, eee->relay_mac, N2N_MAC_SIZE) == 0 )
             {
@@ -5480,12 +5137,9 @@ process_n2n_packet:
                 }
             }
 
-            /* Move from pending_peers to known_peers; ignore if not in pending. */
             PEERS_LOCK(eee);
             if ( from_supernode ) {
-                /* REGISTER_ACK relayed via supernode: direct path NOT verified.
-                 * Do NOT move to known_peers. Keep in pending_peers so traffic uses
-                 * supernode relay. Only promote to known_peers on a direct REGISTER_ACK. */
+                /* Relayed via supernode: direct path NOT verified — stay in pending_peers. */
                 struct peer_info *pscan = find_peer_by_mac(eee->pending_peers, ra.srcMac);
                 if ( pscan ) {
                     pscan->last_seen = n2n_now(); /* keep alive in pending_peers */
@@ -5500,20 +5154,16 @@ process_n2n_packet:
         }
         else if(msg_type == n2n_probe)
         {
-            /* Another edge sent us a direct PROBE to open NAT mapping.
-             * 1. Send PROBE_ACK via supernode so sender learns their public addr.
-             * 2. Start reverse punch only if not already in progress/done. */
+            /* Direct PROBE to open our NAT mapping: reply PROBE_ACK, then reverse-punch if not already running. */
             n2n_PROBE_t probe;
             decode_PROBE(&probe, &cmn, udp_buf, &rem, &idx);
 
             traceEvent(TRACE_INFO, "Rx PROBE from %s at %s - sending PROBE_ACK",
                        macaddr_str(mac_buf1, probe.srcMac), sock_to_cstr(sockbuf1, &sender));
 
-            /* Send PROBE_ACK via supernode: tell sender what addr we observed */
             send_probe_ack(eee, probe.srcMac, &sender);
 
-            /* sender is the peer's real public address (direct UDP packet).
-             * Update pending_peers sock so subsequent REGISTERs go directly. */
+            /* The PROBE came from the peer's real public address — learn it so REGISTERs go direct. */
             PEERS_LOCK(eee);
             struct peer_info *known = find_peer_by_mac(eee->known_peers, probe.srcMac);
             if ( NULL == known ) {
@@ -5536,18 +5186,14 @@ process_n2n_packet:
         }
         else if(msg_type == n2n_probe_ack)
         {
-            /* Received PROBE_ACK: we now know our real public addr
-             * as observed by the remote peer. Update that peer's sock and retry REGISTER. */
+            /* PROBE_ACK reveals our own public address as observed by the peer; retry REGISTER there. */
             n2n_PROBE_ACK_t ack;
             decode_PROBE_ACK(&ack, &cmn, udp_buf, &rem, &idx);
 
             traceEvent(TRACE_INFO, "Rx PROBE_ACK from %s: my observed addr = %s",
                        macaddr_str(mac_buf1, ack.dstMac), sock_to_cstr(sockbuf1, &ack.observed_addr));
 
-            /* The peer that sent PROBE_ACK is ack.dstMac; their sock is 'sender'.
-             * More importantly, we now know our own public addr. Update and retry REGISTER. */
             PEERS_LOCK(eee);
-            /* Update last_seen in known_peers so keepalive knows peer is alive */
             struct peer_info *kp = find_peer_by_mac(eee->known_peers, ack.dstMac);
             if (kp) {
                 kp->last_seen = now;
@@ -5557,7 +5203,6 @@ process_n2n_packet:
             }
             struct peer_info * scan = find_peer_by_mac(eee->pending_peers, ack.dstMac);
             if ( scan && !scan->punch_failed ) {
-                /* Send REGISTER to the address that was probed (based on observed_addr family) */
                 n2n_sock_t *target_addr = (ack.observed_addr.family == AF_INET6) ? &scan->sock6 : &scan->sock;
                 if (target_addr->family != 0) {
                     send_register(eee, target_addr);
@@ -5575,32 +5220,19 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
-            /* Relay: SN advertises the community relay peer. When the advertised
-             * MAC is our own, the SN is designating THIS edge as the relay:
-             * switch on forwarding. Otherwise the relay is another peer and we
-             * remember its address so we can register to it as a client. The
-             * edge carries no eligibility judgment of its own -- the SN decides
-             * who qualifies (NAT1/2, public, willing). */
+            /* Relay advertisement: our own MAC => we are the designated relay (enable
+             * forwarding); another MAC => remember it and register to it as a client.
+             * The SN alone decides eligibility. */
             if (pi.aflags & N2N_AFLAGS_RELAY) {
-                /* WS mode carries the SN conversation over the WebSocket, but a
-                 * community relay is pure UDP (register to it, send data to it,
-                 * receive forwarded frames from it). WS mode is chosen exactly
-                 * when UDP is not usable, so ignore relay assignments
-                 * completely: we neither become a relay nor register to one. */
+                /* WS mode is UDP-less, so a UDP relay is unusable: ignore relay assignments entirely. */
                 if (eee->use_ws) return 1;
                 if (memcmp(pi.mac, eee->device.mac_addr, N2N_MAC_SIZE) == 0) {
                     eee->relay_mode = 1; /* we are the designated relay */
-                    /* The SN names our own MAC: this is our relay assignment,
-                     * not a peer announcement. Never fall through to the generic
-                     * PEER_INFO handling below - it would add ourselves to
-                     * pending_peers, make us REGISTER to our own public address
-                     * and drag the SN into advertising a different peer as the
-                     * relay for us. */
+                    /* Our own MAC: relay assignment, not a peer announcement — do not fall
+                     * through (would self-register and mislead the SN). */
                     return 1;
                 } else {
-                    /* Client view: remember R so we can register to it. Log only
-                     * when R actually changes -- SN re-advertises the same relay
-                     * every ~15s, and repeating it would spam the log. */
+                    /* Client view: remember R for registration; log only when R changes (SN re-advertises every ~15s). */
                     int rchanged = ( !eee->relay_valid ||
                                      eee->relay_sock.port != pi.sockets[0].port ||
                                      memcmp(eee->relay_sock.addr.v4, pi.sockets[0].addr.v4,
@@ -5610,11 +5242,7 @@ process_n2n_packet:
                     eee->relay_valid = 1;
                     eee->relay_last_reg = 0; /* register to the relay on next tick */
                     if (rchanged) {
-                        /* Start the 15s grace: until the first REGISTER_ACK
-                         * arrives, base relay_last_ack on now so a dead relay
-                         * is detected after RELAY_ACK_SECS even if it never
-                         * ACKs at all. Re-advertisement of the same R leaves
-                         * the existing health timestamp untouched. */
+                        /* Base relay_last_ack on now so a dead relay is detected after RELAY_ACK_SECS even if it never ACKs. */
                         eee->relay_last_ack = n2n_now();
                         traceEvent(TRACE_INFO, "Rx PEER_INFO RELAY relay=%s at %s",
                                    macaddr_str(mac_buf1, pi.mac),
@@ -5675,9 +5303,7 @@ process_n2n_packet:
                         PEERS_UNLOCK(eee);
                         return 1;
                     }
-                    /* Address change is detected unconditionally (2026-09-29:
-                     * a changed address on a communicating pair restarts the
-                     * punch immediately — no direct-seen 5s gate). */
+                    /* Address change is detected unconditionally: a changed address on a communicating pair restarts the punch immediately. */
                     if (pi.sockets[0].family == AF_INET) {
                         if (known->sock.family != AF_INET ||
                             sock_equal(&known->sock, &pi.sockets[0]) != 0) {
@@ -5708,14 +5334,8 @@ process_n2n_packet:
                             uint8_t nt = N2N_NAT_FROM_AFLAGS(pi.aflags);
                             if (nt) known->nat_type = nt; /* 0 = sn did not report */
                         }
-                        /* Do NOT update last_seen here — PEER_INFO is from the
-                         * supernode, not from the peer itself. Updating last_seen
-                         * would mask relay failures: if the relay is broken but
-                         * the supernode still sends PEER_INFO (because the peer
-                         * is still registered), last_seen stays current and the
-                         * relay failure detection in check_keepalive never triggers.
-                         * last_seen should only reflect actual peer communication
-                         * (PACKET, REGISTER), not metadata from the supernode. */
+                        /* Do NOT update last_seen here — PEER_INFO is SN metadata,
+                         * not peer traffic; it would mask relay failures. */
                         PEERS_UNLOCK(eee);
                         return 1;
                     }
@@ -5733,16 +5353,11 @@ process_n2n_packet:
                     }
                 }
                 if (pending) {
-                    /* Communicating scope for the broadcast path: a peer with
-                     * direct connectivity, or heard from recently over any
-                     * transport, is a communicating partner — its address
-                     * change restarts the punch. Idle peers only get their
-                     * address refreshed (no punch). */
+                    /* Communicating = direct link or heard recently; only its address change restarts the punch. */
                     was_communicating = (pending->direct_seen != 0 ||
                                          (now - pending->last_seen) <= PUNCH_ACTIVE_WINDOW);
                     if (!addr_changed) {
-                        /* Peer already in pending (not moved from known):
-                         * detect a change against its current address too. */
+                        /* Peer already in pending: detect a change against its current address too. */
                         if (pi.sockets[0].family == AF_INET) {
                             if (pending->sock.family != AF_INET ||
                                 sock_equal(&pending->sock, &pi.sockets[0]) != 0) {
@@ -5776,11 +5391,7 @@ process_n2n_packet:
                         uint8_t nt = N2N_NAT_FROM_AFLAGS(pi.aflags);
                         if (nt) pending->nat_type = nt;
                     }
-                    /* PEER_INFO is from the supernode, not from the peer
-                     * itself - metadata does not count as communication.
-                     * Refreshing last_seen here would make the
-                     * was_communicating gate above read an idle peer as
-                     * active and restart a punch with zero real traffic. */
+                    /* SN metadata is not peer communication; refreshing last_seen here would false-arm the punch gate. */
                     if (addr_changed && was_communicating)
                         restart_punch_for_peer(eee, pending, pi.aflags,
                                                &pi.sockets[0], &pi.sockets[1]);
@@ -5825,12 +5436,8 @@ process_n2n_packet:
                 pending->assigned_ip = pi.assigned_ip;
                 pending->nat_type = N2N_NAT_FROM_AFLAGS(pi.aflags);
                 peer_list_add(&eee->pending_peers, pending);
-                /* peer_list_add() force-fills last_seen; this PEER_INFO dump
-                 * from the supernode is metadata, not peer communication -
-                 * backdate it just outside PUNCH_ACTIVE_WINDOW so an idle peer
-                 * is never read as "communicating" by the address-change gate
-                 * and punched at startup. Not 0: purge (last_seen < now-1800)
-                 * would free the entry on the next purge cycle. */
+                /* Backdate last_seen outside PUNCH_ACTIVE_WINDOW: PEER_INFO is SN
+                 * metadata, and 0 would trip the purge (last_seen < now-1800). */
                 pending->last_seen = n2n_now() - PUNCH_ACTIVE_WINDOW - 1;
                 PEERS_UNLOCK(eee);
                 if (eee->enable_gaming_mode && pi.assigned_ip != 0) {
@@ -5877,11 +5484,8 @@ process_n2n_packet:
                 peer_list_add(&eee->pending_peers, pending);
             }
 
-            /* Snapshot the addresses before the refresh below: a PUNCH that
-             * carries a genuinely new address (peer restarted / NAT remapped)
-             * must stop the old punch and start a complete new one; a PUNCH
-             * that only re-hands the same address (per-round handoff) must
-             * not restart the rounds. */
+            /* Snapshot pre-refresh addresses: a genuinely new PUNCH address restarts
+             * the punch; a same-address per-round handoff must not. */
             n2n_sock_t prev_sock  = pending->sock;
             n2n_sock_t prev_sock6 = pending->sock6;
 
@@ -5912,27 +5516,8 @@ process_n2n_packet:
                 ( prev_sock6.family != pending->sock6.family ||
                   sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
 
-            /* A changed address restarts the whole punch unconditionally:
-             * either side of a communicating pair moved => stop the old punch
-             * and start a brand-new complete two-way punch, whatever the
-             * transport state (relay or direct) and whatever the previous
-             * punch outcome (including a previous give-up). An unchanged
-             * address never restarts an established direct link: set_peer_operational
-             * resets the punch state on going direct, so a handoff PUNCH would
-             * otherwise re-arm the rounds in an endless loop — a direct peer
-             * just refreshes its address. Same-address handoffs never restart
-             * a punch that is already in progress — during the WAN rounds
-             * (punch_start_time) or the LAN phase (lan_punch_start). Restarting
-             * there is a self-feeding burst: the restart's own
-             * try_send_register -> start_punch sends a fresh QUERY, whose
-             * PUNCH reply restarts again — an RTT-paced loop that fires right
-             * after startup while the NAT type is still unknown and the sn
-             * answers every QUERY. A peer that gave up is left alone: the
-             * 40s x 3 retry chain in check_punch_timeouts re-arms the rounds
-             * and finally settles on relay only, so a same-address handoff
-             * must not reset that timer by re-arming right here. Only an idle
-             * peer with no punch running and no live direct link is re-armed
-             * exactly as before. */
+            /* Same-address handoff must NOT restart the punch: that would
+             * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain). */
             int direct_alive = ( pending->direct_seen != 0 &&
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
             int punch_running = ( pending->punch_start_time != 0 ||
@@ -5963,11 +5548,8 @@ process_n2n_packet:
         {
             n2n_REGISTER_SUPER_ACK_t ra;
 
-            /* Stay receptive during the one-shot twin check: handling the
-             * FIRST echo can fire the classify push (cookie_mode 0, force),
-             * which zeroes sn_ack_count at its send — closing this gate
-             * before the SECOND echo lands and stranding the verdict as
-             * symmetric. Either twin order must be processable. */
+            /* Keep the gate open across both twin echoes: the first echo's classify
+             * push zeroes sn_ack_count; closing early would strand the verdict as symmetric. */
             if ( eee->sn_wait || eee->sn_ack_count > 0 ||
                  eee->nat_probe_pending )
             {
@@ -5985,42 +5567,29 @@ process_n2n_packet:
                      0 == memcmp( ra.cookie, eee->sn_probe_cookie,
                                   N2N_COOKIE_SIZE ) )
                 {
-                    /* ACK to a Phase-3 probe or the one-shot symmetric check
-                     * (shared cookie; told apart by sender). From the current
-                     * supernode: refresh sn1's cached identity only — the
-                     * supernode answering is NOT proof sn1 is back (it IS
-                     * sn1, which is why the twin ACKs double as the second
-                     * NAT observation). From sn1 itself during failover:
-                     * failback to the probed address; afterwards the edge
-                     * registers solely with sn1. */
+                    /* ACK to a Phase-3 probe or one-shot symmetric check (shared
+                     * cookie, told apart by sender): refresh sn1's cached identity
+                     * only — it is not proof sn1 is back. */
                     int was_sym_check = eee->nat_probe_pending;
 
                     if ( sock_equal( &sender, &eee->supernode ) == 0 )
                     {
-                        /* The current supernode's echo of our source address
-                         * (main port): twin-mode it is the second
-                         * observation for NAT classification; failover-mode
-                         * (supernode == sn2 query channel) it also carries
-                         * the sn1 brother lookup result below. */
+                        /* Current supernode's echo: twin-mode = 2nd NAT observation;
+                         * failover-mode also carries the sn1 brother lookup below. */
                         if ( ra.sock.family == AF_INET )
                         {
                             eee->nat_seen_sn2 = ra.sock;
                             nat_classify( eee );
                         }
 
-                        /* The probed supernode answered: it is alive. Keep
-                         * last_sup fresh so a rejected-but-alive supernode
-                         * (e.g. -E gate while the promoted list is not yet
-                         * rebuilt) does not trip sn_all_failed. */
+                        /* The probed supernode is alive: keep last_sup fresh so a
+                         * rejected-but-alive sn (e.g. -E gate) does not trip sn_all_failed. */
                         eee->last_sup = now;
                         if ( ra.sn_bak.family != 0 )
                         {
-                            /* sn_bak_str is the ANSWERING sn's own -b text,
-                             * not an sn1 address: never let it rewrite
-                             * sn_ip_array[0]. Only the brother-matched sock
-                             * (ra.sn_bak) is a genuine sn1 address — only a
-                             * failover supernode (sn2) produces that; a twin
-                             * ACK from sn1 itself carries no brother match. */
+                            /* sn_bak_str is the answering sn's own -b text, never an
+                             * sn1 address; only the brother-matched sock (ra.sn_bak)
+                             * from a failover sn (sn2) is a genuine sn1 address. */
                             cache_sn1_addr( eee, NULL, 0, &ra.sn_bak );
                             if ( mac_nonzero( ra.sn1_mac ) )
                                 memcpy( eee->sn1_mac, ra.sn1_mac, N2N_MAC_SIZE );
@@ -6038,11 +5607,9 @@ process_n2n_packet:
                               memcmp( sender.addr.v4, eee->supernode.addr.v4,
                                       IPV4_SIZE ) == 0 )
                     {
-                        /* Twin probe echo from the supernode's alt port
-                         * (lport+1): the same IP at a second destination
-                         * port. Both echoes share one cookie and can arrive
-                         * in either order; equal public ports prove the
-                         * mapping is reused per IP (never frozen as
+                        /* Twin probe echo from the supernode's alt port (lport+1):
+                         * same IP, second destination port. Equal public ports
+                         * prove the mapping is reused per IP (never frozen as
                          * symmetric). */
                         eee->last_sup = now;
                         if ( ra.sock.family == AF_INET )
@@ -6055,11 +5622,10 @@ process_n2n_packet:
                               eee->sn_query.family != 0 &&
                               sock_equal( &sender, &(eee->sn_query) ) == 0 )
                     {
-                        /* Cross-IP probe echo from the second supernode (sn2),
-                         * a distinct public IP. Confirms the port toward a
-                         * second destination; it is never the NAT3/NAT4 arbiter
-                         * (a NAT3 changes its port per destination IP), so it
-                         * is stored separately from the twin observation. */
+                        /* Cross-IP probe echo from sn2 (a distinct public IP).
+                         * Confirms the port toward a second destination but is
+                         * never the NAT3/NAT4 arbiter (a NAT3 changes its port
+                         * per destination IP); stored separately. */
                         eee->last_sup = now;
                         if ( ra.sock.family == AF_INET )
                         {
@@ -6077,9 +5643,8 @@ process_n2n_packet:
                         eee->sn_wait = 0;
                         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
                         eee->last_sup = now;
-                        /* Recompute the alt-family address for sn1: the old
-                         * value still points at the failover target's other
-                         * family and would leak into sn1's register cycle. */
+                        /* Recompute the alt-family address for sn1: the old value
+                         * still points at the failover target's other family. */
                         {
                             int alt_af = ( eee->supernode.family == AF_INET6 ) ? AF_INET : AF_INET6;
                             memset( &eee->supernode_alt, 0, sizeof(n2n_sock_t) );
@@ -6093,14 +5658,7 @@ process_n2n_packet:
                                     "sn1 back online - switching back to sn1");
                     }
 
-                    /* Spend the one-shot symmetric check only once BOTH twin echoes are
-                     * in: they share one cookie and can arrive in either
-                     * order, and the alt echo is exactly what keeps a
-                     * per-IP-reuse NAT from being frozen as symmetric. An
-                     * alt-less SN answers only the main probe; the Phase 2.5
-                     * retry timeout then freezes the verdict as before. The
-                     * cross-IP echo (sn2) is confirmatory and never gates the
-                     * freeze. */
+                    /* Freeze only once both twin echoes are in (else a per-IP-reuse NAT may freeze as symmetric) */
                     if ( was_sym_check &&
                          eee->nat_seen_sn2.family == AF_INET &&
                          eee->nat_seen_sn2_alt.family == AF_INET )
@@ -6113,36 +5671,21 @@ process_n2n_packet:
                 }
                 else if ( 0 == memcmp( ra.cookie, eee->last_cookie, N2N_COOKIE_SIZE ) )
                 {
-                    /* A valid ACK from the current supernode; if that is sn1,
-                     * remember that sn1 has actually worked — so a later failover
-                     * knows to ask sn2 for sn1's NEW address (vs. sn1 never
-                     * having been up, where there is nothing to look up). */
+                    /* sn1 worked: a later failover can ask sn2 for its new address */
                     if ( eee->sn_idx == 0 )
                         eee->sn1_ever_ok = 1;
 
                     eee->sn_ack_count++;
-                    /* Identity gate captured before any switch below: this
-                     * ACK carries sn1's identity when it comes from sn1's own
-                     * registration (sn_idx==0) or is an ask_backup reply
-                     * (sn_bak set, sn2 filled it with the matched brother).
-                     * A failover target's self-advertised MAC/IPv6 must never
-                     * overwrite sn1's cached identity — it would break the
-                     * later ask_backup MAC match and the -Q display. */
+                    /* Only sn1's own registration or an ask_backup reply may update its identity */
                     int sn1_identity_ok =
                         ( ra.sn_bak.family != 0 || eee->sn_idx == 0 );
 
-                    /* Only do full processing on the first ACK; subsequent ACKs
-                     * (from alt address family) just refresh last_sup silently. */
+                    /* Full processing on the first ACK only; later ACKs (alt family) just refresh last_sup. */
                     if ( eee->sn_ack_count == 1 ) {
                         eee->last_sup = now;
                         eee->sn_wait = 0;
 
-                        /* sn2 ACK during ask_backup: sn2 tells us sn1's address.
-                         * If sn2 reports the SAME address we just failed 3
-                         * registrations on, the successful probe to sn2 proves
-                         * our own network is fine — sn1 is genuinely down at
-                         * that address, so re-registering there is futile:
-                         * switch to the failover target immediately. */
+                        /* Same address as the failed registrations: sn1 is genuinely down, switch */
                         if ( eee->sn_ask_backup && ra.sn_bak.family != 0 &&
                              sock_equal( &sender, &eee->sn_query ) == 0 )
                         {
@@ -6164,9 +5707,7 @@ process_n2n_packet:
                                 eee->sn_idx = 0;
                                 eee->sn_ask_backup = 0;
                                 eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
-                                /* sn_bak_str is the answering sn's own -b
-                                 * text, not an sn1 address: use the brother-
-                                 * matched binary sock instead. */
+                                /* sn_bak_str is the answering sn's own -b text; use the brother-matched binary sock. */
                                 cache_sn1_addr( eee, NULL, 0, &ra.sn_bak );
                                 sock_to_cstr( sockbuf1, &ra.sn_bak );
                                 if ( strcmp(eee->sn1_current_addr, sockbuf1) == 0 )
@@ -6178,18 +5719,16 @@ process_n2n_packet:
                                                "Sn2 returned sn1 new address: %s (DNS=%s) - re-registering",
                                                sockbuf1,
                                                eee->sn1_current_addr);
-                                /* Register at the new address immediately;
-                                 * the ask_backup probes were QUERY_ONLY, so
-                                 * sn1 has no peer entry for us yet. */
+                                /* Register at the new address immediately; the
+                                 * ask_backup probes were QUERY_ONLY, so sn1 has no entry for us yet. */
                                 send_register_super( eee, &(eee->supernode), 1, 0, NULL );
                                 eee->sn_wait = 1;
                                 eee->last_register_req = now;
                             }
                         }
 
-                        /* sn2 ACK but no sn1 address info -> sn2 doesn't know
-                         * where sn1 is. Since we entered ask_backup because sn1
-                         * stopped responding, go to the failover target. */
+                        /* sn2 ACK without sn1 address info: sn2 doesn't know where sn1
+                         * is — we entered ask_backup because sn1 stopped responding. */
                         else if ( eee->sn_ask_backup &&
                                   sock_equal( &sender, &eee->sn_query ) == 0 &&
                                   ra.sn_bak.family == 0 && ra.sn_bak_str_len == 0 )
@@ -6204,8 +5743,8 @@ process_n2n_packet:
                             eee->last_register_req = now;
                         }
 
-                        /* ask_backup + reply from sn1 (old address) -> sn1
-                         * address did not change, switch to the failover target. */
+                        /* ask_backup + reply from sn1 (old address): sn1's address
+                         * did not change, switch to the failover target. */
                         else if ( eee->sn_ask_backup &&
                                   sock_equal( &sender, &eee->supernode ) == 0 &&
                                   eee->sn_idx == 0 )
@@ -6245,10 +5784,9 @@ process_n2n_packet:
                                                assigned_ip_str, eee->device.ip_prefixlen);
                             }
                         } else if (!default_ip_assignment && ra.dev_addr.net_addr == 0) {
-                            /* Static IP requested via -a, but the supernode did not
-                             * echo any IP back (e.g. third-party supernodes like
-                             * cnn2n keep dev_addr zero for a valid static request).
-                             * Keep our own configured static IP instead of exiting. */
+                            /* Static IP requested (-a) but the SN echoed none (e.g.
+                             * cnn2n keeps dev_addr zero for a valid static request):
+                             * keep our configured static IP instead of exiting. */
                             traceEvent(TRACE_DEBUG, "Supernode did not echo an IP for static address; keeping %s",
                                        inet_ntoa(*(struct in_addr*)&eee->device.ip_addr));
                         }
@@ -6265,15 +5803,7 @@ process_n2n_packet:
                                                    (eee->supernode_alt.family == AF_INET6 ? 1 : 0);
                         }
 
-                        /* Surface the backup supernode name from sn_bak_str so -Q
-                         * shows it and sn_num >= 2 failover paths exist even when
-                         * the user did not pass a second -l. Insert it after sn1
-                         * and shift any user-configured supernodes to the right,
-                         * so the edge's own -l entries stay last. Runs on every
-                         * sn1 ACK until learned (not only on the very first ACK),
-                         * so an edge that never saw sn1's -b at startup — e.g.
-                         * first ACK came from the failover target — still picks
-                         * the query channel up after failing back to sn1. */
+                        /* Insert the backup SN name after sn1 so failover works without a second -l; keep user -l entries last */
                         if (eee->sn_idx == 0 && ra.sn_bak_str_len > 0 &&
                             !eee->sn_ak_parsed)
                         {
@@ -6299,12 +5829,8 @@ process_n2n_packet:
                                 strncpy(eee->sn_ip_array[1], bakstr, N2N_EDGE_SN_HOST_SIZE - 1);
                                 eee->sn_ip_array[1][N2N_EDGE_SN_HOST_SIZE - 1] = '\0';
                                 eee->sn_num++;
-                                /* The ACK-learned brother now occupies index 1 and becomes the fixed
-                                 * query channel (sn2). When the user ALSO passed a second
-                                 * -l, that entry shifted to index 2 and stays the failover
-                                 * target (sn_num==3 after insert). With only one -l, the
-                                 * learned brother at index 1 IS the failover target, so we
-                                 * must NOT re-point it at index 2. */
+                                /* The ACK-learned brother becomes the fixed query channel (sn2);
+                                 * with only one -l it is also the failover target — do NOT re-point it. */
                                 eee->sn_query_index = 1;
                                 memset(&(eee->sn_query), 0, sizeof(n2n_sock_t));
                                 supernode2addr( &(eee->sn_query), eee->sn_af,
@@ -6312,11 +5838,8 @@ process_n2n_packet:
                                 if ( eee->sn_backup_index == 1 && eee->sn_num > 2 )
                                     eee->sn_backup_index = 2;
                                 eee->sn_ack_backup[1] = 1; /* slot 1 now holds the ACK-learned brother */
-                                /* From here the address exists twice: the raw copy
-                                 * (sn_ip_array[1], used for all run-time traffic) and
-                                 * a masked display copy (sn_bak_masked, built here
-                                 * once — hide the first 5 chars with a '*'). Every
-                                 * display/logging site just reads sn_bak_masked. */
+                                /* The address exists twice: the raw copy (sn_ip_array[1], used for
+                                 * traffic) and a masked display copy (sn_bak_masked) for logs. */
                                 {
                                     size_t hl = strlen(bakstr);
                                     if ( hl > 5 )
@@ -6368,26 +5891,17 @@ process_n2n_packet:
                             initial_connection_complete = 1;
                         }
 
-                        /* NAT detection is IPv4-only: an IPv6 ACK neither
-                         * updates the stored public mapping nor touches the
-                         * classification state. (A dual-stack host receives
-                         * ACKs from both families — treating a family flip as
-                         * an "address change" would wipe IPv4 NAT progress
-                         * that still belongs to a live mapping, e.g. right
-                         * after startup on SIM/hotspot networks.) */
+                        /* NAT detection is IPv4-only: a family flip is not an address change */
                         if ( ra.sock.family == AF_INET )
                         {
-                            /* Store our own public address as seen by supernode.
-                             * Log if it changed (e.g. WiFi switch). */
+                            /* Store our public address as seen by the SN; log on change */
                             n2n_sock_t old_pub = eee->my_public_sock;
                             eee->my_public_sock = ra.sock;
                             int suppress_ack = 0; /* fixed-port restore: keep verdict, skip observations */
                             if (old_pub.family != 0 &&
                                 sock_equal(&old_pub, &eee->my_public_sock) != 0)
                             {
-                                /* Under CGNAT the public port churns on every new
-                                 * mapping; only a public IP change is worth a
-                                 * NORMAL line, port-only changes go to INFO. */
+                                /* CGNAT churns the port per mapping; only an IP change is NORMAL */
                                 int ip_changed = (old_pub.family != eee->my_public_sock.family) ||
                                                  (old_pub.family == AF_INET &&
                                                   memcmp(old_pub.addr.v4,
@@ -6398,20 +5912,14 @@ process_n2n_packet:
                                            sock_to_cstr(sockbuf1, &eee->my_public_sock));
 
                                 if (eee->nat_suppress_remap) {
-                                    /* This remap is the fixed-port restore of an
-                                     * "n" refresh: classification already ran on
-                                     * the random mapping, so keep that verdict —
-                                     * just adopt the new public address. */
+                                    /* Fixed-port restore: keep the verdict from the random mapping */
                                     eee->nat_suppress_remap = 0;
                                     suppress_ack = 1;
                                     traceEvent(TRACE_DEBUG, "NAT refresh: fixed-port restore keeps the fresh NAT verdict");
                                 }
                                 else
                                 {
-                                    /* Fresh NAT mapping: its filter whitelist starts
-                                     * empty again — re-arm the full-cone stranger
-                                     * test and restart classification from scratch
-                                     * (old observations belong to the dead mapping). */
+                                    /* Fresh mapping: old observations are dead, restart classification */
                                     eee->nat_type = N2N_NAT_UNKNOWN;
                                     memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
                                     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
@@ -6423,23 +5931,13 @@ process_n2n_packet:
                                     eee->fc_window = 1;
                                     eee->nat_sym_tries = 0;
                                     eee->nat_final = 0;
-                                    /* The one-shot symmetric check is scheduled
-                                     * NAT_STRANGER_SECS out instead of firing
-                                     * right here: a first-contact packet now
-                                     * would slam the fresh stranger window shut
-                                     * before the brother's N2NF probes land. */
+                                    /* Defer the stranger check so the N2NF probes land first */
                                     eee->nat_probe_time = now;
                                     eee->fc_arm_time = now;
                                 }
                             }
 
-                            /* First observation for NAT classification: which sn
-                             * answered (by sender, not by sn_idx — during
-                             * ask_backup sn_idx is still 0 while sn2 replies).
-                             * The suppressed restoral ACK is skipped entirely:
-                             * its fixed-mapping echo must not mix with the
-                             * random-mapping observations (that would look like
-                             * a symmetric NAT). */
+                            /* Attribute the first observation by sender; skip the suppressed restoral ACK */
                             if ( !suppress_ack )
                             {
                                 if ( sock_equal( &sender, &eee->sn_query ) == 0 )
@@ -6467,17 +5965,13 @@ process_n2n_packet:
                             strcpy(eee->supernode_version, "unknown");
                         }
                     } else {
-                        /* Duplicate ACK, or the secondary (sn2) ACK from the
-                         * one-shot sn1 MAC lookup / ask_backup dual probe. */
+                        /* Duplicate ACK or secondary (sn2) reply */
                         eee->last_sup = now;
                         traceEvent(TRACE_DEBUG, "Rx REGISTER_SUPER_ACK (alt addr, ack#%u) - refreshing last_sup",
                                    eee->sn_ack_count);
                     }
 
-                    /* Adopt sn1's identity (MAC + global IPv6) only from genuine
-                     * sn1 sources (sn1_identity_ok, captured above) — first and
-                     * duplicate ACKs alike. A failover target's self-advertised
-                     * identity must never overwrite sn1's cached one. */
+                    /* Only genuine sn1 sources may update sn1's identity (never a failover target) */
                     if ( sn1_identity_ok )
                     {
                         if ( mac_nonzero( ra.sn1_mac ) )
@@ -6489,12 +5983,7 @@ process_n2n_packet:
                 }
                 else
                 {
-                    /* Transient: an in-flight ACK carrying a pre-rotation
-                     * cookie arrived late (multi-probe failover). Benign —
-                     * the next periodic registration refreshes the cookie
-                     * match, so do NOT force an immediate re-registration
-                     * here (that would rotate the cookie again and sustain
-                     * a stale-ACK storm). */
+                    /* Stale cookie: benign in-flight ACK, do not re-register (avoids a stale-ACK storm) */
                     traceEvent( TRACE_DEBUG, "Rx REGISTER_SUPER_ACK with old cookie (stale, ignored)." );
                 }
             }
@@ -7004,14 +6493,9 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn) {
 
 /* ***************************************************** */
 
-/** Check if supernode domain resolved to a new address and re-register if changed.
- *  
- *  Main-thread implementation: periodically re-resolves supernode domain when idle.
- *  Checks every 300 seconds (5 minutes) and only when no communication in last 30 seconds.
- *  If supernode domain resolves to a different address, update and re-register.
- *  
- *  @return 1 if address changed and re-registered, 0 otherwise
- */
+/** Re-resolve the supernode domain when idle (every 5 min, no communication in
+ *  last 30s); if the address changed, update and re-register.
+ *  @return 1 if address changed and re-registered, 0 otherwise */
 static int check_supernode_domain_and_update(n2n_edge_t * eee, time_t now)
 {
     n2n_sock_t new_addr;
@@ -7352,9 +6836,8 @@ fail:
     return 0;
 }
 
-/** In the main loop: start bypass negotiation for known_peers that have
- *  had P2P established for >= 2 seconds (principle 10: bypass is only a
- *  fallback). The 2s guard is enforced by bypass_start_negotiation(). */
+/** Start bypass negotiation for known_peers with P2P established >= 2s
+ *  (bypass is only a fallback; enforced in bypass_start_negotiation). */
 static void check_delayed_bypass(n2n_edge_t *eee, time_t now)
 {
     if (!eee->bp) return;
@@ -7722,15 +7205,10 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         } /* end switch */
     }
 
-    /* Save full community name for local display, then obfuscate what
-     * gets sent to the supernode when no encryption key is available
-     * or encryption is explicitly disabled (-A1).
-     *
-     * When encryption is disabled (null_transop):
-     *   - Only the first half of the community name is sent to the supernode
-     *     (e.g. "mycommunity" → "mycom" on the wire)
-     *   - If neither -k nor -A was explicitly given (simple mode), the second
-     *     half is used as the encryption key */
+    /* Save full community name for local display, then obfuscate what gets sent
+     * to the supernode when encryption is unavailable or disabled (-A1):
+     * only the first half of the name goes on the wire; in simple mode
+     * (no -k / -A given) the second half becomes the encryption key. */
     {
         char full_community[N2N_COMMUNITY_SIZE];
         memcpy(full_community, eee.community_name, N2N_COMMUNITY_SIZE);
@@ -8097,27 +7575,8 @@ static int run_loop(n2n_edge_t * eee )
     int   retval = 0;
 
 #ifdef _WIN32
-    /* Single-threaded TAP reader using OVERLAPPED I/O —
-     *   architecture 100% aligned with cnn2n.  No tunReadThread,
-     *   no ring buffer, no cross-thread events.  TAP reads are
-     *   submitted as overlapped IRPs, completions are signalled
-     *   via overlap_read.hEvent directly to the main loop's
-     *   WaitForSingleObject, and frames flow straight from
-     *   tuntap_dev.read_buf → bypass_tap_forward → send_packet2net
-     *   on the SAME thread with zero intermediate queueing.  If
-     *   send_packet2net blocks on a full SO_SNDBUF, no further
-     *   TAP reads are submitted until it unblocks, so the TAP
-     *   driver's RX ring fills up and the user-space TCP that is
-     *   writing to the TAP gets back-pressure automatically —
-     *   zero parameters, fully auto-tuning to the real uplink
-     *   capacity just like cnn2n.
-     *
-     *   Pre-submit the first overlapped read before entering the
-     *   loop, draining any synchronously-completed frames (driver
-     *   backlog on startup).  On any transient error we silently
-     *   skip; the per-tick lazy-init block inside the loop will
-     *   re-try the submission so we never get stuck with no IRP
-     *   in flight. */
+    /* Overlapped TAP reader: IRP completions arrive via hEvent in the main loop;
+     * a full SO_SNDBUF blocks here, applying TCP back-pressure. Pre-submit the first read. */
     if (eee->device.overlap_read.hEvent != NULL &&
         eee->device.device_handle != INVALID_HANDLE_VALUE)
     {
@@ -8138,12 +7597,7 @@ static int run_loop(n2n_edge_t * eee )
     }
 #endif
 
-    /* Main loop
-     *
-     * select() is used to wait for input on either the TAP fd or the UDP/TCP
-     * socket. When input is present the data is read and processed by either
-     * readFromIPSocket() or readFromTAPSocket()
-     */
+    /* Main loop: select() waits on the TAP fd or the UDP/TCP socket, then dispatches */
 
     while(keep_running && g_edge_running)
     {
@@ -8152,14 +7606,9 @@ static int run_loop(n2n_edge_t * eee )
         struct timeval wait_time;
         time_t nowTime;
 
-        /* Probe-window management, both port modes (armed by mgmt "n" and by each
-         * rebuild): while the verdict is still out and within the hard cap,
-         * extend the window — or, if the full-cone probe missed the stranger
-         * window and can never land on this mapping, re-run the whole refresh
-         * (same entry as mgmt "n") instead of downgrading. Once a verdict is
-         * in or the cap is hit, freeze and (fixed-port mode) rebind the
-         * configured port; nat_suppress_remap keeps the verdict when the
-         * first ACK arrives on the restored port. */
+        /* Probe-window: extend while the verdict is pending within the hard cap;
+         * rebuild if the full-cone probe missed the stranger window; freeze and
+         * rebind at verdict/cap, nat_suppress_remap keeps the verdict. */
         if (eee->nat_revert_at != 0 && n2n_now() >= eee->nat_revert_at) {
             if ( eee->nat_type == N2N_NAT_UNKNOWN &&
                  !eee->nat_final &&
@@ -8188,11 +7637,7 @@ static int run_loop(n2n_edge_t * eee )
                 }
                 else
                 {
-                    /* Window spent with no full-cone evidence: it can never
-                     * arrive on this mapping, and a later probe would only
-                     * downgrade the verdict. Jump back to the refresh entry
-                     * (fresh random mapping, full detection again) — but only
-                     * for a bounded number of rounds, then freeze. */
+                    /* No full-cone evidence: rebuild the mapping for another round (bounded, then freeze) */
                     eee->nat_rebuild_tries++;
                     traceEvent( TRACE_INFO, "NAT refresh: full-cone probe missed the stranger window, rebuilding the mapping for another round (%d/%d)",
                                 eee->nat_rebuild_tries, NAT_REBUILD_MAX_TRIES );
@@ -8202,15 +7647,7 @@ static int run_loop(n2n_edge_t * eee )
             }
             else
             {
-                /* The twin symmetric check is still in flight: only one of the
-                 * two echoes has landed (the verdict was newly re-derived and
-                 * can still move to port-restr when the alt echo agrees, or be
-                 * frozen by the check's own 3x5s retry timeout). The revert
-                 * deadline (15s) is shorter than that window (12s+3x5s), so
-                 * freezing here would strand the verdict on half the evidence
-                 * and silently cancel the "sn2 silent" path — defer instead and
-                 * let the probe loop finish; the absolute cap still bounds the
-                 * wait. */
+                /* Twin check still pending: defer the freeze, else the verdict strands on half the evidence */
                 if ( eee->nat_probe_pending &&
                      ( eee->nat_refresh_start == 0 ||
                        n2n_now() - eee->nat_refresh_start < NAT_REVERT_MAX_SECS ) )
@@ -8221,11 +7658,7 @@ static int run_loop(n2n_edge_t * eee )
                 }
                 else
                 {
-                    /* Verdict in hand, or the window hard-capped: stop refreshing
-                     * and freeze it. Drop the observations (they belong to the
-                     * abandoned mapping); fixed-port mode rebinds the configured
-                     * port and the first ACK there keeps the verdict thanks to
-                     * nat_suppress_remap. */
+                    /* Verdict in hand or hard-capped: stop refreshing and freeze */
                     eee->nat_revert_at = 0;
                     eee->nat_refresh_start = 0;
                     memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
@@ -8306,49 +7739,11 @@ static int run_loop(n2n_edge_t * eee )
             }
         }
 
-        /* ---------- Wait / wake-up.
-         *   One fixed tick cadence (N2N_MAINLOOP_TICK_MS = 10 ms) for
-         *   EVERY deployment — it covers KCP's 100 Hz update cadence,
-         *   and 0-10 ms added ingress latency on non-TAP fds is
-         *   invisible on any real WAN RTT.  Completely generic.
-         *
-         *   Windows: single-threaded OVERLAPPED I/O — no separate tunReadThread.
-         *            We block on overlap_read.hEvent (the single kernel
-         *            notification that TAP driver has completed a read
-         *            IRP we submitted) and combine that with a 10 ms
-         *            upper bound for polling all ingress socket fds.
-         *            Architecture = cnn2n exactly:
-         *              WFSO → TAP frame ready? → process → send_packet2net
-         *                → if send_packet2net blocks on SO_SNDBUF full,
-         *                  we stall here; further TAP reads won't be
-         *                  submitted until it unblocks → TAP driver RX
-         *                  ring fills up → user-space TCP writing to
-         *                  TAP gets blocked → TCP cwnd auto-tunes to
-         *                  real uplink capacity.
-         *            After every wakeup (signal or timeout) we run
-         *            select(timeout=0) on the same fd sets as Linux,
-         *            so UDP/mgmt/WS/bypass TCP fds never need WinSock
-         *            event binding (which silently breaks SO_SNDBUF
-         *            back-pressure by forcing non-blocking mode).
-         *   Linux:   Classic select(timeout = 10 ms) — TAP fd already
-         *            lives in socket_mask so no extra handle is needed,
-         *            all I/O stays single-threaded. ---------- */
+        /* Fixed 10 ms tick: Windows WFSO on TAP overlap + UDP events then select(0);
+         * Linux plain select. WinSock event binding would break SO_SNDBUF back-pressure. */
 #ifdef _WIN32
         {
-            /* Single-threaded, fully event-driven Windows I/O.
-             *
-             *   WaitForMultipleObjects() on:
-             *     [0] TAP overlapped read completion event
-             *     [1] UDP v4 socket WSA event (FD_READ | FD_CLOSE)
-             *     [2] UDP v6 socket WSA event (FD_READ | FD_CLOSE)  [optional]
-             *   Timeout = N2N_MAINLOOP_TICK_MS (10 ms) guarantees we
-             *   always wake up to drive the periodic tick (KCP,
-             *   supernode reg, keepalive, ...).
-             *
-             *   WFSO manual-reset events stay signalled until WE reset
-             *   them, so a single fire handles "frame available" and
-             *   draining happens via the post-WFSO select(timeout=0)
-             *   pass below — exactly the same FD walk as Linux. */
+            /* WFSO on TAP overlap + UDP events; 10 ms tick; post-WFSO select(0) drains the fds */
             HANDLE handles[3];
             int n_handles = 0;
             HANDLE h_tap = eee->device.overlap_read.hEvent;
@@ -8361,8 +7756,7 @@ static int run_loop(n2n_edge_t * eee )
                 wfso_rc = WaitForMultipleObjects((DWORD)n_handles, handles,
                                                  FALSE, N2N_MAINLOOP_TICK_MS);
             } else {
-                /* No events bound (extreme init failure). Fall back to
-                 *   a pure sleep so we don't spin. */
+                /* No event handles (init failure): sleep instead of spinning */
                 static unsigned warn_suppress = 0;
                 if (warn_suppress == 0)
                     traceEvent(TRACE_WARNING,
@@ -8372,28 +7766,16 @@ static int run_loop(n2n_edge_t * eee )
                 wfso_rc = WAIT_TIMEOUT;
             }
 
-            /* After a UDP WSAEvent fires, the FD_READ/FD_CLOSE events are
-             *   still queued in the socket's internal network-event
-             *   structure.  Calling select() on the same socket
-             *   de-queues them AND un-signals the WSA event (since the
-             *   event is edge-triggered in that sense: re-arming only
-             *   happens after the network events are consumed).  This
-             *   is the same approach cnn2n uses. */
+            /* select() below de-queues the FD events and re-arms the WSA event */
             if (wfso_rc != WAIT_TIMEOUT && n_handles > 0 &&
                 (wfso_rc - WAIT_OBJECT_0) < (DWORD)n_handles)
             {
-                /* Signalled index = (wfso_rc - WAIT_OBJECT_0).
-                 *   We don't need to act on the WSA events directly —
-                 *   the select(timeout=0) pass below picks them up. */
+                /* WSA events need no direct handling: the select(0) pass picks them up */
                 (void)0;
             }
 
-            /* TAP RX harvesting: same careful rules as before.
-             *   - Only touch overlap_read if TAP event fired (index 0).
-             *   - GetOverlappedResult(bWait=FALSE) on a still-pending
-             *     IRP fails with ERROR_IO_INCOMPLETE — never do that.
-             *   - On async completion, ResetEvent + harvest + resubmit,
-             *     draining any synchronously-completed frames. */
+            /* Only harvest when the TAP event fired; never call
+             *   GetOverlappedResult on a still-pending IRP. */
             bool tap_signalled = (wfso_rc != WAIT_TIMEOUT &&
                                   n_handles > 0 &&
                                   (wfso_rc - WAIT_OBJECT_0) == 0);
@@ -8414,12 +7796,9 @@ static int run_loop(n2n_edge_t * eee )
                     process_tap_rx_frame(eee, eee->device.read_buf, slen);
                 }
             }
-            /* else: WFSO timed out (or UDP fired, not TAP) and a TAP
-             *       IRP is still pending — leave it. */
+            /* else: TAP IRP still pending — leave it */
 
-            /* Zero-timeout select walk so UDP/mgmt/WS/bypass fds get
-             *   serviced without blocking.  Zero timeout is correct:
-             *   WFSO above already gated on I/O availability. */
+            /* Zero-timeout select services UDP/mgmt/WS/bypass fds without blocking */
             struct timeval zt;
             zt.tv_sec  = 0;
             zt.tv_usec = 0;
@@ -8490,9 +7869,8 @@ static int run_loop(n2n_edge_t * eee )
                 }
             }
 
-            /* WS mode: handle WebSocket fd read — drain like the UDP loop
-             * (128 cap) because ws_recv decodes ONE frame per call;
-             * a single recv per select tick caps WS throughput at ~1 Mbps. */
+            /* WS mode: drain like the UDP loop (128 cap) — ws_recv decodes
+             * one frame per call, else throughput caps at ~1 Mbps. */
             if (eee->use_ws && eee->ws_conn.state == WS_OPEN &&
                 eee->ws_conn.fd >= 0 &&
                 FD_ISSET(eee->ws_conn.fd, &socket_mask)) {
@@ -8562,11 +7940,7 @@ static int run_loop(n2n_edge_t * eee )
                 }
             }
         }
-        /* WS heartbeat: application-level ping every 30s. TCP keepalive
-         * segments are swallowed by CDN / reverse proxies, so without this
-         * an idle WS connection would be dropped by the proxy long before
-         * the 120s stale check below notices. pong is auto-replied by the
-         * peer's ws_recv (SN side replies automatically). */
+        /* WS heartbeat (app-level ping, 30s): CDN / reverse proxies swallow TCP keepalive */
         if (eee->use_ws && eee->ws_conn.state == WS_OPEN) {
             if (nowTime - eee->ws_last_ping >= 30) {
                 eee->ws_last_ping = nowTime;
@@ -8590,8 +7964,7 @@ static int run_loop(n2n_edge_t * eee )
         /* Periodically check HTTP redirect for updated supernode address */
         check_http_redirect_and_update(eee, nowTime);
 
-        /* Delayed bypass start: ensure P2P has been established >= 2s
-         * before starting negotiation (principle 10). */
+        /* Delayed bypass start: ensure P2P established >= 2s first (principle 10). */
         check_delayed_bypass(eee, nowTime);
 
         /* Bypass tick: handle timeouts and state transitions */
@@ -8599,22 +7972,15 @@ static int run_loop(n2n_edge_t * eee )
             bypass_tick(eee->bp, nowTime);
         }
 
-        /* Re-send bypass probe frames for peers still in PROBING state.
-         * Build the encrypted n2n PACKET via send_packet2net, but override
-         * the destination to send directly to the peer's P2P UDP address,
-         * bypassing find_peer_destination's relay-via-supernode logic.
-         * This prevents "Relayed packet: addr changed" on the peer side. */
+        /* Re-send bypass probes: send_packet2net to the peer's P2P address, bypassing
+         * the relay-via-supernode logic (avoids "Relayed packet: addr changed") */
         if (bypass_has_peers(eee->bp) && eee->bp->enabled && !eee->bp->user_disabled) {
             uint8_t probe_buf[19 * BYPASS_MAX_PEERS];
             int n = bypass_get_pending_probes(eee->bp, probe_buf, BYPASS_MAX_PEERS,
                                                eee->device.ip_addr, eee->device.mac_addr);
             for (int _pi = 0; _pi < n; _pi++) {
                 uint8_t *frame = probe_buf + _pi * 19;
-                /* Find the peer matching this probe frame's destination MAC
-                 * (frame[0..5] was set by bypass_get_pending_probes).  The
-                 * old code searched for the first PROBING peer, which always
-                 * returned the same peer for every frame — breaking bypass
-                 * negotiation when multiple peers were being probed. */
+                /* Match the probe frame's destination MAC (frame[0..5]); the old first-PROBING-peer scan broke multi-peer negotiation */
                 n2n_mac_t dst_mac;
                 memcpy(dst_mac, frame, N2N_MAC_SIZE);
                 struct peer_info *pi = NULL;
@@ -8742,11 +8108,10 @@ static int run_loop(n2n_edge_t * eee )
             }
         }
         numPurged =  purge_expired_registrations( &(eee->known_peers) );
-        /* pending_peers: use much longer timeout. These are relay-only peers
-         * that we know exist but can't punch to. Forgetting them causes long
-         * re-discovery delays when traffic resumes after idle (the "stop ping,
-         * resume ping = unreachable" problem). The 1800s stuck-peer check in
-         * check_punch_timeouts handles truly dead peers. */
+        /* pending_peers: much longer timeout. These are relay-only peers that
+         * exist but can't be punched to; forgetting them causes long re-discovery
+         * delays after idle ("stop ping, resume ping = unreachable"). The 1800s
+         * stuck-peer check in check_punch_timeouts handles truly dead peers. */
         numPurged += purge_peer_list( &(eee->pending_peers), nowTime - 1800 );
         /* After purging, clean up bypass state for removed peers */
         if (bypass_has_peers(eee->bp) && bp_known_count > 0) {
