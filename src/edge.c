@@ -3022,10 +3022,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         }
     }
 
-    /* Phase 3: while on the failover target, every 30s probe for sn1 recovery:
-     * 1) ask the sn2 query channel for sn1's CURRENT address (refresh only,
-     *    does NOT switch), 2) heartbeat sn1 at the last-known address (only
-     *    sn1's own ACK triggers failback). */
+    /* Phase 3: while on the failover target, every 30s heartbeat sn1 at the
+     * authoritative -l address (only sn1's own ACK triggers failback). */
     if ( eee->sn_num >= 2 && eee->sn_idx == eee->sn_backup_index &&
          !eee->use_ws && eee->sn_query.family != 0 &&
          nowTime > eee->last_primary_probe + 30 )
@@ -3039,34 +3037,10 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         n2n_sock_t sn1addr;
         memset(&sn1addr, 0, sizeof(sn1addr));
 
-        if ( !eee->re_resolve_supernode_ip )
-        {
-            /* sn1 is a literal IP: -l is authoritative (sn2 may only know an
-             * unreachable NATed address), so skip the sn2 lookup and just
-             * heartbeat the original address — sn1's own ACK triggers failback. */
-            eee->sn1_current_addr[0] = '\0';
-            supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
-        }
-        else
-        {
-            /* The sn1 cache was written from sn2's ask_backup answer (binary IP),
-             * so the -l domain would never be looked at again. Drop the cache
-             * every ~5 min so resolution falls back to the -l domain. */
-            if ( nowTime > eee->last_failover_dns + 300 )
-            {
-                eee->last_failover_dns = nowTime;
-                eee->sn1_current_addr[0] = '\0';
-            }
-
-            if ( eee->sn1_current_addr[0] )
-                supernode2addr( &sn1addr, eee->sn_af, eee->sn1_current_addr );
-            if ( sn1addr.family == 0 )
-                supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
-
-            /* ask the sn2 query channel for sn1's current address (refreshes
-             * sn1_current_addr), even when it IS the current failover target. */
-            send_register_super( eee, &(eee->sn_query), 0, 2, &sn1addr );
-        }
+        /* Probe sn1's authoritative -l address only: an sn2 ask_backup answer
+         * (sn1_current_addr) may name the wrong brother when sn2 has its own
+         * siblings, so it is never used as the probe target. */
+        supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
 
         /* heartbeat sn1 directly; only its own ACK triggers failback. */
         if ( sn1addr.family != 0 )
@@ -5585,11 +5559,11 @@ process_n2n_packet:
                         /* The probed supernode is alive: keep last_sup fresh so a
                          * rejected-but-alive sn (e.g. -E gate) does not trip sn_all_failed. */
                         eee->last_sup = now;
-                        if ( ra.sn_bak.family != 0 )
+                        if ( eee->sn_idx == 0 && ra.sn_bak.family != 0 )
                         {
-                            /* sn_bak_str is the answering sn's own -b text, never an
-                             * sn1 address; only the brother-matched sock (ra.sn_bak)
-                             * from a failover sn (sn2) is a genuine sn1 address. */
+                            /* Only on sn1 does its ACK carry genuine sn1 identity;
+                             * a failover sn's reply may name its own brother,
+                             * never adopt it. */
                             cache_sn1_addr( eee, NULL, 0, &ra.sn_bak );
                             if ( mac_nonzero( ra.sn1_mac ) )
                                 memcpy( eee->sn1_mac, ra.sn1_mac, N2N_MAC_SIZE );
