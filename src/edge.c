@@ -1521,6 +1521,14 @@ static void send_register_super( n2n_edge_t * eee,
         eee->gaming_started = 1;
     }
 
+    /* Fresh process: the peer table starts empty, so the first registration
+     * asks SN to push the whole member list — a restarted edge with unchanged
+     * MAC+address would otherwise stay blind (SN sees no change and pushes
+     * nothing). The dump is non-PUNCH: it only fills the table, punching
+     * stays demand-driven. */
+    if ( cookie_mode == 0 && !eee->known_peers && !eee->pending_peers )
+        reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
+
     /* When this packet goes to the fixed query channel (sn2) and that
      * channel is NOT the current supernode, it is a one-shot address lookup,
      * not a real registration — ask sn2 not to register us as a peer. */
