@@ -2541,11 +2541,31 @@ static void update_peer_address(n2n_edge_t * eee,
 /*     dead supernode.                                                 */
 /* ------------------------------------------------------------------ */
 
+/* Prefix the on-wire community name with '*' while on a backup supernode, so
+ * the failover group cannot talk to same-named members living on that sn. */
+static void sn_apply_community_mask( n2n_edge_t * eee, int masked )
+{
+    if ( !masked )
+    {
+        memcpy( eee->community_name, eee->community_name_base,
+                N2N_COMMUNITY_SIZE );
+        return;
+    }
+
+    memset( eee->community_name, 0, N2N_COMMUNITY_SIZE );
+    eee->community_name[0] = '*';
+    strncat( (char *)eee->community_name, (const char *)eee->community_name_base,
+             N2N_COMMUNITY_SIZE - 2 );
+}
+
 /* Switch the active supernode to index idx and resolve all addresses. */
 static void sn_switch_to( n2n_edge_t * eee, size_t idx )
 {
     eee->sn_idx = idx;
     eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;   /* fresh retry budget */
+
+    /* Group name follows the supernode: masked on a backup, pristine on sn1. */
+    sn_apply_community_mask( eee, idx != 0 );
 
     /* The periodic-resolve cache refers to the previously active supernode's
      * address; keep it from mis-reporting "address updated" (and from
@@ -3022,8 +3042,10 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         }
     }
 
-    /* Phase 3: while on the failover target, every 30s heartbeat sn1 at the
-     * authoritative -l address (only sn1's own ACK triggers failback). */
+    /* Phase 3: while on the failover target, every 30s probe for sn1 recovery:
+     * 1) ask the sn2 query channel for sn1's CURRENT address (refresh only,
+     *    does NOT switch), 2) heartbeat sn1 at the last-known address (only
+     *    sn1's own ACK triggers failback). */
     if ( eee->sn_num >= 2 && eee->sn_idx == eee->sn_backup_index &&
          !eee->use_ws && eee->sn_query.family != 0 &&
          nowTime > eee->last_primary_probe + 30 )
@@ -3037,10 +3059,34 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         n2n_sock_t sn1addr;
         memset(&sn1addr, 0, sizeof(sn1addr));
 
-        /* Probe sn1's authoritative -l address only: an sn2 ask_backup answer
-         * (sn1_current_addr) may name the wrong brother when sn2 has its own
-         * siblings, so it is never used as the probe target. */
-        supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
+        if ( !eee->re_resolve_supernode_ip )
+        {
+            /* sn1 is a literal IP: -l is authoritative (sn2 may only know an
+             * unreachable NATed address), so skip the sn2 lookup and just
+             * heartbeat the original address — sn1's own ACK triggers failback. */
+            eee->sn1_current_addr[0] = '\0';
+            supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
+        }
+        else
+        {
+            /* The sn1 cache was written from sn2's ask_backup answer (binary IP),
+             * so the -l domain would never be looked at again. Drop the cache
+             * every ~5 min so resolution falls back to the -l domain. */
+            if ( nowTime > eee->last_failover_dns + 300 )
+            {
+                eee->last_failover_dns = nowTime;
+                eee->sn1_current_addr[0] = '\0';
+            }
+
+            if ( eee->sn1_current_addr[0] )
+                supernode2addr( &sn1addr, eee->sn_af, eee->sn1_current_addr );
+            if ( sn1addr.family == 0 )
+                supernode2addr( &sn1addr, eee->sn_af, eee->sn_ip_array[0] );
+
+            /* ask the sn2 query channel for sn1's current address (refreshes
+             * sn1_current_addr), even when it IS the current failover target. */
+            send_register_super( eee, &(eee->sn_query), 0, 2, &sn1addr );
+        }
 
         /* heartbeat sn1 directly; only its own ACK triggers failback. */
         if ( sn1addr.family != 0 )
@@ -5559,11 +5605,11 @@ process_n2n_packet:
                         /* The probed supernode is alive: keep last_sup fresh so a
                          * rejected-but-alive sn (e.g. -E gate) does not trip sn_all_failed. */
                         eee->last_sup = now;
-                        if ( eee->sn_idx == 0 && ra.sn_bak.family != 0 )
+                        if ( ra.sn_bak.family != 0 )
                         {
-                            /* Only on sn1 does its ACK carry genuine sn1 identity;
-                             * a failover sn's reply may name its own brother,
-                             * never adopt it. */
+                            /* sn_bak_str is the answering sn's own -b text, never an
+                             * sn1 address; only the brother-matched sock (ra.sn_bak)
+                             * from a failover sn (sn2) is a genuine sn1 address. */
                             cache_sn1_addr( eee, NULL, 0, &ra.sn_bak );
                             if ( mac_nonzero( ra.sn1_mac ) )
                                 memcpy( eee->sn1_mac, ra.sn1_mac, N2N_MAC_SIZE );
@@ -5612,6 +5658,7 @@ process_n2n_packet:
                     {
                         eee->supernode = eee->sn1_probe_addr;
                         eee->sn_idx = 0;
+                        sn_apply_community_mask( eee, 0 ); /* back to the original group */
                         eee->sn_ask_backup = 0;
                         eee->sn_ack_count = 0;
                         eee->sn_wait = 0;
@@ -5679,6 +5726,7 @@ process_n2n_packet:
                             {
                                 eee->supernode = ra.sn_bak;
                                 eee->sn_idx = 0;
+                                sn_apply_community_mask( eee, 0 ); /* back to the original group */
                                 eee->sn_ask_backup = 0;
                                 eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
                                 /* sn_bak_str is the answering sn's own -b text; use the brother-matched binary sock. */
@@ -7206,6 +7254,10 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         /* Use full name for local display */
         memcpy(eee.community_name_full, full_community, N2N_COMMUNITY_SIZE);
     }
+
+    /* Pristine on-wire name: failing over to a backup supernode prefixes it
+     * with '*', and failing back restores it from here. */
+    memcpy(eee.community_name_base, eee.community_name, N2N_COMMUNITY_SIZE);
 
     if (eee.sn_num == 0) {
         strcpy(eee.sn_ip_array[0], "n2n6.ouno.eu.org");
