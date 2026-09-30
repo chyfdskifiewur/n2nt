@@ -2541,7 +2541,7 @@ static void update_peer_address(n2n_edge_t * eee,
 /*     dead supernode.                                                 */
 /* ------------------------------------------------------------------ */
 
-/* Prefix the on-wire community name with '*' while on a backup supernode, so
+/* Append '*' to the on-wire community name while on a backup supernode, so
  * the failover group cannot talk to same-named members living on that sn. */
 static void sn_apply_community_mask( n2n_edge_t * eee, int masked )
 {
@@ -2552,10 +2552,11 @@ static void sn_apply_community_mask( n2n_edge_t * eee, int masked )
         return;
     }
 
+    /* Room for the marker: keep 14 chars of the name, then append '*'. */
     memset( eee->community_name, 0, N2N_COMMUNITY_SIZE );
-    eee->community_name[0] = '*';
     strncat( (char *)eee->community_name, (const char *)eee->community_name_base,
              N2N_COMMUNITY_SIZE - 2 );
+    strncat( (char *)eee->community_name, "*", 1 );
 }
 
 /* Switch the active supernode to index idx and resolve all addresses. */
