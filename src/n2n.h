@@ -489,7 +489,6 @@ struct n2n_edge
 
     n2n_community_t     community_name;
     n2n_community_t     community_name_full;  /* full name before truncation for local display */
-    n2n_community_t     community_name_base;  /* pristine name, restored when failing back to sn1 */
     char                keyschedule[N2N_PATHNAME_MAXLEN];
     int                 null_transop;
     char                supernode_version[32];

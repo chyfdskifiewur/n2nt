@@ -2989,7 +2989,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 
             /* Twin probe to the current supernode's main + alt port (lport,
              * lport+1): equal public ports prove per-IP reuse -> NAT3 (punches
-             * fine); this is the reliable NAT3/NAT4 arbiter, kept everywhere. */
+             * fine); disagreeing ports prove endpoint-dependent mapping
+             * (NAT4/symmetric). This is the reliable NAT3/NAT4 arbiter. */
             send_register_super( eee, &(eee->supernode), 0, 2, NULL );
             if ( eee->supernode.family == AF_INET &&
                  eee->supernode.port != 0xFFFF )
@@ -2999,19 +3000,14 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
                 send_register_super( eee, &snq_alt, 0, 2, NULL );
             }
 
-            /* Cross-IP probe to sn2 (distinct public IP, no NAT1 verdict yet):
-             * confirmatory only — cross-IP difference must never upgrade to NAT4
-             * (the within-IP reuse evidence above is the arbiter). */
+            /* Cross-IP probe to sn2 (distinct public IP, no NAT1 verdict yet) */
             int cross_probe = ( eee->sn_num >= 2 &&
-                             eee->sn_query.family == AF_INET &&
-                             eee->supernode.family == AF_INET &&
-                             sock_equal( &(eee->sn_query),
-                                         &(eee->supernode) ) != 0 &&
-                             memcmp( eee->sn_query.addr.v4,
-                                     eee->supernode.addr.v4,
-                                     IPV4_SIZE ) != 0 )
-                           && !eee->fc_seen;
-
+                                eee->sn_query.family == AF_INET &&
+                                eee->supernode.family == AF_INET &&
+                                memcmp( eee->sn_query.addr.v4,
+                                        eee->supernode.addr.v4,
+                                        IPV4_SIZE ) != 0 &&
+                                !eee->fc_seen );
             eee->nat_probe_cross = cross_probe ? 1 : 0;
             if ( cross_probe )
                 send_register_super( eee, &(eee->sn_query), 0, 2, NULL );
@@ -5460,11 +5456,9 @@ process_n2n_packet:
             }
 
             if (known) {
-                /* A verified direct link is terminal: accept the address as fresh metadata
-                 * but do NOT move the peer back to pending_peers. Doing so re-arms the punch
-                 * gate (punch_start_time is 0 on an established peer), and since the SN
-                 * re-pushes PUNCH every 2s while the pair is live, the two feed each other:
-                 * PUNCH -> pending -> punch -> QUERY_PEER -> pair refreshed -> PUNCH. */
+                /* A verified direct link is terminal: refresh metadata only. Moving the peer
+                 * back to pending_peers re-arms the punch gate, and the SN re-pushes PUNCH
+                 * every 2s while the pair is live, so the two would feed each other. */
                 struct peer_info *prev = NULL, *scan = eee->known_peers;
                 while (scan && memcmp(scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
                     prev = scan; scan = scan->next;
@@ -5472,8 +5466,7 @@ process_n2n_packet:
                 if (scan) {
                     int direct_alive = ( scan->direct_seen != 0 &&
                                          ( now - scan->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
-                    /* An address change still matters: the peer may have moved NAT mapping,
-                     * so fall through and re-punch against the new endpoint. */
+                    /* A moved address means the peer may have a new NAT mapping: re-punch. */
                     int addr_moved =
                         ( pi.sockets[0].family == AF_INET &&
                           sock_equal( &scan->sock, &pi.sockets[0] ) != 0 ) ||
@@ -5919,8 +5912,26 @@ process_n2n_packet:
                             initial_connection_complete = 1;
                         }
 
+                        /* 只认当前 SN 的注册信息：打洞期间 our public endpoint 由我们实际
+                         * 注册的那个 SN 独家定义。lport+1 的孪生探针和兄弟 sn2 各自看到的是
+                         * 另一个 NAT 映射，让它们覆盖 my_public_sock 会让这个值每隔一个注册
+                         * 周期来回翻转，而每次翻转都把整个 NAT 分类状态清零重来，分类器因此
+                         * 永远收敛不了。 */
+                        int auth_sn = ( eee->supernode.family != 0 &&
+                                        sock_equal( &sender, &eee->supernode ) == 0 ) ||
+                                      ( eee->supernode_alt.family != 0 &&
+                                        sock_equal( &sender, &eee->supernode_alt ) == 0 );
+
                         /* NAT detection is IPv4-only: a family flip is not an address change */
-                        if ( ra.sock.family == AF_INET )
+                        if ( !auth_sn )
+                        {
+                            if ( ra.sock.family == AF_INET )
+                                traceEvent( TRACE_DEBUG,
+                                            "Ignoring public address %s from non-current supernode %s",
+                                            sock_to_cstr( sockbuf1, &ra.sock ),
+                                            sock_to_cstr( sockbuf2, &sender ) );
+                        }
+                        else if ( ra.sock.family == AF_INET )
                         {
                             /* Store our public address as seen by the SN; log on change */
                             n2n_sock_t old_pub = eee->my_public_sock;
@@ -5965,19 +5976,10 @@ process_n2n_packet:
                                 }
                             }
 
-                            /* Attribute the first observation by sender; skip the suppressed restoral ACK */
                             if ( !suppress_ack )
                             {
-                                if ( sock_equal( &sender, &eee->sn_query ) == 0 )
-                                {
-                                    eee->nat_seen_sn2 = ra.sock;
-                                    nat_classify( eee );
-                                }
-                                else
-                                {
-                                    eee->nat_seen_sn1 = ra.sock;
-                                    nat_classify( eee );
-                                }
+                                eee->nat_seen_sn1 = ra.sock;
+                                nat_classify( eee );
                             }
                         }
 
