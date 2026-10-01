@@ -70,7 +70,6 @@
 #define PUNCH_RETRY_MAX                 3    /* failed attempts before relay-only */
 #define PUNCH_LAN_TIMEOUT               2    /* sec: LAN phase before WAN fallback */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
-#define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -5526,14 +5525,13 @@ process_n2n_packet:
                 ( prev_sock6.family != pending->sock6.family ||
                   sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
 
-            /* Same-address handoff must NOT restart the punch: that would
-             * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain). */
-            int direct_alive = ( pending->direct_seen != 0 &&
-                                 ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
+            /* An SN PUNCH is an explicit (re)establish request: re-arm the punch
+             * unless one is already in flight (that guard stops the handoff loop).
+             * A stale direct_seen must not veto it: after a peer restart the link
+             * is dead long before direct_seen ages out, so the peer never punches. */
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
-            if ( addr_changed ||
-                 ( !punch_running && !direct_alive ) )
+            if ( addr_changed || !punch_running )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
