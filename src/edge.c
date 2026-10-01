@@ -1496,10 +1496,6 @@ static void send_register_super( n2n_edge_t * eee,
         eee->gaming_started = 1;
     }
 
-    /* Empty peer table (fresh start): ask the SN to push all peers */
-    if ( cookie_mode == 0 && !eee->known_peers && !eee->pending_peers )
-        reg.aflags |= N2N_AFLAGS_FORCE_PEER_INFO;
-
     /* Packet to sn2 (not the current supernode) is a one-shot lookup: ask it not to register us. */
     if ( cookie_mode == 0 &&
          sock_equal( supernode, &(eee->sn_query) ) == 0 &&
@@ -2316,7 +2312,9 @@ void set_peer_operational( n2n_edge_t * eee,
         scan->last_seen = n2n_now();
         scan->direct_seen = n2n_now();
         scan->p2p_est_time = scan->direct_seen;
-        scan->punch_start_time = 0;
+        /* Reaching here means the direct link is verified: a terminal state. Clearing
+         * punch_start_time would re-open the gate at edge.c:5521, so the next PEER_INFO
+         * would restart the punch, force a REGISTER_SUPER, and loop with the SN. */
         scan->punch_failed = 0;
 
         if (memcmp(scan->mac_addr, eee->last_p2p_log_mac, N2N_MAC_SIZE) ||
@@ -2541,32 +2539,11 @@ static void update_peer_address(n2n_edge_t * eee,
 /*     dead supernode.                                                 */
 /* ------------------------------------------------------------------ */
 
-/* Append '*' to the on-wire community name while on a backup supernode, so
- * the failover group cannot talk to same-named members living on that sn. */
-static void sn_apply_community_mask( n2n_edge_t * eee, int masked )
-{
-    if ( !masked )
-    {
-        memcpy( eee->community_name, eee->community_name_base,
-                N2N_COMMUNITY_SIZE );
-        return;
-    }
-
-    /* Room for the marker: keep 14 chars of the name, then append '*'. */
-    memset( eee->community_name, 0, N2N_COMMUNITY_SIZE );
-    strncat( (char *)eee->community_name, (const char *)eee->community_name_base,
-             N2N_COMMUNITY_SIZE - 2 );
-    strncat( (char *)eee->community_name, "*", 1 );
-}
-
 /* Switch the active supernode to index idx and resolve all addresses. */
 static void sn_switch_to( n2n_edge_t * eee, size_t idx )
 {
     eee->sn_idx = idx;
     eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;   /* fresh retry budget */
-
-    /* Group name follows the supernode: masked on a backup, pristine on sn1. */
-    sn_apply_community_mask( eee, idx != 0 );
 
     /* The periodic-resolve cache refers to the previously active supernode's
      * address; keep it from mis-reporting "address updated" (and from
@@ -5659,7 +5636,6 @@ process_n2n_packet:
                     {
                         eee->supernode = eee->sn1_probe_addr;
                         eee->sn_idx = 0;
-                        sn_apply_community_mask( eee, 0 ); /* back to the original group */
                         eee->sn_ask_backup = 0;
                         eee->sn_ack_count = 0;
                         eee->sn_wait = 0;
@@ -5727,7 +5703,6 @@ process_n2n_packet:
                             {
                                 eee->supernode = ra.sn_bak;
                                 eee->sn_idx = 0;
-                                sn_apply_community_mask( eee, 0 ); /* back to the original group */
                                 eee->sn_ask_backup = 0;
                                 eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
                                 /* sn_bak_str is the answering sn's own -b text; use the brother-matched binary sock. */
@@ -7255,10 +7230,6 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         /* Use full name for local display */
         memcpy(eee.community_name_full, full_community, N2N_COMMUNITY_SIZE);
     }
-
-    /* Pristine on-wire name: failing over to a backup supernode prefixes it
-     * with '*', and failing back restores it from here. */
-    memcpy(eee.community_name_base, eee.community_name, N2N_COMMUNITY_SIZE);
 
     if (eee.sn_num == 0) {
         strcpy(eee.sn_ip_array[0], "n2n6.ouno.eu.org");
