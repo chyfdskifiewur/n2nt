@@ -3393,7 +3393,8 @@ static int send_PACKET( n2n_edge_t * eee,
             }
             do_query = 1;
         } else if ( p->punch_failed && p->punch_retry_count >= 3 ) {
-            /* Punch gave up: further queries only fetch the same PUNCH back. */
+            /* 打洞已彻底放弃：再查只会换回一条同样的 PUNCH，纯空转。保留 last_query_sent
+             * 不动，peer 的地址真变了时由 PEER_INFO 路径重新发起。 */
             do_query = 0;
         } else {
             do_query = ((now - p->last_query_sent) >= 5);
@@ -5215,22 +5216,21 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
-            /* Drop redundant PUNCH: address unchanged and peer already busy. */
+            /* 已在同一地址上耗尽全部打洞重试的 peer：SN 仍会每 5s 回一条一模一样的
+             * PUNCH（中继路径每 5s 查询一次，SN 就双向推一次），而 punch_running
+             * 恒真使它无人消费。地址没变就静默丢弃，否则日志被同一行刷满。 */
             if (do_punch) {
                 PEERS_LOCK(eee);
                 struct peer_info *gp = find_peer_by_mac(eee->pending_peers, pi.mac);
-                if (!gp) gp = find_peer_by_mac(eee->known_peers, pi.mac);
-                int busy = (gp != NULL) &&
-                           (gp->punch_start_time != 0 || gp->lan_punch_start != 0 ||
-                            (gp->direct_seen != 0 &&
-                             (n2n_now() - gp->direct_seen) < PUNCH_DIRECT_ALIVE_SECS));
-                int addr_same = (gp != NULL) &&
+                int given_up = (gp != NULL) && gp->punch_failed &&
+                               gp->punch_retry_count >= 3;
+                int addr_same = (gp == NULL) ||
                                 ((pi.sockets[0].family != AF_INET ||
                                   sock_equal(&gp->sock, &pi.sockets[0]) == 0) &&
                                  (pi.sock6.family != AF_INET6 ||
                                   sock_equal(&gp->sock6, &pi.sock6) == 0));
                 PEERS_UNLOCK(eee);
-                if (busy && addr_same)
+                if (given_up && addr_same)
                     return 1;
             }
 
@@ -5934,9 +5934,11 @@ process_n2n_packet:
                             initial_connection_complete = 1;
                         }
 
-                        /* Trust only the SN we actually register with: letting the twin
-                         * probe (lport+1) or sn2 overwrite my_public_sock flips it every
-                         * cycle, and each flip resets the whole NAT classifier. */
+                        /* 只认当前 SN 的注册信息：打洞期间 our public endpoint 由我们实际
+                         * 注册的那个 SN 独家定义。lport+1 的孪生探针和兄弟 sn2 各自看到的是
+                         * 另一个 NAT 映射，让它们覆盖 my_public_sock 会让这个值每隔一个注册
+                         * 周期来回翻转，而每次翻转都把整个 NAT 分类状态清零重来，分类器因此
+                         * 永远收敛不了。 */
                         int auth_sn = ( eee->supernode.family != 0 &&
                                         sock_equal( &sender, &eee->supernode ) == 0 ) ||
                                       ( eee->supernode_alt.family != 0 &&
