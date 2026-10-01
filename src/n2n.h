@@ -307,6 +307,8 @@ struct sn_punch_pair {
     time_t              b_reg;          /* last round REGISTER_SUPER time of edge_b */
     time_t              last_exchanged; /* last handoff exchange time (0 = none yet) */
     time_t              last_activity;  /* last QUERY touching this pair (purge key) */
+    time_t              a_query;        /* last QUERY_PEER time of edge_a (0 = never) */
+    time_t              b_query;        /* last QUERY_PEER time of edge_b (0 = never) */
     /* Round-start sync: defer the near side so both punch together. */
     int64_t             sync_send_ms;   /* ms: first handoff send time (measurement start) */
     int64_t             sync_reg_a_ms;  /* ms: edge_a's first registration after the start */
