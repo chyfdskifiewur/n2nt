@@ -2312,9 +2312,7 @@ void set_peer_operational( n2n_edge_t * eee,
         scan->last_seen = n2n_now();
         scan->direct_seen = n2n_now();
         scan->p2p_est_time = scan->direct_seen;
-        /* Reaching here means the direct link is verified: a terminal state. Clearing
-         * punch_start_time would re-open the gate at edge.c:5521, so the next PEER_INFO
-         * would restart the punch, force a REGISTER_SUPER, and loop with the SN. */
+        scan->punch_start_time = 0;
         scan->punch_failed = 0;
 
         if (memcmp(scan->mac_addr, eee->last_p2p_log_mac, N2N_MAC_SIZE) ||
@@ -5462,11 +5460,43 @@ process_n2n_packet:
             }
 
             if (known) {
+                /* A verified direct link is terminal: accept the address as fresh metadata
+                 * but do NOT move the peer back to pending_peers. Doing so re-arms the punch
+                 * gate (punch_start_time is 0 on an established peer), and since the SN
+                 * re-pushes PUNCH every 2s while the pair is live, the two feed each other:
+                 * PUNCH -> pending -> punch -> QUERY_PEER -> pair refreshed -> PUNCH. */
                 struct peer_info *prev = NULL, *scan = eee->known_peers;
                 while (scan && memcmp(scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
                     prev = scan; scan = scan->next;
                 }
                 if (scan) {
+                    int direct_alive = ( scan->direct_seen != 0 &&
+                                         ( now - scan->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
+                    /* An address change still matters: the peer may have moved NAT mapping,
+                     * so fall through and re-punch against the new endpoint. */
+                    int addr_moved =
+                        ( pi.sockets[0].family == AF_INET &&
+                          sock_equal( &scan->sock, &pi.sockets[0] ) != 0 ) ||
+                        ( pi.sockets[0].family == AF_INET6 &&
+                          sock_equal( &scan->sock6, &pi.sockets[0] ) != 0 );
+
+                    if ( direct_alive && !addr_moved ) {
+                        if ( pi.sock6.family == AF_INET6 )
+                            scan->sock6 = pi.sock6;
+                        if ( pi.version[0] )
+                            strncpy(scan->version, pi.version, sizeof(scan->version) - 1);
+                        if ( pi.os_name[0] )
+                            strncpy(scan->os_name, pi.os_name, sizeof(scan->os_name) - 1);
+                        if ( pi.assigned_ip )
+                            scan->assigned_ip = pi.assigned_ip;
+                        {
+                            uint8_t nt = N2N_NAT_FROM_AFLAGS(pi.aflags);
+                            if (nt) scan->nat_type = nt; /* 0 = sn did not report */
+                        }
+                        PEERS_UNLOCK(eee);
+                        return 1;
+                    }
+
                     if (prev) prev->next = scan->next;
                     else eee->known_peers = scan->next;
                     scan->next = eee->pending_peers;

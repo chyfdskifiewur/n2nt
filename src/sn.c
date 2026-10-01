@@ -3166,6 +3166,22 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
             struct peer_info *eb = find_peer_by_mac( sss->edges, p->edge_b );
             if ( ea && eb )
             {
+                /* Stop pushing once the pair has proved it can reach itself: the edge
+                 * that stopped asking (no more round REGISTER_SUPER / QUERY_PEER) will
+                 * not consume a handoff, so continuing only re-arms the punch on the
+                 * other side and feeds the PUSH->punch->QUERY loop. Without this the
+                 * pair never converges once a direct link exists (PUNCH_PAIR_HOLD only
+                 * fires when *both* edges fall silent). */
+                int a_silent = ( p->a_reg == 0 ) ||
+                               ( p->last_activity - p->a_reg > PUNCH_PAIR_HOLD );
+                int b_silent = ( p->b_reg == 0 ) ||
+                               ( p->last_activity - p->b_reg > PUNCH_PAIR_HOLD );
+                if ( a_silent || b_silent )
+                {
+                    p->last_exchanged = now;
+                    return;
+                }
+
                 if ( p->sync_armed && p->sync_delay_ms > 0 )
                 {
                     /* Far side immediately, near side after the measured half-difference. */
@@ -4371,9 +4387,8 @@ static int process_udp( n2n_sn_t * sss,
                     sock_to_cstr( sockbuf, &(ack.sock) ),
                     ws_sender ? " (ws)" : "" );
 
-        /* Member dump only on a real registration; a QUERY_ONLY probe must
-         * not leak this community's peers to a non-member. */
-        if ( !query_only && ( is_new_edge || force_peer_info ) )
+        /* Push all existing peers when this is a NEW edge registration or FORCE_PEER_INFO flag is set */
+        if ( is_new_edge || force_peer_info )
         {
             n2n_common_t    pi_cmn;
             n2n_PEER_INFO_t pi;
