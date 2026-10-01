@@ -5215,25 +5215,23 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
-            /* Suppress redundant PUNCH: address unchanged and peer already busy
-             * (punching, gave up, or direct alive). Same predicate as the
-             * restart gate below, so anything that would change state still passes. */
+            /* Suppress redundant PUNCH only when peer is given up or direct alive
+             * with unchanged address. Do not suppress during active punch rounds. */
             if (do_punch) {
                 PEERS_LOCK(eee);
                 struct peer_info *gp = find_peer_by_mac(eee->pending_peers, pi.mac);
                 if (!gp) gp = find_peer_by_mac(eee->known_peers, pi.mac);
-                int busy = (gp != NULL) &&
-                           (gp->punch_start_time != 0 || gp->lan_punch_start != 0 ||
-                            gp->punch_failed ||
-                            (gp->direct_seen != 0 &&
-                             (n2n_now() - gp->direct_seen) < PUNCH_DIRECT_ALIVE_SECS));
+                int redundant = (gp != NULL) &&
+                                ((gp->punch_failed && gp->punch_retry_count >= 3) ||
+                                 (gp->direct_seen != 0 &&
+                                  (n2n_now() - gp->direct_seen) < PUNCH_DIRECT_ALIVE_SECS));
                 int addr_same = (gp != NULL) &&
                                 ((pi.sockets[0].family != AF_INET ||
                                   sock_equal(&gp->sock, &pi.sockets[0]) == 0) &&
                                  (pi.sock6.family != AF_INET6 ||
                                   sock_equal(&gp->sock6, &pi.sock6) == 0));
                 PEERS_UNLOCK(eee);
-                if (busy && addr_same)
+                if (redundant && addr_same)
                     return 1;
             }
 
