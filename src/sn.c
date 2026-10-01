@@ -2962,10 +2962,6 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
  * within the 2s rounds the handoff already refreshes both edges. */
 #define PUNCH_QUERY_REFRESH_SECS 3
 
-/* sec: an edge unregistered for this long is gone. Must exceed
- * REGISTER_SUPER_INTERVAL_DFL (20s) so a healthy edge is never taken as dead. */
-#define EDGE_LIVENESS_HOLD_SECS 60
-
 static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
                                             const n2n_community_t community,
                                             const n2n_mac_t a,
@@ -3170,18 +3166,6 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
             struct peer_info *eb = find_peer_by_mac( sss->edges, p->edge_b );
             if ( ea && eb )
             {
-                /* Judged on registration liveness: giving up punching is not
-                 * being gone, and a silent peer cannot ask for a handoff. */
-                int a_silent = ( ea->last_seen == 0 ) ||
-                               ( now - ea->last_seen > EDGE_LIVENESS_HOLD_SECS );
-                int b_silent = ( eb->last_seen == 0 ) ||
-                               ( now - eb->last_seen > EDGE_LIVENESS_HOLD_SECS );
-                if ( a_silent || b_silent )
-                {
-                    p->last_exchanged = now;
-                    return;
-                }
-
                 if ( p->sync_armed && p->sync_delay_ms > 0 )
                 {
                     /* Far side immediately, near side after the measured half-difference. */

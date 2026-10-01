@@ -1314,6 +1314,23 @@ static int sn_is_ack_brother( n2n_edge_t * eee, int slot )
     return slot >= 0 && slot < (int)eee->sn_num && eee->sn_ack_backup[slot];
 }
 
+/** True when a datagram came from the supernode we are currently registered
+ *  with (eee->sn_idx), over either address family. Everything else — the sn2
+ *  query/brother channel, a supernode we already failed over from — is not the
+ *  active primary and must not feed the peer address book. */
+static int sn_is_active_sender( n2n_edge_t * eee, const n2n_sock_t * sender )
+{
+    if ( eee->supernode.family != 0 &&
+         sock_equal( sender, &(eee->supernode) ) == 0 )
+        return 1;
+
+    if ( eee->supernode_alt.family != 0 &&
+         sock_equal( sender, &(eee->supernode_alt) ) == 0 )
+        return 1;
+
+    return 0;
+}
+
 /** Persist sn1's current address from an sn2 ask_backup reply (string or binary
  * sock); leaves sn_ip_array[0] (-l domain) untouched for DNS re-resolve. */
 static void cache_sn1_addr( n2n_edge_t * eee,
@@ -2989,8 +3006,7 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 
             /* Twin probe to the current supernode's main + alt port (lport,
              * lport+1): equal public ports prove per-IP reuse -> NAT3 (punches
-             * fine); disagreeing ports prove endpoint-dependent mapping
-             * (NAT4/symmetric). This is the reliable NAT3/NAT4 arbiter. */
+             * fine); this is the reliable NAT3/NAT4 arbiter, kept everywhere. */
             send_register_super( eee, &(eee->supernode), 0, 2, NULL );
             if ( eee->supernode.family == AF_INET &&
                  eee->supernode.port != 0xFFFF )
@@ -3000,14 +3016,19 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
                 send_register_super( eee, &snq_alt, 0, 2, NULL );
             }
 
-            /* Cross-IP probe to sn2 (distinct public IP, no NAT1 verdict yet) */
+            /* Cross-IP probe to sn2 (distinct public IP, no NAT1 verdict yet):
+             * confirmatory only — cross-IP difference must never upgrade to NAT4
+             * (the within-IP reuse evidence above is the arbiter). */
             int cross_probe = ( eee->sn_num >= 2 &&
-                                eee->sn_query.family == AF_INET &&
-                                eee->supernode.family == AF_INET &&
-                                memcmp( eee->sn_query.addr.v4,
-                                        eee->supernode.addr.v4,
-                                        IPV4_SIZE ) != 0 &&
-                                !eee->fc_seen );
+                             eee->sn_query.family == AF_INET &&
+                             eee->supernode.family == AF_INET &&
+                             sock_equal( &(eee->sn_query),
+                                         &(eee->supernode) ) != 0 &&
+                             memcmp( eee->sn_query.addr.v4,
+                                     eee->supernode.addr.v4,
+                                     IPV4_SIZE ) != 0 )
+                           && !eee->fc_seen;
+
             eee->nat_probe_cross = cross_probe ? 1 : 0;
             if ( cross_probe )
                 send_register_super( eee, &(eee->sn_query), 0, 2, NULL );
@@ -5210,29 +5231,18 @@ process_n2n_packet:
             n2n_PEER_INFO_t pi;
             decode_PEER_INFO(&pi, &cmn, udp_buf, &rem, &idx);
 
-            int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
-
-            /* Suppress redundant PUNCH: address unchanged and peer already busy
-             * (punching, gave up, or direct alive). Same predicate as the
-             * restart gate below, so anything that would change state still passes. */
-            if (do_punch) {
-                PEERS_LOCK(eee);
-                struct peer_info *gp = find_peer_by_mac(eee->pending_peers, pi.mac);
-                if (!gp) gp = find_peer_by_mac(eee->known_peers, pi.mac);
-                int busy = (gp != NULL) &&
-                           (gp->punch_start_time != 0 || gp->lan_punch_start != 0 ||
-                            gp->punch_failed ||
-                            (gp->direct_seen != 0 &&
-                             (n2n_now() - gp->direct_seen) < PUNCH_DIRECT_ALIVE_SECS));
-                int addr_same = (gp != NULL) &&
-                                ((pi.sockets[0].family != AF_INET ||
-                                  sock_equal(&gp->sock, &pi.sockets[0]) == 0) &&
-                                 (pi.sock6.family != AF_INET6 ||
-                                  sock_equal(&gp->sock6, &pi.sock6) == 0));
-                PEERS_UNLOCK(eee);
-                if (busy && addr_same)
-                    return 1;
+            /* Punch addresses must come from the active primary SN only: the sn2
+             * query/brother channel and an already-failed-over supernode may still
+             * be pushing PEER_INFO, and acting on it would restart the punch with a
+             * foreign address book. Drop those packets entirely. */
+            if ( !sn_is_active_sender(eee, &sender) )
+            {
+                traceEvent(TRACE_DEBUG, "Rx PEER_INFO for %s from non-primary supernode %s - dropped",
+                           macaddr_str(mac_buf1, pi.mac), sock_to_cstr(sockbuf1, &sender));
+                return 1;
             }
+
+            int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
             /* Relay advertisement: our own MAC => we are the designated relay (enable
              * forwarding); another MAC => remember it and register to it as a client.
@@ -5478,40 +5488,11 @@ process_n2n_packet:
             }
 
             if (known) {
-                /* A verified direct link is terminal: refresh metadata only. Moving the peer
-                 * back to pending_peers re-arms the punch gate, and the SN re-pushes PUNCH
-                 * every 2s while the pair is live, so the two would feed each other. */
                 struct peer_info *prev = NULL, *scan = eee->known_peers;
                 while (scan && memcmp(scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
                     prev = scan; scan = scan->next;
                 }
                 if (scan) {
-                    int direct_alive = ( scan->direct_seen != 0 &&
-                                         ( now - scan->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
-                    /* A moved address means the peer may have a new NAT mapping: re-punch. */
-                    int addr_moved =
-                        ( pi.sockets[0].family == AF_INET &&
-                          sock_equal( &scan->sock, &pi.sockets[0] ) != 0 ) ||
-                        ( pi.sockets[0].family == AF_INET6 &&
-                          sock_equal( &scan->sock6, &pi.sockets[0] ) != 0 );
-
-                    if ( direct_alive && !addr_moved ) {
-                        if ( pi.sock6.family == AF_INET6 )
-                            scan->sock6 = pi.sock6;
-                        if ( pi.version[0] )
-                            strncpy(scan->version, pi.version, sizeof(scan->version) - 1);
-                        if ( pi.os_name[0] )
-                            strncpy(scan->os_name, pi.os_name, sizeof(scan->os_name) - 1);
-                        if ( pi.assigned_ip )
-                            scan->assigned_ip = pi.assigned_ip;
-                        {
-                            uint8_t nt = N2N_NAT_FROM_AFLAGS(pi.aflags);
-                            if (nt) scan->nat_type = nt; /* 0 = sn did not report */
-                        }
-                        PEERS_UNLOCK(eee);
-                        return 1;
-                    }
-
                     if (prev) prev->next = scan->next;
                     else eee->known_peers = scan->next;
                     scan->next = eee->pending_peers;
@@ -5934,22 +5915,8 @@ process_n2n_packet:
                             initial_connection_complete = 1;
                         }
 
-                        /* Trust only the SN we actually register with. */
-                        int auth_sn = ( eee->supernode.family != 0 &&
-                                        sock_equal( &sender, &eee->supernode ) == 0 ) ||
-                                      ( eee->supernode_alt.family != 0 &&
-                                        sock_equal( &sender, &eee->supernode_alt ) == 0 );
-
                         /* NAT detection is IPv4-only: a family flip is not an address change */
-                        if ( !auth_sn )
-                        {
-                            if ( ra.sock.family == AF_INET )
-                                traceEvent( TRACE_DEBUG,
-                                            "Ignoring public address %s from non-current supernode %s",
-                                            sock_to_cstr( sockbuf1, &ra.sock ),
-                                            sock_to_cstr( sockbuf2, &sender ) );
-                        }
-                        else if ( ra.sock.family == AF_INET )
+                        if ( ra.sock.family == AF_INET )
                         {
                             /* Store our public address as seen by the SN; log on change */
                             n2n_sock_t old_pub = eee->my_public_sock;
@@ -5994,10 +5961,19 @@ process_n2n_packet:
                                 }
                             }
 
+                            /* Attribute the first observation by sender; skip the suppressed restoral ACK */
                             if ( !suppress_ack )
                             {
-                                eee->nat_seen_sn1 = ra.sock;
-                                nat_classify( eee );
+                                if ( sock_equal( &sender, &eee->sn_query ) == 0 )
+                                {
+                                    eee->nat_seen_sn2 = ra.sock;
+                                    nat_classify( eee );
+                                }
+                                else
+                                {
+                                    eee->nat_seen_sn1 = ra.sock;
+                                    nat_classify( eee );
+                                }
                             }
                         }
 
