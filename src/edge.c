@@ -1744,8 +1744,14 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     scan->punch_failed = 1;
                     scan->punch_start_time = 0; /* attempt over: not "running" any more */
                     scan->punch_reset_time = now;
-                    traceEvent(TRACE_DEBUG, "rounds exhausted for %s",
-                               PEER_ID(mac_tmp, scan));
+                    scan->punch_retry_count++;  /* one attempt spent (sole budget consumer) */
+                    if ( scan->punch_retry_count >= PUNCH_RETRY_MAX )
+                        traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
+                                   PEER_ID(mac_tmp, scan),
+                                   scan->punch_retry_count);
+                    else
+                        traceEvent(TRACE_DEBUG, "rounds exhausted for %s",
+                                   PEER_ID(mac_tmp, scan));
                 }
                 else
                 {
@@ -1775,24 +1781,17 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             continue;
         } else if ( scan->punch_failed )
         {
-            /* Exponential back-off: 10s, 20s, 40s, then relay-only. */
+            /* Relay-only once the retry budget is spent. */
             if ( scan->punch_retry_count >= PUNCH_RETRY_MAX ) {
                 prev = scan;
                 scan = scan->next;
                 continue;
             }
-            time_t backoff = (time_t)PUNCH_RETRY_BASE_SECS << scan->punch_retry_count;
+            /* Back-off between attempts: 10s, 20s. */
+            time_t backoff = (time_t)PUNCH_RETRY_BASE_SECS
+                             << ( scan->punch_retry_count > 0 ? scan->punch_retry_count - 1 : 0 );
             if ( (now - scan->punch_reset_time) > backoff )
             {
-                scan->punch_retry_count++;
-                if ( scan->punch_retry_count >= PUNCH_RETRY_MAX ) {
-                    traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
-                               PEER_ID(mac_tmp, scan),
-                               scan->punch_retry_count);
-                    prev = scan;
-                    scan = scan->next;
-                    continue;
-                }
                 scan->punch_failed = 0;
                 scan->punch_start_time = 0;
                 scan->lan_punch_done = 0;
@@ -1800,7 +1799,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 scan->lan_punch_last_tx = 0;
                 traceEvent(TRACE_DEBUG, "Retrying punch for %s (attempt %u/%u)",
                            PEER_ID(mac_tmp, scan),
-                           scan->punch_retry_count, PUNCH_RETRY_MAX);
+                           scan->punch_retry_count + 1, PUNCH_RETRY_MAX);
                 start_punch(eee, scan);
             }
         }
@@ -5268,14 +5267,16 @@ process_n2n_packet:
             }
 
             if (pi.assigned_ip) {
-                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s [%u.%u.%u.%u] at %s%s",
+                traceEvent(do_punch ? TRACE_DEBUG : TRACE_INFO,
+                           "Rx PEER_INFO for %s [%u.%u.%u.%u] at %s%s",
                            macaddr_str(mac_buf1, pi.mac),
                            (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
                            (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF,
                            sock_to_cstr(sockbuf1, &pi.sockets[0]),
                            do_punch ? " [PUNCH]" : "");
             } else {
-                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s at %s%s",
+                traceEvent(do_punch ? TRACE_DEBUG : TRACE_INFO,
+                           "Rx PEER_INFO for %s at %s%s",
                            macaddr_str(mac_buf1, pi.mac),
                            sock_to_cstr(sockbuf1, &pi.sockets[0]),
                            do_punch ? " [PUNCH]" : "");
@@ -5559,28 +5560,15 @@ process_n2n_packet:
             }
             else if ( !punch_running && !relay_only )
             {
-                MACSTR_TMP(mac_give);
-                /* Join now rather than wait out the back-off, so the two ends punch
-                 * as one. This spends a retry, so the give-up countdown still runs. */
-                pending->punch_retry_count++;
-                if ( pending->punch_retry_count >= PUNCH_RETRY_MAX )
-                {
-                    pending->punch_failed = 1;
-                    pending->punch_start_time = 0;
-                    pending->punch_reset_time = n2n_now();
-                    traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
-                               PEER_ID(mac_give, pending),
-                               pending->punch_retry_count);
-                }
-                else
-                {
-                    pending->punch_failed = 0;
-                    pending->punch_start_time = 0;
-                    pending->lan_punch_done = 0;
-                    pending->lan_punch_start = 0;
-                    pending->lan_punch_last_tx = 0;
-                    start_punch( eee, pending );
-                }
+                /* Join the sn's beat: drop the back-off and fire round 0 now, so the
+                 * two ends punch as one. The retry budget is spent at round
+                 * exhaustion, not here, so a join never eats a whole attempt. */
+                pending->punch_failed = 0;
+                pending->punch_start_time = 0;
+                pending->lan_punch_done = 0;
+                pending->lan_punch_start = 0;
+                pending->lan_punch_last_tx = 0;
+                start_punch( eee, pending );
             }
 
             PEERS_UNLOCK(eee);
