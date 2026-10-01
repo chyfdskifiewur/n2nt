@@ -70,7 +70,6 @@
 #define PUNCH_RETRY_MAX                 3    /* failed attempts before relay-only */
 #define PUNCH_LAN_TIMEOUT               2    /* sec: LAN phase before WAN fallback */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
-#define PUNCH_REARM_COOLDOWN            30   /* sec: quiet time before a relay-only peer honours a punch signal */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -2328,6 +2327,9 @@ void set_peer_operational( n2n_edge_t * eee,
         scan->p2p_est_time = scan->direct_seen;
         scan->punch_start_time = 0;
         scan->punch_failed = 0;
+        /* Direct link up: the punch cycle ends here, so start the next one fresh. */
+        scan->punch_retry_count = 0;
+        scan->punch_reset_time = 0;
 
         if (memcmp(scan->mac_addr, eee->last_p2p_log_mac, N2N_MAC_SIZE) ||
             memcmp(peer, &eee->last_p2p_log_addr, sizeof(n2n_sock_t))) {
@@ -5527,16 +5529,16 @@ process_n2n_packet:
                 ( prev_sock6.family != pending->sock6.family ||
                   sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
 
-            /* An SN PUNCH is an explicit (re)establish request: re-arm the punch
-             * unless one is already in flight. An exhausted attempt is not "in
-             * flight"; a relay-only peer re-arms after a quiet cooldown so that two
-             * peers waking each other cannot keep punching forever. A stale
-             * direct_seen never vetoes: after a restart the link is dead long
+            /* An SN PUNCH starts a punch only for a peer that has none in progress and
+             * has not burnt its retry budget. A bare PUNCH storm must not reset that
+             * budget, or the give-up back-off is never reached and a pair that cannot
+             * punch never settles into relay-only. Recovery is elsewhere: an address
+             * change restarts unconditionally, a keepalive failure clears the budget.
+             * A stale direct_seen never vetoes: after a restart the link is dead long
              * before direct_seen ages out, so the peer would never punch. */
             int punch_running = ( ( pending->punch_start_time != 0 && !pending->punch_failed ) ||
                                   pending->lan_punch_start != 0 );
-            int rearm_ok = ( !pending->punch_failed ||
-                             ( now - pending->punch_reset_time ) >= PUNCH_REARM_COOLDOWN );
+            int rearm_ok = ( !pending->punch_failed && pending->punch_retry_count == 0 );
             if ( addr_changed || ( !punch_running && rearm_ok ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
