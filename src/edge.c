@@ -3392,6 +3392,10 @@ static int send_PACKET( n2n_edge_t * eee,
                 peer_list_add(&eee->pending_peers, p);
             }
             do_query = 1;
+        } else if ( p->punch_failed && p->punch_retry_count >= 3 ) {
+            /* 打洞已彻底放弃：再查只会换回一条同样的 PUNCH，纯空转。保留 last_query_sent
+             * 不动，peer 的地址真变了时由 PEER_INFO 路径重新发起。 */
+            do_query = 0;
         } else {
             do_query = ((now - p->last_query_sent) >= 5);
             if (do_query)
@@ -5211,6 +5215,24 @@ process_n2n_packet:
             decode_PEER_INFO(&pi, &cmn, udp_buf, &rem, &idx);
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
+
+            /* 已在同一地址上耗尽全部打洞重试的 peer：SN 仍会每 5s 回一条一模一样的
+             * PUNCH（中继路径每 5s 查询一次，SN 就双向推一次），而 punch_running
+             * 恒真使它无人消费。地址没变就静默丢弃，否则日志被同一行刷满。 */
+            if (do_punch) {
+                PEERS_LOCK(eee);
+                struct peer_info *gp = find_peer_by_mac(eee->pending_peers, pi.mac);
+                int given_up = (gp != NULL) && gp->punch_failed &&
+                               gp->punch_retry_count >= 3;
+                int addr_same = (gp == NULL) ||
+                                ((pi.sockets[0].family != AF_INET ||
+                                  sock_equal(&gp->sock, &pi.sockets[0]) == 0) &&
+                                 (pi.sock6.family != AF_INET6 ||
+                                  sock_equal(&gp->sock6, &pi.sock6) == 0));
+                PEERS_UNLOCK(eee);
+                if (given_up && addr_same)
+                    return 1;
+            }
 
             /* Relay advertisement: our own MAC => we are the designated relay (enable
              * forwarding); another MAC => remember it and register to it as a client.
