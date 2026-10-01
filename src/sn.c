@@ -2979,9 +2979,8 @@ static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
     return NULL;
 }
 
-/* Touch (or create) the pair for (a,b), where `a` is the querying edge.
- * Returns 1 when newly created; the round-0 join messages (requester reply +
- * target wake-up) go out only then. */
+/* Touch (or create) the pair for (a,b). Returns 1 when newly created; the
+ * round-0 join messages (requester reply + target wake-up) go out only then. */
 static int sn_pair_touch( n2n_sn_t * sss, const n2n_community_t community,
                           const n2n_mac_t a, const n2n_mac_t b, time_t now )
 {
@@ -3000,13 +2999,6 @@ static int sn_pair_touch( n2n_sn_t * sss, const n2n_community_t community,
     if ( p )
     {
         p->last_activity = now;
-        /* Stamp the querying side: the simultaneous-open push below is skipped
-         * when the target is querying on its own (it gets the same PUNCH from
-         * its own reply path), which would otherwise double every round. */
-        if ( memcmp( a, ea, N2N_MAC_SIZE ) == 0 )
-            p->a_query = now;
-        else
-            p->b_query = now;
         return 0;
     }
     p = (struct sn_punch_pair*)calloc(1, sizeof(struct sn_punch_pair));
@@ -3016,10 +3008,6 @@ static int sn_pair_touch( n2n_sn_t * sss, const n2n_community_t community,
     memcpy(p->edge_a, ea, N2N_MAC_SIZE);
     memcpy(p->edge_b, eb, N2N_MAC_SIZE);
     p->last_activity = now;
-    if ( memcmp( a, ea, N2N_MAC_SIZE ) == 0 )
-        p->a_query = now;
-    else
-        p->b_query = now;
     p->next = sss->punch_pairs;
     sss->punch_pairs = p;
     /* Keep the table bounded: drop the least recently active pair when full. */
@@ -3867,28 +3855,8 @@ static int process_udp( n2n_sn_t * sss,
             }
             }
 
-            /* Simultaneous open: also push A's address to B so B punches back
-             * when B has not issued its own QUERY_PEER recently (otherwise B
-             * would get this PUNCH from its own reply path). */
-            int push_b = 0;
+            /* Simultaneous open: also push A's address to B so B punches back */
             if ( requester && reply )
-            {
-                if ( memcmp( query.srcMac, qpair->edge_a, N2N_MAC_SIZE ) == 0 )
-                {
-                    /* A queried: only push to B if B hasn't queried recently */
-                    if ( qpair->b_query == 0 ||
-                         ( now - qpair->b_query ) >= PUNCH_QUERY_REFRESH_SECS )
-                        push_b = 1;
-                }
-                else
-                {
-                    /* B queried: only push to A if A hasn't queried recently */
-                    if ( qpair->a_query == 0 ||
-                         ( now - qpair->a_query ) >= PUNCH_QUERY_REFRESH_SECS )
-                        push_b = 1;
-                }
-            }
-            if ( push_b )
             {
                 n2n_PEER_INFO_t pi2;
                 n2n_common_t    cmn3;

@@ -64,8 +64,13 @@
 #define REGISTER_SUPER_INTERVAL_MAX     120  /* sec */
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
-#define PUNCH_ROUNDS                    5    /* punch rounds before giving up */
-#define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
+#define PUNCH_ROUNDS                    5    /* punch rounds per attempt before giving up */
+#define PUNCH_FAST_ROUNDS               2    /* leading rounds use the shorter cadence */
+#define PUNCH_FAST_INTERVAL             1    /* sec: cadence of the leading rounds */
+#define PUNCH_ROUND_INTERVAL            2    /* sec: cadence of the remaining rounds */
+#define PUNCH_RETRY_BASE_SECS           10   /* sec: first back-off; doubles per failed attempt */
+#define PUNCH_RETRY_MAX                 3    /* failed attempts before relay-only */
+#define PUNCH_LAN_TIMEOUT               2    /* sec: LAN phase before WAN fallback */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
@@ -1314,23 +1319,6 @@ static int sn_is_ack_brother( n2n_edge_t * eee, int slot )
     return slot >= 0 && slot < (int)eee->sn_num && eee->sn_ack_backup[slot];
 }
 
-/** True when a datagram came from the supernode we are currently registered
- *  with (eee->sn_idx), over either address family. Everything else — the sn2
- *  query/brother channel, a supernode we already failed over from — is not the
- *  active primary and must not feed the peer address book. */
-static int sn_is_active_sender( n2n_edge_t * eee, const n2n_sock_t * sender )
-{
-    if ( eee->supernode.family != 0 &&
-         sock_equal( sender, &(eee->supernode) ) == 0 )
-        return 1;
-
-    if ( eee->supernode_alt.family != 0 &&
-         sock_equal( sender, &(eee->supernode_alt) ) == 0 )
-        return 1;
-
-    return 0;
-}
-
 /** Persist sn1's current address from an sn2 ask_backup reply (string or binary
  * sock); leaves sn_ip_array[0] (-l domain) untouched for DNS re-resolve. */
 static void cache_sn1_addr( n2n_edge_t * eee,
@@ -1701,7 +1689,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     peer->punch_start_time = n2n_now();
     peer->punch_round = 0;
     peer->punch_round_time = peer->punch_start_time;
-    traceEvent(TRACE_INFO, "rounds started for %s",
+    traceEvent(TRACE_DEBUG, "rounds started for %s",
                macaddr_str(mac_tmp, peer->mac_addr));
     punch_round(eee, peer); /* round-0: punch with the known address now */
     eee->punch_round_reg = 1; /* round re-registration refreshes the handoff */
@@ -1721,9 +1709,11 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
              scan->lan_punch_start != 0 )
         {
             time_t lan_elapsed = now - scan->lan_punch_start;
-            
-            /* Retransmit REGISTER every 1s for first 3s */
-            if ( lan_elapsed < 3 && (now - scan->last_seen) >= 1 )
+
+            /* Retransmit REGISTER every 1s; dedicated tx timer — inbound relay
+             * traffic must not throttle the LAN retransmits. */
+            if ( lan_elapsed < PUNCH_LAN_TIMEOUT &&
+                 (now - scan->lan_punch_last_tx) >= 1 )
             {
                 /* Use temp_local_sock if valid (dynamically selected best IP) */
                 if (scan->temp_local_sock_valid) {
@@ -1731,14 +1721,14 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 } else {
                     send_register(eee, &scan->sockets[1]);
                 }
-                scan->last_seen = now;
+                scan->lan_punch_last_tx = now;
             }
-            
+
             /* LAN punch timeout: fall back to WAN punch */
-            if ( lan_elapsed >= 3 )
+            if ( lan_elapsed >= PUNCH_LAN_TIMEOUT )
             {
                 scan->lan_punch_done = 1;
-                traceEvent(TRACE_INFO, "LAN punch timeout for %s - trying WAN",
+                traceEvent(TRACE_DEBUG, "LAN punch timeout for %s - trying WAN",
                            macaddr_str(mac_tmp, scan->mac_addr));
                 send_register(eee, &scan->sockets[0]);
                 send_register(eee, &(eee->supernode));
@@ -1748,14 +1738,17 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* Punch with the latest known address; a missing PUNCH handoff never blocks. */
-            if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
+            /* Punch with the latest known address; a missing PUNCH handoff never blocks.
+             * Leading rounds fire faster (1s) to catch the NAT window; the rest ease off. */
+            time_t round_interval = ( scan->punch_round < PUNCH_FAST_ROUNDS )
+                                  ? PUNCH_FAST_INTERVAL : PUNCH_ROUND_INTERVAL;
+            if ( (now - scan->punch_round_time) >= round_interval )
             {
                 if ( scan->punch_round >= PUNCH_ROUNDS - 1 )
                 {
                     scan->punch_failed = 1;
                     scan->punch_reset_time = now;
-                    traceEvent(TRACE_INFO, "rounds exhausted for %s",
+                    traceEvent(TRACE_DEBUG, "rounds exhausted for %s",
                                PEER_ID(mac_tmp, scan));
                 }
                 else
@@ -1786,15 +1779,17 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             continue;
         } else if ( scan->punch_failed )
         {
-            if ( scan->punch_retry_count >= 3 ) {
+            /* Exponential back-off: 10s, 20s, 40s, then relay-only. */
+            if ( scan->punch_retry_count >= PUNCH_RETRY_MAX ) {
                 prev = scan;
                 scan = scan->next;
                 continue;
             }
-            if ( (now - scan->punch_reset_time) > 40 )
+            time_t backoff = (time_t)PUNCH_RETRY_BASE_SECS << scan->punch_retry_count;
+            if ( (now - scan->punch_reset_time) > backoff )
             {
                 scan->punch_retry_count++;
-                if ( scan->punch_retry_count >= 3 ) {
+                if ( scan->punch_retry_count >= PUNCH_RETRY_MAX ) {
                     traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
                                PEER_ID(mac_tmp, scan),
                                scan->punch_retry_count);
@@ -1806,9 +1801,10 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 scan->punch_start_time = 0;
                 scan->lan_punch_done = 0;
                 scan->lan_punch_start = 0;
-                traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/3)",
+                scan->lan_punch_last_tx = 0;
+                traceEvent(TRACE_DEBUG, "Retrying punch for %s (attempt %u/%u)",
                            PEER_ID(mac_tmp, scan),
-                           scan->punch_retry_count);
+                           scan->punch_retry_count, PUNCH_RETRY_MAX);
                 start_punch(eee, scan);
             }
         }
@@ -1953,6 +1949,7 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                     scan->punch_retry_count  = 0;
                     scan->punch_reset_time   = 0;
                     scan->lan_punch_start    = 0;
+                    scan->lan_punch_last_tx  = 0;
                     scan->lan_punch_done     = 0;
                     scan->keepalive_fails    = 0;
                     scan->last_probe_sent    = 0;
@@ -2177,6 +2174,7 @@ void try_send_register( n2n_edge_t * eee,
             scan->punch_retry_count = 0;
             scan->punch_reset_time = 0;
             scan->lan_punch_start = 0;
+            scan->lan_punch_last_tx = 0;
             scan->lan_punch_done = 0;
             send_register(eee, peer);
             send_register(eee, &(eee->supernode));
@@ -2228,6 +2226,7 @@ void try_send_register_lan( n2n_edge_t * eee,
         scan->sockets[1]   = *local_sock;
         scan->last_seen    = n2n_now();
         scan->lan_punch_start = n2n_now();
+        scan->lan_punch_last_tx = scan->lan_punch_start;
         scan->lan_punch_done  = 0;
         
         /* Save temp_local_sock for LAN punch retransmissions */
@@ -2250,6 +2249,7 @@ void try_send_register_lan( n2n_edge_t * eee,
         scan->sockets[0]  = *peer;
         scan->sockets[1]  = *local_sock;
         scan->lan_punch_start = n2n_now();
+        scan->lan_punch_last_tx = scan->lan_punch_start;
         scan->lan_punch_done  = 0;
         scan->punch_start_time = 0;
         scan->punch_failed = 0;
@@ -4706,6 +4706,7 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
     pending->punch_round = 0;
     pending->punch_round_time = 0;
     pending->lan_punch_start = 0;
+    pending->lan_punch_last_tx = 0;
     pending->lan_punch_done = 0;
     /* Drop stale LAN sockets[1] from a previous same-LAN phase; the LAN path rebuilds both. */
     pending->num_sockets = 1;
@@ -5230,17 +5231,6 @@ process_n2n_packet:
         {
             n2n_PEER_INFO_t pi;
             decode_PEER_INFO(&pi, &cmn, udp_buf, &rem, &idx);
-
-            /* Punch addresses must come from the active primary SN only: the sn2
-             * query/brother channel and an already-failed-over supernode may still
-             * be pushing PEER_INFO, and acting on it would restart the punch with a
-             * foreign address book. Drop those packets entirely. */
-            if ( !sn_is_active_sender(eee, &sender) )
-            {
-                traceEvent(TRACE_DEBUG, "Rx PEER_INFO for %s from non-primary supernode %s - dropped",
-                           macaddr_str(mac_buf1, pi.mac), sock_to_cstr(sockbuf1, &sender));
-                return 1;
-            }
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
