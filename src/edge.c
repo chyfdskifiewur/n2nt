@@ -5215,23 +5215,25 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
-            /* Suppress redundant PUNCH only when peer is given up or direct alive
-             * with unchanged address. Do not suppress during active punch rounds. */
+            /* Suppress redundant PUNCH: address unchanged and peer already busy
+             * (punching, gave up, or direct alive). Same predicate as the
+             * restart gate below, so anything that would change state still passes. */
             if (do_punch) {
                 PEERS_LOCK(eee);
                 struct peer_info *gp = find_peer_by_mac(eee->pending_peers, pi.mac);
                 if (!gp) gp = find_peer_by_mac(eee->known_peers, pi.mac);
-                int redundant = (gp != NULL) &&
-                                ((gp->punch_failed && gp->punch_retry_count >= 3) ||
-                                 (gp->direct_seen != 0 &&
-                                  (n2n_now() - gp->direct_seen) < PUNCH_DIRECT_ALIVE_SECS));
+                int busy = (gp != NULL) &&
+                           (gp->punch_start_time != 0 || gp->lan_punch_start != 0 ||
+                            gp->punch_failed ||
+                            (gp->direct_seen != 0 &&
+                             (n2n_now() - gp->direct_seen) < PUNCH_DIRECT_ALIVE_SECS));
                 int addr_same = (gp != NULL) &&
                                 ((pi.sockets[0].family != AF_INET ||
                                   sock_equal(&gp->sock, &pi.sockets[0]) == 0) &&
                                  (pi.sock6.family != AF_INET6 ||
                                   sock_equal(&gp->sock6, &pi.sock6) == 0));
                 PEERS_UNLOCK(eee);
-                if (redundant && addr_same)
+                if (busy && addr_same)
                     return 1;
             }
 
@@ -5266,23 +5268,18 @@ process_n2n_packet:
                 }
             }
 
-            if (do_punch) {
-                /* PUNCH repeats every few seconds while punching: keep it on one
-                 * short line so the punch stays visible without flooding. */
-                traceEvent(TRACE_INFO, "Rx PUNCH for [%u.%u.%u.%u] at %s",
-                           (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
-                           (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF,
-                           sock_to_cstr(sockbuf1, &pi.sockets[0]));
-            } else if (pi.assigned_ip) {
-                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s [%u.%u.%u.%u] at %s",
+            if (pi.assigned_ip) {
+                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s [%u.%u.%u.%u] at %s%s",
                            macaddr_str(mac_buf1, pi.mac),
                            (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
                            (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF,
-                           sock_to_cstr(sockbuf1, &pi.sockets[0]));
+                           sock_to_cstr(sockbuf1, &pi.sockets[0]),
+                           do_punch ? " [PUNCH]" : "");
             } else {
-                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s at %s",
+                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s at %s%s",
                            macaddr_str(mac_buf1, pi.mac),
-                           sock_to_cstr(sockbuf1, &pi.sockets[0]));
+                           sock_to_cstr(sockbuf1, &pi.sockets[0]),
+                           do_punch ? " [PUNCH]" : "");
             }
 
             /* If peer is in same LAN as supernode, replace its private IP
