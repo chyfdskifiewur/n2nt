@@ -5266,18 +5266,23 @@ process_n2n_packet:
                 }
             }
 
-            if (pi.assigned_ip) {
-                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s [%u.%u.%u.%u] at %s%s",
+            if (do_punch) {
+                /* PUNCH repeats every few seconds while punching: keep it on one
+                 * short line so the punch stays visible without flooding. */
+                traceEvent(TRACE_INFO, "Rx PUNCH for [%u.%u.%u.%u] at %s",
+                           (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
+                           (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF,
+                           sock_to_cstr(sockbuf1, &pi.sockets[0]));
+            } else if (pi.assigned_ip) {
+                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s [%u.%u.%u.%u] at %s",
                            macaddr_str(mac_buf1, pi.mac),
                            (pi.assigned_ip>>24)&0xFF, (pi.assigned_ip>>16)&0xFF,
                            (pi.assigned_ip>>8)&0xFF, pi.assigned_ip&0xFF,
-                           sock_to_cstr(sockbuf1, &pi.sockets[0]),
-                           do_punch ? " [PUNCH]" : "");
+                           sock_to_cstr(sockbuf1, &pi.sockets[0]));
             } else {
-                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s at %s%s",
+                traceEvent(TRACE_INFO, "Rx PEER_INFO for %s at %s",
                            macaddr_str(mac_buf1, pi.mac),
-                           sock_to_cstr(sockbuf1, &pi.sockets[0]),
-                           do_punch ? " [PUNCH]" : "");
+                           sock_to_cstr(sockbuf1, &pi.sockets[0]));
             }
 
             /* If peer is in same LAN as supernode, replace its private IP
