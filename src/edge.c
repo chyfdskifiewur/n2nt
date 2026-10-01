@@ -3947,6 +3947,9 @@ static int handle_PACKET( n2n_edge_t * eee,
                         traceEvent(TRACE_INFO, "Peer %s addr from SN, updating",
                                    macaddr_str(mb, pkt->srcMac));
                         *active_sock = pkt->sock;
+                        /* Flag the change: a later PEER_INFO compares against the
+                         * address just written here and would otherwise see none. */
+                        scan->addr_dirty = 1;
                     }
                 }
                 /* Only frames addressed to us count: relayed startup broadcasts must
@@ -5369,6 +5372,12 @@ process_n2n_packet:
                     /* Communicating = direct link or heard recently; only its address change restarts the punch. */
                     was_communicating = (pending->direct_seen != 0 ||
                                          (now - pending->last_seen) <= PUNCH_ACTIVE_WINDOW);
+                    if (pending->addr_dirty) {
+                        /* handle_PACKET already wrote the new address: honour it here too. */
+                        addr_changed = 1;
+                        pending->addr_dirty = 0;
+                        eee->cached_dst_valid = 0;
+                    }
                     if (!addr_changed) {
                         /* Peer already in pending: detect a change against its current address too. */
                         if (pi.sockets[0].family == AF_INET) {
@@ -5523,11 +5532,14 @@ process_n2n_packet:
             }
             pending->last_seen = n2n_now();
 
-            int addr_changed =
+            /* handle_PACKET may have written the new address already (from a relayed
+             * frame), so the sock snapshot alone can miss the change. */
+            int addr_changed = pending->addr_dirty ||
                 ( prev_sock.family  != pending->sock.family  ||
                   sock_equal( &prev_sock,  &pending->sock  ) != 0 ) ||
                 ( prev_sock6.family != pending->sock6.family ||
                   sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
+            pending->addr_dirty = 0;
 
             /* An SN PUNCH starts a punch only for a peer that has none in progress and
              * has not burnt its retry budget. A bare PUNCH storm must not reset that

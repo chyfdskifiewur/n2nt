@@ -275,6 +275,7 @@ struct peer_info {
     uint8_t             punch_retry_count; /* number of punch retries, remove after max */
     uint8_t             punch_round;       /* current 2s punch round (0-based), reset on start_punch */
     time_t              punch_round_time;  /* round anchor for the 2s punch cadence */
+    uint8_t             addr_dirty;        /* 1=address updated since the last punch decision */
     time_t              direct_seen;       /* time of last direct P2P communication with this peer; 0=never */
     time_t              p2p_est_time;      /* time P2P was established (set_peer_operational); for transition grace */
     n2n_sock_t          temp_local_sock;   /* dynamically selected best local IP for this peer */
