@@ -5905,49 +5905,57 @@ process_n2n_packet:
                             initial_connection_complete = 1;
                         }
 
-                        /* NAT detection is IPv4-only: a family flip is not an address change */
+                        /* NAT detection is IPv4-only: a family flip is not an address change.
+                         * Only the active supernode defines our public address: twin-port and
+                         * brother SN echoes see a per-destination mapping and must not flip it. */
+                        int from_primary_sn =
+                            ( sock_equal( &sender, &eee->supernode ) == 0 );
                         if ( ra.sock.family == AF_INET )
                         {
-                            /* Store our public address as seen by the SN; log on change */
-                            n2n_sock_t old_pub = eee->my_public_sock;
-                            eee->my_public_sock = ra.sock;
                             int suppress_ack = 0; /* fixed-port restore: keep verdict, skip observations */
-                            if (old_pub.family != 0 &&
-                                sock_equal(&old_pub, &eee->my_public_sock) != 0)
-                            {
-                                /* CGNAT churns the port per mapping; only an IP change is NORMAL */
-                                int ip_changed = (old_pub.family != eee->my_public_sock.family) ||
-                                                 (old_pub.family == AF_INET &&
-                                                  memcmp(old_pub.addr.v4,
-                                                         eee->my_public_sock.addr.v4,
-                                                         IPV4_SIZE) != 0);
-                                traceEvent(ip_changed ? TRACE_NORMAL : TRACE_INFO,
-                                           "Our public address changed to %s",
-                                           sock_to_cstr(sockbuf1, &eee->my_public_sock));
 
-                                if (eee->nat_suppress_remap) {
-                                    /* Fixed-port restore: keep the verdict from the random mapping */
-                                    eee->nat_suppress_remap = 0;
-                                    suppress_ack = 1;
-                                    traceEvent(TRACE_DEBUG, "NAT refresh: fixed-port restore keeps the fresh NAT verdict");
-                                }
-                                else
+                            if ( from_primary_sn )
+                            {
+                                /* Store our public address as seen by the SN; log on change */
+                                n2n_sock_t old_pub = eee->my_public_sock;
+                                eee->my_public_sock = ra.sock;
+                                if (old_pub.family != 0 &&
+                                    sock_equal(&old_pub, &eee->my_public_sock) != 0)
                                 {
-                                    /* Fresh mapping: old observations are dead, restart classification */
-                                    eee->nat_type = N2N_NAT_UNKNOWN;
-                                    memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
-                                    memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
-                                    memset(&eee->nat_seen_sn2_alt, 0, sizeof(n2n_sock_t));
-                                    memset(&eee->nat_seen_sn_cross, 0, sizeof(n2n_sock_t));
-                                    eee->nat_bounce_seen = 0;
-                                    eee->nat_probe_cross = 0;
-                                    eee->fc_seen = 0;
-                                    eee->fc_window = 1;
-                                    eee->nat_sym_tries = 0;
-                                    eee->nat_final = 0;
-                                    /* Defer the stranger check so the N2NF probes land first */
-                                    eee->nat_probe_time = now;
-                                    eee->fc_arm_time = now;
+                                    /* CGNAT churns the port per mapping; only an IP change is NORMAL */
+                                    int ip_changed = (old_pub.family != eee->my_public_sock.family) ||
+                                                     (old_pub.family == AF_INET &&
+                                                      memcmp(old_pub.addr.v4,
+                                                             eee->my_public_sock.addr.v4,
+                                                             IPV4_SIZE) != 0);
+                                    traceEvent(ip_changed ? TRACE_NORMAL : TRACE_INFO,
+                                               "Our public address changed to %s",
+                                               sock_to_cstr(sockbuf1, &eee->my_public_sock));
+
+                                    if (eee->nat_suppress_remap) {
+                                        /* Fixed-port restore: keep the verdict from the random mapping */
+                                        eee->nat_suppress_remap = 0;
+                                        suppress_ack = 1;
+                                        traceEvent(TRACE_DEBUG, "NAT refresh: fixed-port restore keeps the fresh NAT verdict");
+                                    }
+                                    else
+                                    {
+                                        /* Fresh mapping: old observations are dead, restart classification */
+                                        eee->nat_type = N2N_NAT_UNKNOWN;
+                                        memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
+                                        memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
+                                        memset(&eee->nat_seen_sn2_alt, 0, sizeof(n2n_sock_t));
+                                        memset(&eee->nat_seen_sn_cross, 0, sizeof(n2n_sock_t));
+                                        eee->nat_bounce_seen = 0;
+                                        eee->nat_probe_cross = 0;
+                                        eee->fc_seen = 0;
+                                        eee->fc_window = 1;
+                                        eee->nat_sym_tries = 0;
+                                        eee->nat_final = 0;
+                                        /* Defer the stranger check so the N2NF probes land first */
+                                        eee->nat_probe_time = now;
+                                        eee->fc_arm_time = now;
+                                    }
                                 }
                             }
 
