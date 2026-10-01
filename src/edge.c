@@ -65,9 +65,7 @@
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
 #define PUNCH_ROUNDS                    5    /* punch rounds per attempt before giving up */
-#define PUNCH_FAST_ROUNDS               2    /* leading rounds use the shorter cadence */
-#define PUNCH_FAST_INTERVAL             1    /* sec: cadence of the leading rounds */
-#define PUNCH_ROUND_INTERVAL            2    /* sec: cadence of the remaining rounds */
+#define PUNCH_ROUND_INTERVAL            2    /* sec: fixed cadence between punch rounds */
 #define PUNCH_RETRY_BASE_SECS           10   /* sec: first back-off; doubles per failed attempt */
 #define PUNCH_RETRY_MAX                 3    /* failed attempts before relay-only */
 #define PUNCH_LAN_TIMEOUT               2    /* sec: LAN phase before WAN fallback */
@@ -1738,11 +1736,9 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* Punch with the latest known address; a missing PUNCH handoff never blocks.
-             * Leading rounds fire faster (1s) to catch the NAT window; the rest ease off. */
-            time_t round_interval = ( scan->punch_round < PUNCH_FAST_ROUNDS )
-                                  ? PUNCH_FAST_INTERVAL : PUNCH_ROUND_INTERVAL;
-            if ( (now - scan->punch_round_time) >= round_interval )
+            /* Punch with the latest known address every PUNCH_ROUND_INTERVAL,
+             * whether or not the address changed; a missing handoff never blocks. */
+            if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
             {
                 if ( scan->punch_round >= PUNCH_ROUNDS - 1 )
                 {
