@@ -3393,15 +3393,7 @@ static int send_PACKET( n2n_edge_t * eee,
             }
             do_query = 1;
         } else if ( p->punch_failed && p->punch_retry_count >= 3 ) {
-            /* 打洞已彻底放弃：再查只会换回一条同样的 PUNCH，纯空转。保留 last_query_sent
-             * 不动，peer 的地址真变了时由 PEER_INFO 路径重新发起。 */
-            do_query = 0;
-        } else if ( p->punch_start_time != 0 || p->lan_punch_start != 0 ||
-                    ( p->direct_seen != 0 &&
-                      (now - p->direct_seen) < PUNCH_DIRECT_ALIVE_SECS ) ) {
-            /* 正在打洞或直连还活着：地址一旦变化，SN 会由注册侧的
-             * push_nat_to_community 主动推来（见 sn.c update_edge 返回 2/3 分支），
-             * 不依赖这里的轮询。去查询只会催回一条同地址的 PUNCH。 */
+            /* Punch gave up: further queries only fetch the same PUNCH back. */
             do_query = 0;
         } else {
             do_query = ((now - p->last_query_sent) >= 5);
@@ -5223,9 +5215,7 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
-            /* 这条 PUNCH 会不会产生任何状态变化？判据与下方的重启判据同源：
-             * 地址没变，且已经在打洞中（punch_start_time 在 rounds exhausted 时不清零）
-             * 或直连还活着 => 纯冗余。SN 在这期间每 5 秒推一次，不挡则日志被同一行刷满。 */
+            /* Drop redundant PUNCH: address unchanged and peer already busy. */
             if (do_punch) {
                 PEERS_LOCK(eee);
                 struct peer_info *gp = find_peer_by_mac(eee->pending_peers, pi.mac);
@@ -5944,11 +5934,9 @@ process_n2n_packet:
                             initial_connection_complete = 1;
                         }
 
-                        /* 只认当前 SN 的注册信息：打洞期间 our public endpoint 由我们实际
-                         * 注册的那个 SN 独家定义。lport+1 的孪生探针和兄弟 sn2 各自看到的是
-                         * 另一个 NAT 映射，让它们覆盖 my_public_sock 会让这个值每隔一个注册
-                         * 周期来回翻转，而每次翻转都把整个 NAT 分类状态清零重来，分类器因此
-                         * 永远收敛不了。 */
+                        /* Trust only the SN we actually register with: letting the twin
+                         * probe (lport+1) or sn2 overwrite my_public_sock flips it every
+                         * cycle, and each flip resets the whole NAT classifier. */
                         int auth_sn = ( eee->supernode.family != 0 &&
                                         sock_equal( &sender, &eee->supernode ) == 0 ) ||
                                       ( eee->supernode_alt.family != 0 &&
