@@ -3396,6 +3396,13 @@ static int send_PACKET( n2n_edge_t * eee,
             /* 打洞已彻底放弃：再查只会换回一条同样的 PUNCH，纯空转。保留 last_query_sent
              * 不动，peer 的地址真变了时由 PEER_INFO 路径重新发起。 */
             do_query = 0;
+        } else if ( p->punch_start_time != 0 || p->lan_punch_start != 0 ||
+                    ( p->direct_seen != 0 &&
+                      (now - p->direct_seen) < PUNCH_DIRECT_ALIVE_SECS ) ) {
+            /* 正在打洞或直连还活着：地址一旦变化，SN 会由注册侧的
+             * push_nat_to_community 主动推来（见 sn.c update_edge 返回 2/3 分支），
+             * 不依赖这里的轮询。去查询只会催回一条同地址的 PUNCH。 */
+            do_query = 0;
         } else {
             do_query = ((now - p->last_query_sent) >= 5);
             if (do_query)
@@ -5216,21 +5223,24 @@ process_n2n_packet:
 
             int do_punch = (pi.aflags & N2N_AFLAGS_PUNCH_REQUEST) != 0;
 
-            /* 已在同一地址上耗尽全部打洞重试的 peer：SN 仍会每 5s 回一条一模一样的
-             * PUNCH（中继路径每 5s 查询一次，SN 就双向推一次），而 punch_running
-             * 恒真使它无人消费。地址没变就静默丢弃，否则日志被同一行刷满。 */
+            /* 这条 PUNCH 会不会产生任何状态变化？判据与下方的重启判据同源：
+             * 地址没变，且已经在打洞中（punch_start_time 在 rounds exhausted 时不清零）
+             * 或直连还活着 => 纯冗余。SN 在这期间每 5 秒推一次，不挡则日志被同一行刷满。 */
             if (do_punch) {
                 PEERS_LOCK(eee);
                 struct peer_info *gp = find_peer_by_mac(eee->pending_peers, pi.mac);
-                int given_up = (gp != NULL) && gp->punch_failed &&
-                               gp->punch_retry_count >= 3;
-                int addr_same = (gp == NULL) ||
+                if (!gp) gp = find_peer_by_mac(eee->known_peers, pi.mac);
+                int busy = (gp != NULL) &&
+                           (gp->punch_start_time != 0 || gp->lan_punch_start != 0 ||
+                            (gp->direct_seen != 0 &&
+                             (n2n_now() - gp->direct_seen) < PUNCH_DIRECT_ALIVE_SECS));
+                int addr_same = (gp != NULL) &&
                                 ((pi.sockets[0].family != AF_INET ||
                                   sock_equal(&gp->sock, &pi.sockets[0]) == 0) &&
                                  (pi.sock6.family != AF_INET6 ||
                                   sock_equal(&gp->sock6, &pi.sock6) == 0));
                 PEERS_UNLOCK(eee);
-                if (given_up && addr_same)
+                if (busy && addr_same)
                     return 1;
             }
 
