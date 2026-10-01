@@ -70,6 +70,7 @@
 #define PUNCH_RETRY_MAX                 3    /* failed attempts before relay-only */
 #define PUNCH_LAN_TIMEOUT               2    /* sec: LAN phase before WAN fallback */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
+#define PUNCH_REARM_COOLDOWN            30   /* sec: quiet time before a relay-only peer honours a punch signal */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -1742,6 +1743,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 if ( scan->punch_round >= PUNCH_ROUNDS - 1 )
                 {
                     scan->punch_failed = 1;
+                    scan->punch_start_time = 0; /* attempt over: not "running" any more */
                     scan->punch_reset_time = now;
                     traceEvent(TRACE_DEBUG, "rounds exhausted for %s",
                                PEER_ID(mac_tmp, scan));
@@ -5526,12 +5528,16 @@ process_n2n_packet:
                   sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
 
             /* An SN PUNCH is an explicit (re)establish request: re-arm the punch
-             * unless one is already in flight (that guard stops the handoff loop).
-             * A stale direct_seen must not veto it: after a peer restart the link
-             * is dead long before direct_seen ages out, so the peer never punches. */
-            int punch_running = ( pending->punch_start_time != 0 ||
+             * unless one is already in flight. An exhausted attempt is not "in
+             * flight"; a relay-only peer re-arms after a quiet cooldown so that two
+             * peers waking each other cannot keep punching forever. A stale
+             * direct_seen never vetoes: after a restart the link is dead long
+             * before direct_seen ages out, so the peer would never punch. */
+            int punch_running = ( ( pending->punch_start_time != 0 && !pending->punch_failed ) ||
                                   pending->lan_punch_start != 0 );
-            if ( addr_changed || !punch_running )
+            int rearm_ok = ( !pending->punch_failed ||
+                             ( now - pending->punch_reset_time ) >= PUNCH_REARM_COOLDOWN );
+            if ( addr_changed || ( !punch_running && rearm_ok ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
