@@ -5375,7 +5375,6 @@ process_n2n_packet:
                     if (pending->addr_dirty) {
                         /* handle_PACKET already wrote the new address: honour it here too. */
                         addr_changed = 1;
-                        pending->addr_dirty = 0;
                         eee->cached_dst_valid = 0;
                     }
                     if (!addr_changed) {
@@ -5414,9 +5413,11 @@ process_n2n_packet:
                         if (nt) pending->nat_type = nt;
                     }
                     /* SN metadata is not peer communication; refreshing last_seen here would false-arm the punch gate. */
-                    if (addr_changed && was_communicating)
+                    if (addr_changed && was_communicating) {
+                        pending->addr_dirty = 0; /* consumed by this restart */
                         restart_punch_for_peer(eee, pending, pi.aflags,
                                                &pi.sockets[0], &pi.sockets[1]);
+                    }
                     PEERS_UNLOCK(eee);
                     if (eee->enable_gaming_mode && pi.assigned_ip != 0) {
                         uint8_t probe[42];
@@ -5541,20 +5542,45 @@ process_n2n_packet:
                   sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
             pending->addr_dirty = 0;
 
-            /* An SN PUNCH starts a punch only for a peer that has none in progress and
-             * has not burnt its retry budget. A bare PUNCH storm must not reset that
-             * budget, or the give-up back-off is never reached and a pair that cannot
-             * punch never settles into relay-only. Recovery is elsewhere: an address
-             * change restarts unconditionally, a keepalive failure clears the budget.
-             * A stale direct_seen never vetoes: after a restart the link is dead long
-             * before direct_seen ages out, so the peer would never punch. */
+            /* The sn's PUNCH is the shared round tick: it starts a punch, or makes an
+             * idle peer join one, so both ends fire round 0 together. While a punch
+             * is already running the tick is a no-op, so a multi-PUNCH burst cannot
+             * restart the rounds mid-flight. A peer that spent its retry budget stays
+             * relay-only until its address changes. */
             int punch_running = ( ( pending->punch_start_time != 0 && !pending->punch_failed ) ||
                                   pending->lan_punch_start != 0 );
-            int rearm_ok = ( !pending->punch_failed && pending->punch_retry_count == 0 );
-            if ( addr_changed || ( !punch_running && rearm_ok ) )
+            int relay_only = ( pending->punch_failed &&
+                               pending->punch_retry_count >= PUNCH_RETRY_MAX );
+            if ( addr_changed )
             {
+                /* Fresh address: full reset, retry budget included. */
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
+            }
+            else if ( !punch_running && !relay_only )
+            {
+                MACSTR_TMP(mac_give);
+                /* Join now rather than wait out the back-off, so the two ends punch
+                 * as one. This spends a retry, so the give-up countdown still runs. */
+                pending->punch_retry_count++;
+                if ( pending->punch_retry_count >= PUNCH_RETRY_MAX )
+                {
+                    pending->punch_failed = 1;
+                    pending->punch_start_time = 0;
+                    pending->punch_reset_time = n2n_now();
+                    traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
+                               PEER_ID(mac_give, pending),
+                               pending->punch_retry_count);
+                }
+                else
+                {
+                    pending->punch_failed = 0;
+                    pending->punch_start_time = 0;
+                    pending->lan_punch_done = 0;
+                    pending->lan_punch_start = 0;
+                    pending->lan_punch_last_tx = 0;
+                    start_punch( eee, pending );
+                }
             }
 
             PEERS_UNLOCK(eee);
