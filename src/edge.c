@@ -5476,11 +5476,14 @@ process_n2n_packet:
 
             /* Same-address handoff must NOT restart the punch: that would
              * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
-             * A peer with a healthy direct link never reaches here — it returned above. */
+             * A peer with a healthy direct link never reaches here — it returned above.
+             * punch_failed counts as not running, so a PUNCH re-wakes an exhausted
+             * punch instead of idling until the 40s retry. */
             int direct_alive = ( pending->direct_seen != 0 &&
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
-            int punch_running = ( pending->punch_start_time != 0 ||
-                                  pending->lan_punch_start != 0 );
+            int punch_running = ( !pending->punch_failed &&
+                                  ( pending->punch_start_time != 0 ||
+                                    pending->lan_punch_start != 0 ) );
             if ( addr_changed ||
                  ( !punch_running && !direct_alive ) )
             {
