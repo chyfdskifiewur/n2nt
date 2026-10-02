@@ -3162,7 +3162,9 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
             struct peer_info *eb = find_peer_by_mac( sss->edges, p->edge_b );
             if ( ea && eb )
             {
-                if ( p->sync_armed && p->sync_delay_ms > 0 )
+                /* The deferral slot is single: don't arm it while one is pending. */
+                if ( p->sync_armed && p->sync_delay_ms > 0 &&
+                     p->defer_due_ms == 0 )
                 {
                     /* Far side immediately, near side after the measured half-difference. */
                     struct peer_info *far_peer, *near_peer;
