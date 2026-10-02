@@ -5477,15 +5477,17 @@ process_n2n_packet:
             /* Same-address handoff must NOT restart the punch: that would
              * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
              * A peer with a healthy direct link never reaches here — it returned above.
-             * punch_failed counts as not running, so a PUNCH re-wakes an exhausted
-             * punch instead of idling until the 40s retry. */
+             * An exhausted punch may be re-woken by a PUNCH so it does not idle
+             * until the 40s retry, but only while retries remain: once the peer is
+             * given up on, further PUNCHes must not restart it for good. The 3 is
+             * the give-up threshold in check_punch_timeouts(). */
             int direct_alive = ( pending->direct_seen != 0 &&
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
-            int punch_running = ( !pending->punch_failed &&
-                                  ( pending->punch_start_time != 0 ||
-                                    pending->lan_punch_start != 0 ) );
+            int punch_running = ( pending->punch_start_time != 0 ||
+                                  pending->lan_punch_start != 0 );
             if ( addr_changed ||
-                 ( !punch_running && !direct_alive ) )
+                 ( !punch_running && !direct_alive &&
+                   pending->punch_retry_count < 3 ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
