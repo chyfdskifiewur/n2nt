@@ -3909,6 +3909,10 @@ static int process_udp( n2n_sn_t * sss,
                                macaddr_str(mac_buf, query.targetMac));
                 }
             }
+            /* Count the reply/wake-up burst as an exchange so the peer's QUERY,
+             * arriving milliseconds later, does not fire a duplicate PUNCH. */
+            if ( reply && qpair )
+                qpair->last_exchanged = now;
         }
     }
     else if ( msg_type == MSG_TYPE_REGISTER_SUPER )
