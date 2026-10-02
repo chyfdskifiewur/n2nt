@@ -5618,15 +5618,15 @@ process_n2n_packet:
                             }
                         }
 
-                        /* sn2 ACK without sn1 address info: sn2 doesn't know where sn1
-                         * is — we entered ask_backup because sn1 stopped responding. */
+                        /* sn2 ACK without a usable binary sn1 address (unknown, or only
+                         * the -b name it cannot resolve for us): sn1 is silent, switch. */
                         else if ( eee->sn_ask_backup &&
                                   sock_equal( &sender, &eee->sn_query ) == 0 &&
-                                  ra.sn_bak.family == 0 && ra.sn_bak_str_len == 0 )
+                                  ra.sn_bak.family == 0 )
                         {
                             eee->sn_ask_backup = 0;
                             traceEvent(TRACE_WARNING,
-                                       "sn2 does not know sn1's address - switching to supernode %u",
+                                       "sn2 has no usable sn1 address - switching to supernode %u",
                                        (unsigned int)(eee->sn_backup_index + 1));
                             sn_switch_to( eee, eee->sn_backup_index );
                             send_register_super( eee, &(eee->supernode), 1, 0, NULL );
