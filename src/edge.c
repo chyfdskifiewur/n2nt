@@ -2905,12 +2905,16 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
      * supernode's main + alt port (same IP, two destination ports): equal
      * public ports prove per-IP reuse (NAT3), disagreeing ports prove
      * endpoint-dependent mapping (NAT4/symmetric). Frozen until the mapping
-     * changes; skipped during failover; waits for Test I. */
+     * changes; skipped during failover; waits for Test I.
+     * lport+1 is only used when there is no second SN at all (neither an edge
+     * -l entry nor an sn -b brother): with a second SN present, probing it
+     * would contact a supernode that is otherwise not in use. */
     if ( !eee->use_ws && eee->sn_idx == 0 &&
          !eee->sn_ask_backup && !eee->sn_all_failed &&
          eee->supernode.family != 0 &&
          eee->nat_seen_sn1.family == AF_INET &&
-         !eee->nat_final )
+         !eee->nat_final &&
+         eee->sn_num < 2 )
     {
         if ( eee->nat_probe_pending &&
              nowTime > eee->nat_probe_time + NAT_SYM_RETRY_SECS )
@@ -2945,7 +2949,10 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 
             /* Cross-IP probe to sn2 (distinct public IP, no NAT1 verdict yet):
              * confirmatory only — cross-IP difference must never upgrade to NAT4
-             * (the within-IP reuse evidence above is the arbiter). */
+             * (the within-IP reuse evidence above is the arbiter).
+             * Only probe sn2 for NAT classification while sn1 is reachable
+             * (sn1 healthy) to assist NAT type detection. Do not send NAT probes
+             * to sn2 while sn1 is unreachable (sn2 is used for lookup/failover). */
             int cross_probe = ( eee->sn_num >= 2 &&
                              eee->sn_query.family == AF_INET &&
                              eee->supernode.family == AF_INET &&
@@ -2954,7 +2961,10 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
                              memcmp( eee->sn_query.addr.v4,
                                      eee->supernode.addr.v4,
                                      IPV4_SIZE ) != 0 )
-                           && !eee->fc_seen;
+                           && !eee->fc_seen
+                           && ( eee->sn_idx == 0 &&
+                                !eee->sn_all_failed &&
+                                !eee->sn_ask_backup );
 
             eee->nat_probe_cross = cross_probe ? 1 : 0;
             if ( cross_probe )
