@@ -322,11 +322,6 @@ struct sn_punch_pair {
     int64_t             defer_due_ms;   /* ms: due time of the pending near-side send (0 = none) */
     n2n_mac_t           defer_self;     /* pending send: recipient */
     n2n_mac_t           defer_other;    /* pending send: peer to describe */
-    /* Address-stall backoff: punching that keeps re-offering the same pair of
-     * addresses is not making progress, so stop pushing after a few rounds. */
-    int                 stall_rounds;   /* consecutive handoffs with unchanged addresses */
-    n2n_sock_t          stall_sock_a;   /* last addresses handed out (a -> b) */
-    n2n_sock_t          stall_sock_b;
 };
 
 struct n2n_edge; /* forward declaration, defined below */

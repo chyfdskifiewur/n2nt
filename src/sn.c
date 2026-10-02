@@ -2958,23 +2958,27 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
  * within the 2s rounds the handoff already refreshes both edges. */
 #define PUNCH_QUERY_REFRESH_SECS 3
 
-/* Consecutive handoffs offering an unchanged pair of addresses before the SN
- * stops pushing PUNCH. A few rounds is enough to let a working punch finish;
- * past that the addresses are not moving, so more pushes only add noise. */
-#define PUNCH_STALL_ROUNDS 5
-
-/* sec of silence that ends a punch burst. The edges retry after a longer lull,
- * so a gap this big means a new round started and the stall count starts over
- * instead of suppressing every later attempt. */
-#define PUNCH_STALL_RESET_SECS 15
-
-/* Pairs are stored in canonical MAC order, so lookups must normalise their two
- * arguments too: a caller passing (b, a) would otherwise miss and create a
- * duplicate pair, defeating the refresh throttle. */
 static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
                                             const n2n_community_t community,
                                             const n2n_mac_t a,
                                             const n2n_mac_t b )
+{
+    struct sn_punch_pair *p = sss->punch_pairs;
+    while ( p )
+    {
+        if ( memcmp(p->community, community, sizeof(n2n_community_t)) == 0 &&
+             memcmp(p->edge_a, a, N2N_MAC_SIZE) == 0 &&
+             memcmp(p->edge_b, b, N2N_MAC_SIZE) == 0 )
+            return p;
+        p = p->next;
+    }
+    return NULL;
+}
+
+/* Touch (or create) the pair for (a,b). Returns 1 when newly created; the
+ * round-0 join messages (requester reply + target wake-up) go out only then. */
+static int sn_pair_touch( n2n_sn_t * sss, const n2n_community_t community,
+                          const n2n_mac_t a, const n2n_mac_t b, time_t now )
 {
     n2n_mac_t ea, eb;
     if ( memcmp(a, b, N2N_MAC_SIZE) < 0 )
@@ -2987,24 +2991,7 @@ static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
         memcpy(ea, b, N2N_MAC_SIZE);
         memcpy(eb, a, N2N_MAC_SIZE);
     }
-    struct sn_punch_pair *p = sss->punch_pairs;
-    while ( p )
-    {
-        if ( memcmp(p->community, community, sizeof(n2n_community_t)) == 0 &&
-             memcmp(p->edge_a, ea, N2N_MAC_SIZE) == 0 &&
-             memcmp(p->edge_b, eb, N2N_MAC_SIZE) == 0 )
-            return p;
-        p = p->next;
-    }
-    return NULL;
-}
-
-/* Touch (or create) the pair for (a,b). Returns 1 when newly created; the
- * round-0 join messages (requester reply + target wake-up) go out only then. */
-static int sn_pair_touch( n2n_sn_t * sss, const n2n_community_t community,
-                          const n2n_mac_t a, const n2n_mac_t b, time_t now )
-{
-    struct sn_punch_pair *p = sn_pair_find( sss, community, a, b );
+    struct sn_punch_pair *p = sn_pair_find( sss, community, ea, eb );
     if ( p )
     {
         p->last_activity = now;
@@ -3014,16 +3001,8 @@ static int sn_pair_touch( n2n_sn_t * sss, const n2n_community_t community,
     if ( !p )
         return 0;
     memcpy(p->community, community, sizeof(n2n_community_t));
-    if ( memcmp(a, b, N2N_MAC_SIZE) < 0 )
-    {
-        memcpy(p->edge_a, a, N2N_MAC_SIZE);
-        memcpy(p->edge_b, b, N2N_MAC_SIZE);
-    }
-    else
-    {
-        memcpy(p->edge_a, b, N2N_MAC_SIZE);
-        memcpy(p->edge_b, a, N2N_MAC_SIZE);
-    }
+    memcpy(p->edge_a, ea, N2N_MAC_SIZE);
+    memcpy(p->edge_b, eb, N2N_MAC_SIZE);
     p->last_activity = now;
     p->next = sss->punch_pairs;
     sss->punch_pairs = p;
@@ -3183,13 +3162,8 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
             struct peer_info *eb = find_peer_by_mac( sss->edges, p->edge_b );
             if ( ea && eb )
             {
-                /* Address-stall backoff: repeated rounds handing over the same
-                 * addresses mean punching cannot progress (usually a hard NAT).
-                 * The QUERY path owns the accounting; here we just honour it. */
-                if ( p->stall_rounds >= PUNCH_STALL_ROUNDS )
-                    ;
                 /* The deferral slot is single: don't arm it while one is pending. */
-                else if ( p->sync_armed && p->sync_delay_ms > 0 &&
+                if ( p->sync_armed && p->sync_delay_ms > 0 &&
                      p->defer_due_ms == 0 )
                 {
                     /* Far side immediately, near side after the measured half-difference. */
@@ -3828,40 +3802,8 @@ static int process_udp( n2n_sn_t * sss,
             }
             struct sn_punch_pair *qpair = sn_pair_find( sss, cmn.community,
                                                         query.srcMac, query.targetMac );
-            /* A pair whose addresses stopped changing is not making progress, so
-             * QUERY traffic must not keep the PUNCH pushes coming either. */
-            int reply = !qpair;
-            if ( qpair )
-            {
-                /* A pair whose addresses stopped changing is not making progress, so
-                 * QUERY traffic must not keep the PUNCH pushes coming either. Counting
-                 * happens here because this is the path that keeps arriving after the
-                 * edges stopped punching. requester may be gone (not registered any
-                 * more), in which case only the target side is compared. */
-                n2n_sock_t rq_sock = requester ? requester->sock : qpair->stall_sock_b;
-                if ( now - qpair->last_exchanged > PUNCH_STALL_RESET_SECS )
-                {
-                    qpair->stall_rounds = 0;
-                    qpair->stall_sock_a = target->sock;
-                    qpair->stall_sock_b = rq_sock;
-                }
-                else if ( sock_equal( &qpair->stall_sock_a, &target->sock ) &&
-                          sock_equal( &qpair->stall_sock_b, &rq_sock ) )
-                {
-                    qpair->stall_rounds++;
-                }
-                else
-                {
-                    qpair->stall_rounds = 0;
-                    qpair->stall_sock_a = target->sock;
-                    qpair->stall_sock_b = rq_sock;
-                }
-                reply = ( qpair->stall_rounds < PUNCH_STALL_ROUNDS &&
-                          ( now - qpair->last_exchanged ) >= PUNCH_QUERY_REFRESH_SECS );
-                if ( qpair->stall_rounds == PUNCH_STALL_ROUNDS )
-                    traceEvent( TRACE_INFO, "punch stalled: unchanged addresses %d rounds, not pushing PUNCH until they change",
-                                qpair->stall_rounds );
-            }
+            int reply = pair_new || !qpair ||
+                        ( now - qpair->last_exchanged ) >= PUNCH_QUERY_REFRESH_SECS;
             if ( reply )
             {
             memset( &cmn2, 0, sizeof(cmn2) );
