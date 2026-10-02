@@ -1641,8 +1641,8 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
-    /* 5 rounds x 2s: re-register first so the SN handoff carries the peer's
-     * current address; round-0 punches when that handoff lands (2s fallback in
+    /* Every round registers first so the SN handoff carries the peer's current
+     * address; the punch follows when that handoff lands (2s fallback in
      * check_punch_timeouts if it never does). */
     int can_punch = ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) ||
                     ( peer->sock6.family == AF_INET6 &&
@@ -1652,6 +1652,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
 
     peer->punch_start_time = n2n_now();
     peer->punch_round = 0;
+    peer->punch_waiting = 1;
     peer->punch_round_time = peer->punch_start_time;
     traceEvent(TRACE_INFO, "rounds started for %s",
                macaddr_str(mac_tmp, peer->mac_addr));
@@ -1679,6 +1680,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                            PEER_ID(mac_tmp, scan));
             scan->punch_start_time = 0;
             scan->punch_round = 0;
+            scan->punch_waiting = 0;
             scan->punch_round_time = 0;
             scan->lan_punch_start = 0;
             scan->lan_punch_done = 1;
@@ -1718,10 +1720,21 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* punch_round counts the rounds already sent; round-0 normally comes
-             * from the PUNCH handoff, this 2s tick is the fallback. */
+            /* punch_round counts the rounds already punched. Each round registers
+             * first and punches when the SN handoff lands; a handoff that never
+             * lands is punched here with the known address so an isolated peer
+             * still progresses. */
             if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
             {
+                if ( scan->punch_waiting )
+                {
+                    punch_round(eee, scan);
+                    scan->punch_round++;
+                    scan->punch_waiting = 0;
+                    traceEvent(TRACE_DEBUG, "round %u (no handoff) for %s",
+                               (unsigned)scan->punch_round, PEER_ID(mac_tmp, scan));
+                }
+
                 if ( scan->punch_round >= PUNCH_ROUNDS )
                 {
                     scan->punch_failed = 1;
@@ -1734,16 +1747,14 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 }
                 else
                 {
-                    punch_round(eee, scan);
-                    scan->punch_round++;
-                    scan->punch_round_time = now;
-                    traceEvent(TRACE_DEBUG, "round %u for %s",
-                               (unsigned)scan->punch_round, PEER_ID(mac_tmp, scan));
+                    /* Start the round: register first, punch on the handoff. */
                     eee->punch_round_reg = 1;
                     send_register_super(eee, &eee->supernode, 1, 0, NULL);
                     eee->sn_wait = 1;
                     send_query_peer(eee, scan->mac_addr);
+                    scan->punch_waiting = 1;
                 }
+                scan->punch_round_time = now;
             }
         }
         else if ( scan->punch_start_time == 0 && !scan->punch_failed &&
@@ -1927,6 +1938,7 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                     scan->punch_failed       = 0;
                     scan->punch_retry_count  = 0;
                     scan->punch_reset_time   = 0;
+                    scan->punch_waiting      = 0;
                     scan->lan_punch_start    = 0;
                     scan->lan_punch_done     = 0;
                     scan->keepalive_fails    = 0;
@@ -2151,6 +2163,7 @@ void try_send_register( n2n_edge_t * eee,
             scan->punch_failed = 0;
             scan->punch_retry_count = 0;
             scan->punch_reset_time = 0;
+            scan->punch_waiting = 0;
             scan->lan_punch_start = 0;
             scan->lan_punch_done = 0;
             send_register(eee, peer);
@@ -4617,6 +4630,7 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
     pending->punch_retry_count = 0;
     pending->punch_reset_time = 0;
     pending->punch_round = 0;
+    pending->punch_waiting = 0;
     pending->punch_round_time = 0;
     pending->lan_punch_start = 0;
     pending->lan_punch_done = 0;
@@ -5501,12 +5515,15 @@ process_n2n_packet:
                                         &pi.sockets[0], &pi.sockets[1] );
             }
 
-            /* Round-0 punches with the address this handoff just carried, not the
-             * stale one cached when the punch was armed. */
-            if ( pending->punch_start_time != 0 && pending->punch_round == 0 )
+            /* This round's handoff just carried the peer's current address: punch now
+             * with it. Only the first handoff of a round punches — later ones
+             * would re-anchor the round timer and stall the cadence. */
+            if ( pending->punch_start_time != 0 && pending->punch_waiting &&
+                 !pending->punch_failed )
             {
                 punch_round( eee, pending );
-                pending->punch_round = 1;
+                pending->punch_round++;
+                pending->punch_waiting = 0;
                 pending->punch_round_time = n2n_now();
             }
 
