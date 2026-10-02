@@ -1641,7 +1641,9 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
-    /* 5 rounds x 2s: punch, then re-register so the PUNCH handoff refreshes the address. */
+    /* 5 rounds x 2s: re-register first so the SN handoff carries the peer's
+     * current address; round-0 punches when that handoff lands (2s fallback in
+     * check_punch_timeouts if it never does). */
     int can_punch = ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) ||
                     ( peer->sock6.family == AF_INET6 &&
                       !is_empty_ip_address(&peer->sock6) &&
@@ -1653,7 +1655,6 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     peer->punch_round_time = peer->punch_start_time;
     traceEvent(TRACE_INFO, "rounds started for %s",
                macaddr_str(mac_tmp, peer->mac_addr));
-    punch_round(eee, peer); /* round-0: punch with the known address now */
     eee->punch_round_reg = 1; /* round re-registration refreshes the handoff */
     send_register_super(eee, &eee->supernode, 1, 0, NULL);
     eee->sn_wait = 1;
@@ -1717,10 +1718,11 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* Punch with the latest known address; a missing PUNCH handoff never blocks. */
+            /* punch_round counts the rounds already sent; round-0 normally comes
+             * from the PUNCH handoff, this 2s tick is the fallback. */
             if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
             {
-                if ( scan->punch_round >= PUNCH_ROUNDS - 1 )
+                if ( scan->punch_round >= PUNCH_ROUNDS )
                 {
                     scan->punch_failed = 1;
                     scan->punch_reset_time = now;
@@ -1732,11 +1734,11 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 }
                 else
                 {
+                    punch_round(eee, scan);
                     scan->punch_round++;
                     scan->punch_round_time = now;
                     traceEvent(TRACE_DEBUG, "round %u for %s",
-                               (unsigned)scan->punch_round + 1, PEER_ID(mac_tmp, scan));
-                    punch_round(eee, scan);
+                               (unsigned)scan->punch_round, PEER_ID(mac_tmp, scan));
                     eee->punch_round_reg = 1;
                     send_register_super(eee, &eee->supernode, 1, 0, NULL);
                     eee->sn_wait = 1;
@@ -5493,6 +5495,15 @@ process_n2n_packet:
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
+            }
+
+            /* Round-0 punches with the address this handoff just carried, not the
+             * stale one cached when the punch was armed. */
+            if ( pending->punch_start_time != 0 && pending->punch_round == 0 )
+            {
+                punch_round( eee, pending );
+                pending->punch_round = 1;
+                pending->punch_round_time = n2n_now();
             }
 
             PEERS_UNLOCK(eee);
