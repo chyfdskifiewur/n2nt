@@ -5089,13 +5089,12 @@ process_n2n_packet:
                 if ( NULL == pscan ) {
                     try_send_register(eee, 0, probe.srcMac, &sender);
                 } else {
-                    /* A PROBE from the peer's real public address is direct-path proof.
-                     * Promote to known_peers here instead of waiting for a direct
-                     * REGISTER_ACK: with both sides port-restr the ACK comes back from
-                     * a different source port, so the ACK path can stay closed while the
-                     * data path is already open — the peer would sit in pending forever
-                     * and every packet would keep going through the supernode. */
-                    set_peer_operational( eee, probe.srcMac, &sender );
+                    if (sender.family == AF_INET6) {
+                        pscan->sock6 = sender;
+                    } else {
+                        pscan->sock = sender;
+                    }
+                    send_register(eee, &sender);
                 }
             } else {
                 known->last_seen = now;
@@ -5388,6 +5387,41 @@ process_n2n_packet:
                 return 1;
             }
 
+            if (known && known->direct_seen != 0 &&
+                (now - known->direct_seen) < PUNCH_DIRECT_ALIVE_SECS) {
+                /* A PUNCH asks us to (re)hole-punch, but this peer is already
+                 * reachable directly. Demoting it here would move it back to
+                 * pending_peers, where find_peer_destination cannot see it, so
+                 * traffic would fall back to the supernode while the direct path
+                 * is still working. Refresh the metadata and keep the link. */
+                if (eee->cached_dst_valid && pi.sockets[0].family == AF_INET &&
+                    !sock_equal(&known->sock, &pi.sockets[0])) {
+                    eee->cached_dst_valid = 0;
+                }
+                if (pi.sockets[0].family == AF_INET)
+                    known->sock = pi.sockets[0];
+                if (pi.sockets[0].family == AF_INET6)
+                    known->sock6 = pi.sockets[0];
+                if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                    pi.sockets[1].family != 0 && pi.sockets[1].port != 0) {
+                    known->sockets[1] = pi.sockets[1];
+                    known->num_sockets = 2;
+                }
+                if ((pi.aflags & N2N_AFLAGS_IPV6_SOCKET) && pi.sock6.family == AF_INET6)
+                    known->sock6 = pi.sock6;
+                if (pi.version[0]) strncpy(known->version, pi.version, sizeof(known->version) - 1);
+                if (pi.os_name[0]) strncpy(known->os_name, pi.os_name, sizeof(known->os_name) - 1);
+                if (pi.assigned_ip) known->assigned_ip = pi.assigned_ip;
+                {
+                    uint8_t nt = N2N_NAT_FROM_AFLAGS(pi.aflags);
+                    if (nt) known->nat_type = nt; /* 0 = sn did not report */
+                }
+                traceEvent(TRACE_DEBUG, "P2P already direct for %s, ignoring PUNCH",
+                           macaddr_str(mac_buf1, known->mac_addr));
+                PEERS_UNLOCK(eee);
+                return 1;
+            }
+
             if (known) {
                 struct peer_info *prev = NULL, *scan = eee->known_peers;
                 while (scan && memcmp(scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
@@ -5442,16 +5476,12 @@ process_n2n_packet:
                   sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
 
             /* Same-address handoff must NOT restart the punch: that would
-             * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain). */
+             * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
+             * A peer with a healthy direct link never reaches here — it returned above. */
             int direct_alive = ( pending->direct_seen != 0 &&
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
-            /* A working direct link outranks a fresh address from the SN: tearing
-             * it down to re-punch a path that already carries traffic is what makes
-             * an established P2P session bounce back to relay. */
-            if ( direct_alive )
-                addr_changed = 0;
             if ( addr_changed ||
                  ( !punch_running && !direct_alive ) )
             {
