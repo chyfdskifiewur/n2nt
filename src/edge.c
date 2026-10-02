@@ -4427,32 +4427,11 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
             const char *mac_str = "-";
             if (sn_i == 0 && mac_nonzero(eee->sn1_mac))
                 mac_str = macaddr_str(mac_buf, eee->sn1_mac);
-            /* Host: with sn1 IPv6 known, print both stacks with the port once
-             * at the end ("v4/[v6]:port"); worst case 63 chars fits the 65-wide
-             * column. */
+            /* Host: sn1 shows the configured -l entry verbatim. */
             const char *sn_host = eee->sn_ip_array[sn_i];
             /* ACK-learned brother: show the masked display copy instead */
             if ( sn_is_ack_brother(eee, (int)sn_i) && eee->sn_bak_masked[0] )
                 sn_host = eee->sn_bak_masked;
-            char host[N2N_SOCKBUF_SIZE + 1] = "";
-            if (sn_i == 0 && eee->sn1_v6.family == AF_INET6)
-            {
-                n2n_sock_str_t v6buf;
-                const char *v6s = sock_to_cstr(v6buf, &eee->sn1_v6); /* "[...]:port" */
-                const char *v6close = strchr(v6s, ']');
-                const char *v6colon = strrchr(v6s, ':');   /* last ':' -> port */
-                if (v6close && v6colon && v6colon > v6close)
-                {
-                    /* Drop the (identical) port from the IPv4 side. */
-                    const char *v4colon = strrchr(sn_host, ':');
-                    size_t v4_len = v4colon ? (size_t)(v4colon - sn_host)
-                                            : strlen(sn_host);
-                    snprintf(host, sizeof(host), "%.*s/%.*s:%s",
-                             (int)v4_len, sn_host,
-                             (int)(v6close - v6s + 1), v6s, v6colon + 1);
-                    sn_host = host;
-                }
-            }
             /* Fixed column widths -> fixed left edges: marker 2, mac 17, host
              * 65, version 7, tok 7, -b; version/token land on the header columns. */
             char ver_field[8];
