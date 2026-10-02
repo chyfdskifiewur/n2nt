@@ -1655,6 +1655,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     punch_round(eee, peer); /* round-0: punch with the known address now */
     eee->punch_round_reg = 1; /* round re-registration refreshes the handoff */
     send_register_super(eee, &eee->supernode, 1, 0, NULL);
+    eee->sn_wait = 1;
     send_query_peer(eee, peer->mac_addr);
 }
 
@@ -1734,6 +1735,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     punch_round(eee, scan);
                     eee->punch_round_reg = 1;
                     send_register_super(eee, &eee->supernode, 1, 0, NULL);
+                    eee->sn_wait = 1;
                     send_query_peer(eee, scan->mac_addr);
                 }
             }

@@ -2956,7 +2956,7 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
 
 /* sec: reply only when the pair is new or the last handoff is this old —
  * within the 2s rounds the handoff already refreshes both edges. */
-#define PUNCH_QUERY_REFRESH_SECS 3
+#define PUNCH_QUERY_REFRESH_SECS 5
 
 static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
                                             const n2n_community_t community,
