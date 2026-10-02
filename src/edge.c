@@ -2674,10 +2674,8 @@ static void nat_classify( n2n_edge_t * eee )
 
     traceEvent( TRACE_NORMAL, "NAT type (RFC 3489): %s -> %s", old, new );
 
-    /* Push the fresh NAT type to the active SN so its relay decision never
-     * lags. Never to sn2: a registration there makes sn2 overwrite
-     * my_public_sock with its own view of our endpoint (CGNAT gives a
-     * different port per destination), so the verdict flip-flops forever. */
+    /* Push the fresh NAT type to the active SN only. Never to sn2
+     * to avoid my_public_sock oscillating with CGNAT per-destination ports. */
     if ( eee->supernode.family != 0 )
         send_register_super( eee, &(eee->supernode), 1, 0, NULL );
 }
@@ -2930,9 +2928,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
             /* Twin probe to the current supernode's main + alt port (lport,
              * lport+1): equal public ports prove per-IP reuse -> NAT3 (punches
              * fine); this is the reliable NAT3/NAT4 arbiter, kept everywhere.
-             * lport+1 is only probed when there is no second SN at all (no -l
-             * entry, no sn -b brother): with a second SN the cross-probe below
-             * supplies the second observation instead. */
+             * lport+1 only when there is no second SN, else the cross-probe
+             * below provides the second observation. */
             send_register_super( eee, &(eee->supernode), 0, 2, NULL );
             if ( eee->sn_num < 2 &&
                  eee->supernode.family == AF_INET &&
@@ -2946,9 +2943,8 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
             /* Cross-IP probe to sn2 (distinct public IP, no NAT1 verdict yet):
              * confirmatory only — cross-IP difference must never upgrade to NAT4
              * (the within-IP reuse evidence above is the arbiter).
-             * Only probe sn2 for NAT classification while sn1 is reachable
-             * (sn1 healthy) to assist NAT type detection. Do not send NAT probes
-             * to sn2 while sn1 is unreachable (sn2 is used for lookup/failover). */
+             * sn1 must be healthy: when sn1 is unreachable sn2 is only used
+             * to look up sn1's address and to fail over. */
             int cross_probe = ( eee->sn_num >= 2 &&
                              eee->sn_query.family == AF_INET &&
                              eee->supernode.family == AF_INET &&
@@ -5561,10 +5557,8 @@ process_n2n_packet:
                                     "sn1 back online - switching back to sn1");
                     }
 
-                    /* Freeze once the second observation is in: the lport+1 echo
-                     * when there is no second SN, else the cross-IP echo from sn2.
-                     * Either way the verdict is complete and sn2 must not be
-                     * contacted again until the mapping changes. */
+                    /* Freeze once the second observation is in: lport+1 if no second SN,
+                     * else cross-IP echo from sn2. */
                     if ( was_sym_check &&
                          eee->nat_seen_sn2.family == AF_INET &&
                          ( eee->nat_seen_sn2_alt.family == AF_INET ||

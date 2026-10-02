@@ -1614,10 +1614,10 @@ static int update_edge( n2n_sn_t * sss,
             scan->os_name[sizeof(scan->os_name) - 1] = '\0';
         }
         if (nat_type) {
-            if (nat_type != scan->nat_type ||
-                (now - scan->last_nat_push) >= 300) { /* re-push same value every 5 min: heals a lost PEER_INFO */
+            if (nat_type != scan->nat_type) {  /* push only on a real change: a
+                                                * periodic re-push of an unchanged
+                                                * value is pure noise */
                 nat_changed = 1;
-                scan->last_nat_push = now;
             }
             scan->nat_type = nat_type;
         }
