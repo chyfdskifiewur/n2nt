@@ -2674,16 +2674,12 @@ static void nat_classify( n2n_edge_t * eee )
 
     traceEvent( TRACE_NORMAL, "NAT type (RFC 3489): %s -> %s", old, new );
 
-    /* Push the fresh NAT type to the SN right away so its relay-eligibility
-     * decision never lags. The SN alone decides who relays (PEER_INFO RELAY). */
+    /* Push the fresh NAT type to the active SN so its relay decision never
+     * lags. Never to sn2: a registration there makes sn2 overwrite
+     * my_public_sock with its own view of our endpoint (CGNAT gives a
+     * different port per destination), so the verdict flip-flops forever. */
     if ( eee->supernode.family != 0 )
         send_register_super( eee, &(eee->supernode), 1, 0, NULL );
-    /* Never contact sn2 while the full-cone stranger window (fc_window) is still
-     * open — that first contact would close it and break its N2NF probes. */
-    if ( !eee->fc_window &&
-         eee->sn_query.family != 0 &&
-         memcmp( &eee->sn_query, &eee->supernode, sizeof(eee->sn_query) ) != 0 )
-        send_register_super( eee, &(eee->sn_query), 1, 0, NULL );
 }
 
 /* A helper-source packet proves the NAT filter is not port-restricted. A frozen
@@ -5565,10 +5561,15 @@ process_n2n_packet:
                                     "sn1 back online - switching back to sn1");
                     }
 
-                    /* Freeze only once both twin echoes are in (else a per-IP-reuse NAT may freeze as symmetric) */
+                    /* Freeze once the second observation is in: the lport+1 echo
+                     * when there is no second SN, else the cross-IP echo from sn2.
+                     * Either way the verdict is complete and sn2 must not be
+                     * contacted again until the mapping changes. */
                     if ( was_sym_check &&
                          eee->nat_seen_sn2.family == AF_INET &&
-                         eee->nat_seen_sn2_alt.family == AF_INET )
+                         ( eee->nat_seen_sn2_alt.family == AF_INET ||
+                           ( eee->nat_probe_cross &&
+                             eee->nat_seen_sn_cross.family == AF_INET ) ) )
                     {
                         eee->nat_probe_pending = 0;
                         eee->nat_final = 1;
