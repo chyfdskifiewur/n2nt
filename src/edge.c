@@ -69,6 +69,7 @@
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define PUNCH_RETRY_MAX                 3    /* retries (40s apart) before relay only */
+#define PUNCH_REVIVE_COOLDOWN_SECS      30   /* sec: a given-up peer may rejoin an active punch */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -1641,15 +1642,13 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
-    /* Every round registers first so the SN handoff carries the peer's current
-     * address; the punch follows when that handoff lands (2s fallback in
-     * check_punch_timeouts if it never does). */
     int can_punch = ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) ||
                     ( peer->sock6.family == AF_INET6 &&
                       !is_empty_ip_address(&peer->sock6) &&
                       eee->own_ipv6.family == AF_INET6 );
     if ( !can_punch ) return;   /* no usable route to punch */
 
+    /* Register first; the punch follows the SN handoff carrying the peer's address. */
     peer->punch_start_time = n2n_now();
     peer->punch_round = 0;
     peer->punch_waiting = 1;
@@ -1720,10 +1719,8 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* punch_round counts the rounds already punched. Each round registers
-             * first and punches when the SN handoff lands; a handoff that never
-             * lands is punched here with the known address so an isolated peer
-             * still progresses. */
+            /* Each round registers first and punches on the SN handoff; a handoff
+             * that never lands falls back to the known address here. */
             if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
             {
                 if ( scan->punch_waiting )
@@ -1739,7 +1736,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 {
                     scan->punch_failed = 1;
                     scan->punch_reset_time = now;
-                    /* Leave the running state so an incoming PUNCH can re-arm us. */
+                    /* Leave the running state; only a later address change re-arms us. */
                     scan->punch_start_time = 0;
                     scan->lan_punch_start = 0;
                     traceEvent(TRACE_INFO, "rounds exhausted for %s",
@@ -1790,7 +1787,6 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     continue;
                 }
                 scan->punch_failed = 0;
-                scan->lan_punch_done = 0;
                 traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/%u)",
                            PEER_ID(mac_tmp, scan),
                            (unsigned)scan->punch_retry_count,
@@ -5497,29 +5493,24 @@ process_n2n_packet:
                 ( prev_sock6.family != pending->sock6.family ||
                   sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
 
-            /* Same-address handoff must NOT restart the punch: that would
-             * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
-             * A peer with a healthy direct link never reaches here — it returned above. */
             int direct_alive = ( pending->direct_seen != 0 &&
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
-            /* A failed punch stays failed: the retry chain owns recovery, so a
-             * same-address PUNCH must not re-arm and reset its budget. The far end's
-             * own retry registrations keep the SN handoff fresh and would otherwise
-             * drive an endless give-up/restart loop. Only a real address change revives. */
+            /* A given-up peer rejoins when the far end is still punching, but only
+             * after a cooldown so two exhausted peers cannot re-arm each other. */
+            int revive = ( !pending->punch_failed ||
+                           ( n2n_now() - pending->punch_reset_time ) >= PUNCH_REVIVE_COOLDOWN_SECS );
             if ( addr_changed ||
-                 ( !punch_running && !direct_alive && !pending->punch_failed ) )
+                 ( !punch_running && !direct_alive && revive ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
             }
 
-            /* This round's handoff just carried the peer's current address: punch now
-             * with it. Only the first handoff of a round punches — later ones
-             * would re-anchor the round timer and stall the cadence. */
-            if ( pending->punch_start_time != 0 && pending->punch_waiting &&
-                 !pending->punch_failed )
+            /* Punch with the address this handoff carried; only the first handoff of
+             * a round punches, later ones would re-anchor the round timer. */
+            if ( pending->punch_start_time != 0 && pending->punch_waiting )
             {
                 punch_round( eee, pending );
                 pending->punch_round++;
