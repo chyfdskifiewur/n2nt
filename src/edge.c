@@ -1723,6 +1723,9 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 {
                     scan->punch_failed = 1;
                     scan->punch_reset_time = now;
+                    /* Leave the running state so an incoming PUNCH can re-arm us. */
+                    scan->punch_start_time = 0;
+                    scan->lan_punch_start = 0;
                     traceEvent(TRACE_INFO, "rounds exhausted for %s",
                                PEER_ID(mac_tmp, scan));
                 }
@@ -1843,7 +1846,7 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                 traceEvent(TRACE_DEBUG, "Relay GARP sent to %s (idle %lds)",
                            macaddr_str(mac_tmp, scan->mac_addr), (long)idle);
             }
-            if (idle > 60 && (now - eee->last_register_req) > 30) {
+            if (idle > 60 && !scan->punch_failed && (now - eee->last_register_req) > 30) {
                 traceEvent(TRACE_NORMAL, "Relay check: peer %s unreachable for %lds, querying supernode",
                            PEER_ID(mac_tmp, scan), (long)idle);
                 eee->last_register_req = 0;
