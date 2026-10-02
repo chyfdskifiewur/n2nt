@@ -2905,16 +2905,12 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
      * supernode's main + alt port (same IP, two destination ports): equal
      * public ports prove per-IP reuse (NAT3), disagreeing ports prove
      * endpoint-dependent mapping (NAT4/symmetric). Frozen until the mapping
-     * changes; skipped during failover; waits for Test I.
-     * lport+1 is only used when there is no second SN at all (neither an edge
-     * -l entry nor an sn -b brother): with a second SN present, probing it
-     * would contact a supernode that is otherwise not in use. */
+     * changes; skipped during failover; waits for Test I. */
     if ( !eee->use_ws && eee->sn_idx == 0 &&
          !eee->sn_ask_backup && !eee->sn_all_failed &&
          eee->supernode.family != 0 &&
          eee->nat_seen_sn1.family == AF_INET &&
-         !eee->nat_final &&
-         eee->sn_num < 2 )
+         !eee->nat_final )
     {
         if ( eee->nat_probe_pending &&
              nowTime > eee->nat_probe_time + NAT_SYM_RETRY_SECS )
@@ -2937,9 +2933,13 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 
             /* Twin probe to the current supernode's main + alt port (lport,
              * lport+1): equal public ports prove per-IP reuse -> NAT3 (punches
-             * fine); this is the reliable NAT3/NAT4 arbiter, kept everywhere. */
+             * fine); this is the reliable NAT3/NAT4 arbiter, kept everywhere.
+             * lport+1 is only probed when there is no second SN at all (no -l
+             * entry, no sn -b brother): with a second SN the cross-probe below
+             * supplies the second observation instead. */
             send_register_super( eee, &(eee->supernode), 0, 2, NULL );
-            if ( eee->supernode.family == AF_INET &&
+            if ( eee->sn_num < 2 &&
+                 eee->supernode.family == AF_INET &&
                  eee->supernode.port != 0xFFFF )
             {
                 n2n_sock_t snq_alt = eee->supernode;
