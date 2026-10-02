@@ -3183,34 +3183,11 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
             struct peer_info *eb = find_peer_by_mac( sss->edges, p->edge_b );
             if ( ea && eb )
             {
-                /* Address-stall backoff: repeated handoffs offering the same
+                /* Address-stall backoff: repeated rounds handing over the same
                  * addresses mean punching cannot progress (usually a hard NAT).
-                 * Stop pushing while that holds, so a stuck pair does not flood
-                 * both edges with PUNCH every round. The count is per punch
-                 * burst: a long lull means the edges gave up and a new retry
-                 * round started, which gets a fresh budget. */
-                if ( now - p->last_exchanged > PUNCH_STALL_RESET_SECS )
-                    p->stall_rounds = 0;
-                else if ( sock_equal( &p->stall_sock_a, &ea->sock ) &&
-                          sock_equal( &p->stall_sock_b, &eb->sock ) )
-                {
-                    p->stall_rounds++;
-                }
-                else
-                {
-                    p->stall_rounds = 0;
-                    p->stall_sock_a = ea->sock;
-                    p->stall_sock_b = eb->sock;
-                }
-
+                 * The QUERY path owns the accounting; here we just honour it. */
                 if ( p->stall_rounds >= PUNCH_STALL_ROUNDS )
-                {
-                    if ( p->stall_rounds == PUNCH_STALL_ROUNDS )
-                        traceEvent( TRACE_INFO, "punch stalled: %s and %s kept the same addresses %d rounds, no more PUNCH until they change",
-                                    macaddr_str(mac_buf_a, p->edge_a),
-                                    macaddr_str(mac_buf_b, p->edge_b),
-                                    p->stall_rounds );
-                }
+                    ;
                 /* The deferral slot is single: don't arm it while one is pending. */
                 else if ( p->sync_armed && p->sync_delay_ms > 0 &&
                      p->defer_due_ms == 0 )
@@ -3853,9 +3830,38 @@ static int process_udp( n2n_sn_t * sss,
                                                         query.srcMac, query.targetMac );
             /* A pair whose addresses stopped changing is not making progress, so
              * QUERY traffic must not keep the PUNCH pushes coming either. */
-            int reply = !qpair ||
-                        ( qpair->stall_rounds < PUNCH_STALL_ROUNDS &&
+            int reply = !qpair;
+            if ( qpair )
+            {
+                /* A pair whose addresses stopped changing is not making progress, so
+                 * QUERY traffic must not keep the PUNCH pushes coming either. Counting
+                 * happens here because this is the path that keeps arriving after the
+                 * edges stopped punching. requester may be gone (not registered any
+                 * more), in which case only the target side is compared. */
+                n2n_sock_t rq_sock = requester ? requester->sock : qpair->stall_sock_b;
+                if ( now - qpair->last_exchanged > PUNCH_STALL_RESET_SECS )
+                {
+                    qpair->stall_rounds = 0;
+                    qpair->stall_sock_a = target->sock;
+                    qpair->stall_sock_b = rq_sock;
+                }
+                else if ( sock_equal( &qpair->stall_sock_a, &target->sock ) &&
+                          sock_equal( &qpair->stall_sock_b, &rq_sock ) )
+                {
+                    qpair->stall_rounds++;
+                }
+                else
+                {
+                    qpair->stall_rounds = 0;
+                    qpair->stall_sock_a = target->sock;
+                    qpair->stall_sock_b = rq_sock;
+                }
+                reply = ( qpair->stall_rounds < PUNCH_STALL_ROUNDS &&
                           ( now - qpair->last_exchanged ) >= PUNCH_QUERY_REFRESH_SECS );
+                if ( qpair->stall_rounds == PUNCH_STALL_ROUNDS )
+                    traceEvent( TRACE_INFO, "punch stalled: unchanged addresses %d rounds, not pushing PUNCH until they change",
+                                qpair->stall_rounds );
+            }
             if ( reply )
             {
             memset( &cmn2, 0, sizeof(cmn2) );
