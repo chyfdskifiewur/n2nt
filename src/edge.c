@@ -5490,8 +5490,12 @@ process_n2n_packet:
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
+            /* A failed punch stays failed: the retry chain owns recovery, so a
+             * same-address PUNCH must not re-arm and reset its budget. The far end's
+             * own retry registrations keep the SN handoff fresh and would otherwise
+             * drive an endless give-up/restart loop. Only a real address change revives. */
             if ( addr_changed ||
-                 ( !punch_running && !direct_alive ) )
+                 ( !punch_running && !direct_alive && !pending->punch_failed ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
