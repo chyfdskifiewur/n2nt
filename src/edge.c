@@ -4391,54 +4391,90 @@ static void readFromMgmtSocket(n2n_edge_t *eee, int *keep_running) {
     msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE, "Supernodes\n");
     sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
            (struct sockaddr*) &sender_sock, i);
-    /* -Q output: two fixed rows. Row 1 is the configured identity
-     * (sn_ip_array[0], taken verbatim from -l and never rewritten by DNS
-     * resolution); row 2 is the supernode actually in use. '*' marks the row in
-     * use; '-b' tags sn1 when it has a little brother (sn2). */
+    /* -Q output: list every SN (with fixed left edges). The active one is
+     * marked with '*'; -b tags any row whose entry came from the sn1 ACK. */
     {
         macstr_t mac_buf;
-        n2n_sock_str_t inbuf;
+        size_t disp = 0;   /* sequential label across shown rows (hide jump numbers) */
+        /* Show only the two failover endpoints: the primary (sn1, index 0) and
+         * the one currently in use. The pure query channel (sn2) is hidden
+         * when it is not itself the failover target. */
+        size_t second = ( eee->sn_idx != 0 ) ? eee->sn_idx : eee->sn_backup_index;
 
-        /* Row 1: configured identity (sn1) */
+        for (size_t sn_i = 0; sn_i < eee->sn_num && sn_i < N2N_EDGE_NUM_SUPERNODES; sn_i++)
         {
-            int in_use = ( eee->sn_idx == 0 );
+            if ( sn_i != 0 && sn_i != second )
+                continue;
+
+            disp++;
+
+            /* Left column: the active one shows '*' INSTEAD of the number (same
+             * style as the P2P_with relay '*'); others their sequential label,
+             * each string carrying its own width for column alignment. */
             char marker[8];
-            snprintf(marker, sizeof(marker), "%s", in_use ? " *" : " 1");
-            const char *mac_str = mac_nonzero(eee->sn1_mac)
-                                ? macaddr_str(mac_buf, eee->sn1_mac) : "-";
+            if ( sn_i == eee->sn_idx )
+                snprintf(marker, sizeof(marker), " *");
+            else
+                snprintf(marker, sizeof(marker), "%2u", (unsigned)disp);
+            const char *tok_str = (eee->token_configured && eee->sn_tokens[sn_i].toksize > 0) ? "Pass" : "NoTok";
             const char *b_marker = "";
-            if ( eee->sn_query_index < eee->sn_num &&
+            /* '-b' on the primary (sn1) row means "sn1 has a little brother
+             * (sn2, learned from the sn1 ACK)", shown as long as it exists. */
+            if ( sn_i == 0 &&
+                 eee->sn_query_index < eee->sn_num &&
                  eee->sn_ack_backup[eee->sn_query_index] )
                 b_marker = "-b";
-            const char *tok_row = ( in_use && eee->token_configured &&
-                                    eee->sn_tokens[0].toksize > 0 ) ? "Pass" : "NoTok";
-            const char *ver_field = ( in_use && eee->supernode_version[0] != '\0' )
-                                  ? eee->supernode_version : "-";
-            msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
-                               " %s  %-17.17s  %-65.65s  %-7.7s  %-7.7s  %s\n",
-                               marker, mac_str, eee->sn_ip_array[0],
-                               ver_field, in_use ? tok_row : "-", b_marker);
-            sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
-                   (struct sockaddr*) &sender_sock, i);
-        }
-
-        /* Row 2: supernode actually in use */
-        {
-            int ack_brother = sn_is_ack_brother(eee, eee->sn_idx);
-            /* Brother from sn1's ACK: show the masked copy, never the raw address. */
-            const char *sn_host = sock_to_cstr(inbuf, &eee->supernode);
-            if ( ack_brother && eee->sn_bak_masked[0] )
+            const char *mac_str = "-";
+            if (sn_i == 0 && mac_nonzero(eee->sn1_mac))
+                mac_str = macaddr_str(mac_buf, eee->sn1_mac);
+            /* Host: with sn1 IPv6 known, print both stacks with the port once
+             * at the end ("v4/[v6]:port"); worst case 63 chars fits the 65-wide
+             * column. */
+            const char *sn_host = eee->sn_ip_array[sn_i];
+            /* ACK-learned brother: show the masked display copy instead */
+            if ( sn_is_ack_brother(eee, (int)sn_i) && eee->sn_bak_masked[0] )
                 sn_host = eee->sn_bak_masked;
-            const char *mac_str = ( eee->sn_idx == 0 && mac_nonzero(eee->sn1_mac) )
-                                ? macaddr_str(mac_buf, eee->sn1_mac) : "-";
-            const char *tok_row = ( !ack_brother && eee->token_configured &&
-                                    eee->sn_tokens[eee->sn_idx].toksize > 0 )
-                                ? "Pass" : "NoTok";
-            const char *ver_field = ( eee->supernode_version[0] != '\0' )
-                                  ? eee->supernode_version : "-";
+            char host[N2N_SOCKBUF_SIZE + 1] = "";
+            if (sn_i == 0 && eee->sn1_v6.family == AF_INET6)
+            {
+                n2n_sock_str_t v6buf;
+                const char *v6s = sock_to_cstr(v6buf, &eee->sn1_v6); /* "[...]:port" */
+                const char *v6close = strchr(v6s, ']');
+                const char *v6colon = strrchr(v6s, ':');   /* last ':' -> port */
+                if (v6close && v6colon && v6colon > v6close)
+                {
+                    /* Drop the (identical) port from the IPv4 side. */
+                    const char *v4colon = strrchr(sn_host, ':');
+                    size_t v4_len = v4colon ? (size_t)(v4colon - sn_host)
+                                            : strlen(sn_host);
+                    snprintf(host, sizeof(host), "%.*s/%.*s:%s",
+                             (int)v4_len, sn_host,
+                             (int)(v6close - v6s + 1), v6s, v6colon + 1);
+                    sn_host = host;
+                }
+            }
+            /* Fixed column widths -> fixed left edges: marker 2, mac 17, host
+             * 65, version 7, tok 7, -b; version/token land on the header columns. */
+            char ver_field[8];
+            char tok_row[8];
+            /* The ACK-learned brother row carries no real data (never configured via
+             * -l, never registered to): dash version/token like the MAC/host. */
+            if ( eee->sn_ack_backup[sn_i] ) {
+                snprintf(ver_field, sizeof(ver_field), "-");
+                snprintf(tok_row, sizeof(tok_row), "-");
+            } else {
+                /* Version reported by the supernode in its ACK; only the
+                 * active one is known, the rest show a dash. */
+                const char *ver_str = ( sn_i == eee->sn_idx &&
+                                        eee->supernode_version[0] != '\0' )
+                                    ? eee->supernode_version : "-";
+                snprintf(ver_field, sizeof(ver_field), "%.7s", ver_str);
+                snprintf(tok_row, sizeof(tok_row), "%s", tok_str);
+            }
             msg_len = snprintf((char*)udp_buf, N2N_PKT_BUF_SIZE,
                                " %s  %-17.17s  %-65.65s  %-7.7s  %-7.7s  %s\n",
-                               " *", mac_str, sn_host, ver_field, tok_row, "");
+                               marker, mac_str, sn_host, ver_field,
+                               tok_row, b_marker);
             sendto(eee->mgmt_sock, udp_buf, msg_len, 0/*flags*/,
                    (struct sockaddr*) &sender_sock, i);
         }

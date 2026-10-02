@@ -559,7 +559,7 @@ struct n2n_edge
     n2n_sock_t          sn1_v6;         /* sn1's IPv6 address (as reported by sn1 in the ACK). */
     uint8_t             sn_ack_backup[N2N_EDGE_NUM_SUPERNODES]; /* indices whose entry came from the sn1 ACK (backup). */
     uint8_t             sn_ak_parsed;   /* sn1's ACK backup string parsed (learnt or already present) */
-    char                sn_bak_masked[N2N_EDGE_SN_HOST_SIZE]; /* ACK-learned brother: masked display copy ('*' + tail) */
+    char                sn_bak_masked[N2N_EDGE_SN_HOST_SIZE]; /* ACK-learned brother: masked display copy (a.b.*.*:port) */
     uint8_t             sn_relay_fails;   /* consecutive relay send failures, reset on success */
     n2n_cookie_t        last_cookie;
     uint8_t             sn_ack_count;
