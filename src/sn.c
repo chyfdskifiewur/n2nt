@@ -3842,8 +3842,11 @@ static int process_udp( n2n_sn_t * sss,
             }
             struct sn_punch_pair *qpair = sn_pair_find( sss, cmn.community,
                                                         query.srcMac, query.targetMac );
-            int reply = pair_new || !qpair ||
-                        ( now - qpair->last_exchanged ) >= PUNCH_QUERY_REFRESH_SECS;
+            /* A pair whose addresses stopped changing is not making progress, so
+             * QUERY traffic must not keep the PUNCH pushes coming either. */
+            int reply = !qpair ||
+                        ( qpair->stall_rounds < PUNCH_STALL_ROUNDS &&
+                          ( now - qpair->last_exchanged ) >= PUNCH_QUERY_REFRESH_SECS );
             if ( reply )
             {
             memset( &cmn2, 0, sizeof(cmn2) );
