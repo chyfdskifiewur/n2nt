@@ -68,6 +68,7 @@
 #define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
+#define PUNCH_RETRY_MAX                 3    /* retries (40s apart) before relay only */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -1758,7 +1759,8 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             continue;
         } else if ( scan->punch_failed )
         {
-            if ( scan->punch_retry_count >= 3 ) {
+            if ( scan->punch_retry_count > PUNCH_RETRY_MAX ) {
+                /* Retries used up: stay relay only. */
                 prev = scan;
                 scan = scan->next;
                 continue;
@@ -1766,21 +1768,20 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             if ( (now - scan->punch_reset_time) > 40 )
             {
                 scan->punch_retry_count++;
-                if ( scan->punch_retry_count >= 3 ) {
+                if ( scan->punch_retry_count > PUNCH_RETRY_MAX ) {
                     traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
                                PEER_ID(mac_tmp, scan),
-                               scan->punch_retry_count);
+                               (unsigned)PUNCH_RETRY_MAX);
                     prev = scan;
                     scan = scan->next;
                     continue;
                 }
                 scan->punch_failed = 0;
-                scan->punch_start_time = 0;
                 scan->lan_punch_done = 0;
-                scan->lan_punch_start = 0;
-                traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/3)",
+                traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/%u)",
                            PEER_ID(mac_tmp, scan),
-                           scan->punch_retry_count);
+                           (unsigned)scan->punch_retry_count,
+                           (unsigned)PUNCH_RETRY_MAX);
                 start_punch(eee, scan);
             }
         }
