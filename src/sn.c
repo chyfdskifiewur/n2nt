@@ -2958,10 +2958,6 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
  * within the 2s rounds the handoff already refreshes both edges. */
 #define PUNCH_QUERY_REFRESH_SECS 5
 
-/* sec: a party whose round registration is older than this has stopped
- * punching (relay-only); the SN must not relay PUNCH at it. */
-#define PUNCH_REG_STALE_SECS 10
-
 static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
                                             const n2n_community_t community,
                                             const n2n_mac_t a,
@@ -3806,23 +3802,6 @@ static int process_udp( n2n_sn_t * sss,
                                                         query.srcMac, query.targetMac );
             int reply = pair_new || !qpair ||
                         ( now - qpair->last_exchanged ) >= PUNCH_QUERY_REFRESH_SECS;
-            /* Only relay PUNCH while the party is still in its punch rounds:
-             * a stale round registration means it gave up (relay-only) and must
-             * stay quiet. First contact (pair_new) may still wake an idle peer. */
-            int requester_active = 1, target_active = 1;
-            if ( qpair )
-            {
-                int req_is_a = ( memcmp( qpair->edge_a, query.srcMac,
-                                         N2N_MAC_SIZE ) == 0 );
-                time_t req_reg = req_is_a ? qpair->a_reg : qpair->b_reg;
-                time_t tgt_reg = req_is_a ? qpair->b_reg : qpair->a_reg;
-                requester_active = ( req_reg != 0 &&
-                                     ( now - req_reg ) <= PUNCH_REG_STALE_SECS );
-                target_active    = ( tgt_reg != 0 &&
-                                     ( now - tgt_reg ) <= PUNCH_REG_STALE_SECS );
-            }
-            if ( reply && !pair_new && !requester_active )
-                reply = 0;
             if ( reply )
             {
             memset( &cmn2, 0, sizeof(cmn2) );
@@ -3873,7 +3852,7 @@ static int process_udp( n2n_sn_t * sss,
             }
 
             /* Simultaneous open: also push A's address to B so B punches back */
-            if ( requester && reply && ( pair_new || target_active ) )
+            if ( requester && reply )
             {
                 n2n_PEER_INFO_t pi2;
                 n2n_common_t    cmn3;
