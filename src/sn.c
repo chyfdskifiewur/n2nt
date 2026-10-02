@@ -2963,12 +2963,23 @@ static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
                                             const n2n_mac_t a,
                                             const n2n_mac_t b )
 {
+    n2n_mac_t ea, eb;
+    if ( memcmp(a, b, N2N_MAC_SIZE) < 0 )
+    {
+        memcpy(ea, a, N2N_MAC_SIZE);
+        memcpy(eb, b, N2N_MAC_SIZE);
+    }
+    else
+    {
+        memcpy(ea, b, N2N_MAC_SIZE);
+        memcpy(eb, a, N2N_MAC_SIZE);
+    }
     struct sn_punch_pair *p = sss->punch_pairs;
     while ( p )
     {
         if ( memcmp(p->community, community, sizeof(n2n_community_t)) == 0 &&
-             memcmp(p->edge_a, a, N2N_MAC_SIZE) == 0 &&
-             memcmp(p->edge_b, b, N2N_MAC_SIZE) == 0 )
+             memcmp(p->edge_a, ea, N2N_MAC_SIZE) == 0 &&
+             memcmp(p->edge_b, eb, N2N_MAC_SIZE) == 0 )
             return p;
         p = p->next;
     }
