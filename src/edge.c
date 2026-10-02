@@ -5089,12 +5089,13 @@ process_n2n_packet:
                 if ( NULL == pscan ) {
                     try_send_register(eee, 0, probe.srcMac, &sender);
                 } else {
-                    if (sender.family == AF_INET6) {
-                        pscan->sock6 = sender;
-                    } else {
-                        pscan->sock = sender;
-                    }
-                    send_register(eee, &sender);
+                    /* A PROBE from the peer's real public address is direct-path proof.
+                     * Promote to known_peers here instead of waiting for a direct
+                     * REGISTER_ACK: with both sides port-restr the ACK comes back from
+                     * a different source port, so the ACK path can stay closed while the
+                     * data path is already open — the peer would sit in pending forever
+                     * and every packet would keep going through the supernode. */
+                    set_peer_operational( eee, probe.srcMac, &sender );
                 }
             } else {
                 known->last_seen = now;
