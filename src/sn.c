@@ -1841,18 +1841,14 @@ static ssize_t sn_send_to_peer(n2n_sn_t * sss,
          * must not kill the connection; liveness is ws_recv's job. */
         return ws_send(peer->ws, pktbuf, pktsize);
     }
-    /* UDP: dual-send v4+v6 — sendto succeeds even on a stale NAT mapping, so a
-     * return-value based fallback never triggers; both paths keep data flowing. */
-    {
-        ssize_t r = -1;
-        if (peer->sock.family != 0)
-            r = sendto_sock(sss, &peer->sock, pktbuf, pktsize);
-        if (peer->sock6.family != 0) {
-            ssize_t r6 = sendto_sock(sss, &peer->sock6, pktbuf, pktsize);
-            if (r6 == (ssize_t)pktsize) r = r6;
-        }
-        return r;
+    /* Prefer IPv4 for forwarding; do not send to both address families. */
+    if (peer->sock.family == AF_INET) {
+        return sendto_sock(sss, &peer->sock, pktbuf, pktsize);
     }
+    if (peer->sock6.family == AF_INET6) {
+        return sendto_sock(sss, &peer->sock6, pktbuf, pktsize);
+    }
+    return -1;
 }
 
 /* Purge timed out / closed WS connections. Close if idle for WS_KEEPALIVE_TIMEOUT seconds. */
