@@ -3345,7 +3345,7 @@ static int send_PACKET( n2n_edge_t * eee,
             }
             do_query = 1;
         } else {
-            do_query = ((now - p->last_query_sent) >= 5);
+            do_query = ((now - p->last_query_sent) >= 5) && !p->punch_failed;
             if (do_query)
                 p->last_query_sent = now;
         }
