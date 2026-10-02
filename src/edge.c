@@ -1665,6 +1665,24 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
     struct peer_info * prev = NULL;
     MACSTR_TMP(mac_tmp);
     while ( scan ) {
+        /* Direct link already up: stop every punch phase for this peer, including
+         * the LAN one. Re-registering here refreshes our SN record and pushes
+         * another PUNCH at the far end, which knocks the working direct path down. */
+        if ( scan->direct_seen != 0 &&
+             ( now - scan->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS )
+        {
+            if ( scan->punch_start_time != 0 || scan->lan_punch_start != 0 )
+                traceEvent(TRACE_DEBUG, "direct alive for %s, stopping punch",
+                           PEER_ID(mac_tmp, scan));
+            scan->punch_start_time = 0;
+            scan->punch_round = 0;
+            scan->punch_round_time = 0;
+            scan->lan_punch_start = 0;
+            scan->lan_punch_done = 1;
+            scan = scan->next;
+            continue;
+        }
+
         /* LAN punch phase: retransmit REGISTER to LAN address */
         if ( scan->num_sockets == 2 && !scan->lan_punch_done &&
              scan->lan_punch_start != 0 )
@@ -3402,7 +3420,7 @@ static void send_packet2net(n2n_edge_t * eee,
             struct in6_addr dst6;
             memcpy(&dst6, &tap_pkt[ETH_FRAMESIZE + IP6_SRCOFFSET], sizeof(dst6));
             if( memcmp(&dst6, &eee->device.ip6_addr, IPV6_SIZE ) != 0 ) {
-                traceEvent(TRACE_INFO, "Discarding routed packet [%s]",
+                traceEvent(TRACE_DEBUG, "Discarding routed packet [%s]",
                            inet_ntop(AF_INET6, &dst6, ip_buf, sizeof(ip_buf)));
                 return;
             }
@@ -5218,6 +5236,12 @@ process_n2n_packet:
                             eee->cached_dst_valid = 0;
                         }
                     }
+                    if (addr_changed && known->direct_seen != 0 &&
+                        (now - known->direct_seen) < PUNCH_DIRECT_ALIVE_SECS) {
+                        traceEvent(TRACE_DEBUG, "P2P already direct for %s, ignoring address change from SN",
+                                   macaddr_str(mac_buf1, known->mac_addr));
+                        addr_changed = 0;
+                    }
 
                     if (!addr_changed) {
                         if ((pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
@@ -5422,6 +5446,11 @@ process_n2n_packet:
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
+            /* A working direct link outranks a fresh address from the SN: tearing
+             * it down to re-punch a path that already carries traffic is what makes
+             * an established P2P session bounce back to relay. */
+            if ( direct_alive )
+                addr_changed = 0;
             if ( addr_changed ||
                  ( !punch_running && !direct_alive ) )
             {
