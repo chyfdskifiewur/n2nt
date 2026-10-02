@@ -1665,8 +1665,9 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
     struct peer_info * prev = NULL;
     MACSTR_TMP(mac_tmp);
     while ( scan ) {
-        /* Direct link already up: stop every punch phase. Re-registering here
-         * pushes another PUNCH at the far end and knocks the link down. */
+        /* Direct link already up: stop every punch phase for this peer, including
+         * the LAN one. Re-registering here refreshes our SN record and pushes
+         * another PUNCH at the far end, which knocks the working direct path down. */
         if ( scan->direct_seen != 0 &&
              ( now - scan->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS )
         {
@@ -2140,8 +2141,7 @@ void try_send_register( n2n_edge_t * eee,
             scan->sockets[0] = *peer;
             scan->punch_start_time = 0;
             scan->punch_failed = 0;
-            /* Keep punch_retry_count: every PUNCH re-addresses, so clearing it
-             * here would restart the 3-attempt budget each round. */
+            scan->punch_retry_count = 0;
             scan->punch_reset_time = 0;
             scan->lan_punch_start = 0;
             scan->lan_punch_done = 0;
@@ -4604,10 +4604,9 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
     if ( eee->use_ws )
         return;
 
-    /* Address changed: re-run the rounds, but keep punch_retry_count — every
-     * round re-addresses, so clearing it would never exhaust the retry budget. */
     pending->punch_failed = 0;
     pending->punch_start_time = 0;
+    pending->punch_retry_count = 0;
     pending->punch_reset_time = 0;
     pending->punch_round = 0;
     pending->punch_round_time = 0;
@@ -5390,9 +5389,11 @@ process_n2n_packet:
 
             if (known && known->direct_seen != 0 &&
                 (now - known->direct_seen) < PUNCH_DIRECT_ALIVE_SECS) {
-                /* Already reachable directly: a PUNCH would demote the peer to
+                /* A PUNCH asks us to (re)hole-punch, but this peer is already
+                 * reachable directly. Demoting it here would move it back to
                  * pending_peers, where find_peer_destination cannot see it, so
-                 * traffic would fall back to the supernode. Just refresh it. */
+                 * traffic would fall back to the supernode while the direct path
+                 * is still working. Refresh the metadata and keep the link. */
                 if (eee->cached_dst_valid && pi.sockets[0].family == AF_INET &&
                     !sock_equal(&known->sock, &pi.sockets[0])) {
                     eee->cached_dst_valid = 0;
@@ -5476,18 +5477,13 @@ process_n2n_packet:
 
             /* Same-address handoff must NOT restart the punch: that would
              * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
-             * A peer with a healthy direct link never reaches here — it returned above.
-             * An exhausted punch may be re-woken by a PUNCH so it does not idle
-             * until the 40s retry, but only while retries remain: once the peer is
-             * given up on, further PUNCHes must not restart it for good. The 3 is
-             * the give-up threshold in check_punch_timeouts(). */
+             * A peer with a healthy direct link never reaches here — it returned above. */
             int direct_alive = ( pending->direct_seen != 0 &&
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
             if ( addr_changed ||
-                 ( !punch_running && !direct_alive &&
-                   pending->punch_retry_count < 3 ) )
+                 ( !punch_running && !direct_alive ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );

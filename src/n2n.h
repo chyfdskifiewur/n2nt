@@ -295,12 +295,7 @@ struct peer_info {
 
 /* Hard-NAT punch pair: two edges coordinate 2s punch rounds; SN hands each the other's latest address (PUNCH) */
 #define PUNCH_PAIR_MAX  64    /* max simultaneous hard-NAT punch pairs */
-#define PUNCH_PAIR_HOLD 100   /* sec: drop a pair whose edges stopped round-querying.
-                              * Must exceed the 40s retry gap (edge.c
-                              * check_punch_timeouts): last_activity only advances
-                              * on QUERY_PEER, so a shorter hold purges the pair
-                              * mid-gap and rebuilds it with cleared counters,
-                              * breaking the both-registered barrier. */
+#define PUNCH_PAIR_HOLD 10    /* sec: drop a pair whose edges both stopped round-querying */
 #define PUNCH_SYNC_MIN_DIFF_MS 10 /* ms: round-latency differences below this are noise */
 #define PUNCH_SYNC_MAX_DIFF_MS 1000 /* ms: larger gaps mean hopelessly asymmetric routes, skip compensation */
 struct sn_punch_pair {
