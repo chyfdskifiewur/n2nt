@@ -2963,6 +2963,11 @@ static void advertise_relay_on_pair( n2n_sn_t *sss,
  * past that the addresses are not moving, so more pushes only add noise. */
 #define PUNCH_STALL_ROUNDS 5
 
+/* sec of silence that ends a punch burst. The edges retry after a longer lull,
+ * so a gap this big means a new round started and the stall count starts over
+ * instead of suppressing every later attempt. */
+#define PUNCH_STALL_RESET_SECS 15
+
 /* Pairs are stored in canonical MAC order, so lookups must normalise their two
  * arguments too: a caller passing (b, a) would otherwise miss and create a
  * duplicate pair, defeating the refresh throttle. */
@@ -3181,9 +3186,13 @@ static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
                 /* Address-stall backoff: repeated handoffs offering the same
                  * addresses mean punching cannot progress (usually a hard NAT).
                  * Stop pushing while that holds, so a stuck pair does not flood
-                 * both edges with PUNCH every round. */
-                if ( sock_equal( &p->stall_sock_a, &ea->sock ) &&
-                     sock_equal( &p->stall_sock_b, &eb->sock ) )
+                 * both edges with PUNCH every round. The count is per punch
+                 * burst: a long lull means the edges gave up and a new retry
+                 * round started, which gets a fresh budget. */
+                if ( now - p->last_exchanged > PUNCH_STALL_RESET_SECS )
+                    p->stall_rounds = 0;
+                else if ( sock_equal( &p->stall_sock_a, &ea->sock ) &&
+                          sock_equal( &p->stall_sock_b, &eb->sock ) )
                 {
                     p->stall_rounds++;
                 }

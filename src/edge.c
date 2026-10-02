@@ -1297,14 +1297,6 @@ static void send_query_peer( n2n_edge_t * eee, const n2n_mac_t targetMac )
     edge_send_to_sn(eee, pktbuf, idx);
 }
 
-/** True when this peer is still worth asking the supernode about. A peer that
- * gave up punching is skipped, otherwise it keeps the SN's QUERY-reply and
- * simultaneous-open pushes coming forever. Recovery paths must bypass this. */
-static int peer_worth_querying( const struct peer_info * peer )
-{
-    return ( peer->punch_retry_count < 3 );
-}
-
 /** True when the 6-byte MAC is not all-zero (tests sn1 identity presence). */
 static int mac_nonzero( const uint8_t * mac )
 {
@@ -1741,8 +1733,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     punch_round(eee, scan);
                     eee->punch_round_reg = 1;
                     send_register_super(eee, &eee->supernode, 1, 0, NULL);
-                    if ( peer_worth_querying(scan) )
-                        send_query_peer(eee, scan->mac_addr);
+                    send_query_peer(eee, scan->mac_addr);
                 }
             }
         }
@@ -1850,10 +1841,6 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                            macaddr_str(mac_tmp, scan->mac_addr), (long)idle);
             }
             if (idle > 60 && (now - eee->last_register_req) > 30) {
-                if ( !peer_worth_querying(scan) ) {
-                    scan = next;
-                    continue;
-                }
                 traceEvent(TRACE_NORMAL, "Relay check: peer %s unreachable for %lds, querying supernode",
                            PEER_ID(mac_tmp, scan), (long)idle);
                 eee->last_register_req = 0;
