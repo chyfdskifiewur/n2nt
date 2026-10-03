@@ -64,11 +64,11 @@
 #define REGISTER_SUPER_INTERVAL_MAX     120  /* sec */
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
-#define PUNCH_ROUNDS                    10   /* punch rounds before giving up */
+#define PUNCH_ROUNDS                    5    /* punch rounds before giving up */
 #define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
-#define PUNCH_RETRY_MAX                 3    /* retries before relay only */
+#define PUNCH_RETRY_MAX                 10   /* retries before relay only */
 #define PUNCH_RETRY_SECS                40   /* sec: wait after round exhaustion before a retry */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
