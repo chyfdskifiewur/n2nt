@@ -2126,6 +2126,8 @@ void try_send_register( n2n_edge_t * eee,
         scan->last_seen = n2n_now();
         scan->punch_start_time = 0;
         scan->punch_failed = 0;
+        /* P2P is up: the punch budget is spent, restore it for any future re-punch. */
+        scan->punch_retry_count = 0;
 
         strncpy(scan->version, n2n_sw_version, sizeof(scan->version) - 1);
         strncpy(scan->os_name, n2n_sw_osName, sizeof(scan->os_name) - 1);
@@ -2310,6 +2312,8 @@ void set_peer_operational( n2n_edge_t * eee,
         scan->p2p_est_time = scan->direct_seen;
         scan->punch_start_time = 0;
         scan->punch_failed = 0;
+        /* P2P is up: the punch budget is spent, restore it for any future re-punch. */
+        scan->punch_retry_count = 0;
 
         if (memcmp(scan->mac_addr, eee->last_p2p_log_mac, N2N_MAC_SIZE) ||
             memcmp(peer, &eee->last_p2p_log_addr, sizeof(n2n_sock_t))) {
@@ -4618,7 +4622,8 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
 
     pending->punch_failed = 0;
     pending->punch_start_time = 0;
-    pending->punch_retry_count = 0;
+    /* Keep punch_retry_count across restart_punch_for_peer: only reset on
+     * successful P2P establishment or explicit retry timeout re-arm. */
     pending->punch_reset_time = 0;
     pending->punch_round = 0;
     pending->punch_round_time = 0;
@@ -5495,7 +5500,7 @@ process_n2n_packet:
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
             if ( addr_changed ||
-                 ( !punch_running && !direct_alive ) )
+                 ( !punch_running && !direct_alive && !pending->punch_failed ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
