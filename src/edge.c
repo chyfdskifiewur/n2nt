@@ -2079,6 +2079,11 @@ void try_send_register_lan( n2n_edge_t * eee,
 void set_peer_operational( n2n_edge_t * eee,
                            const n2n_mac_t mac,
                            const n2n_sock_t * peer );
+static void restart_punch_for_peer( n2n_edge_t * eee,
+                                    struct peer_info * pending,
+                                    uint16_t aflags,
+                                    const n2n_sock_t * pub_sock,
+                                    const n2n_sock_t * lan_sock );
 
 
 
@@ -3877,6 +3882,7 @@ static int handle_PACKET( n2n_edge_t * eee,
                     scan->last_seen = now;
                 }
             } else {
+                int relay_addr_changed = 0;
                 if (scan->direct_seen == 0 && !is_empty_ip_address(&pkt->sock)) {
                     n2n_sock_t *active_sock = (scan->sock.family == AF_INET) ? &scan->sock : &scan->sock6;
                     if (sock_equal(active_sock, &pkt->sock) != 0) {
@@ -3884,12 +3890,22 @@ static int handle_PACKET( n2n_edge_t * eee,
                         traceEvent(TRACE_INFO, "Peer %s addr from SN, updating",
                                    macaddr_str(mb, pkt->srcMac));
                         *active_sock = pkt->sock;
+                        relay_addr_changed = 1;
                     }
                 }
                 /* Only frames addressed to us count: relayed startup broadcasts must
                  * not refresh last_seen (would false-arm the punch gate). */
                 if (memcmp(pkt->dstMac, eee->device.mac_addr, N2N_MAC_SIZE) == 0)
                     scan->last_seen = now;
+
+                /* A communicating peer's relayed endpoint changed: re-punch from scratch,
+                 * unconditionally. A freshly started, non-communicating edge stays silent. */
+                if (relay_addr_changed &&
+                    (now - scan->last_seen) <= PUNCH_ACTIVE_WINDOW &&
+                    find_peer_by_mac(eee->pending_peers, pkt->srcMac) != NULL) {
+                    n2n_sock_t no_lan = {0};
+                    restart_punch_for_peer(eee, scan, 0, &pkt->sock, &no_lan);
+                }
             }
 
             /* Extract sender's virtual IP — reuse 'scan' from above, no second lookup. */
