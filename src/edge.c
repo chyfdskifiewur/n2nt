@@ -66,6 +66,7 @@
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
 #define PUNCH_ROUNDS                    5    /* punch rounds before giving up */
 #define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
+#define PUNCH_HANDOFF_GRACE             1    /* sec: a round with no SN handoff punches with the known address after this */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define PUNCH_RETRY_MAX                 3    /* retries (40s apart) before relay only */
@@ -1718,19 +1719,21 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* Each round registers first and punches on the SN handoff; a handoff
-             * that never lands falls back to the known address here. */
+            /* Handoff grace: a round whose SN handoff never lands punches with
+             * the known address inside the same window, keeping the grid fixed. */
+            if ( scan->punch_waiting &&
+                 (now - scan->punch_round_time) >= PUNCH_HANDOFF_GRACE )
+            {
+                punch_round(eee, scan);
+                scan->punch_round++;
+                scan->punch_waiting = 0;
+                traceEvent(TRACE_DEBUG, "round %u (no handoff) for %s",
+                           (unsigned)scan->punch_round, PEER_ID(mac_tmp, scan));
+            }
+
+            /* Window advance: the grid is anchored only by the window start. */
             if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
             {
-                if ( scan->punch_waiting )
-                {
-                    punch_round(eee, scan);
-                    scan->punch_round++;
-                    scan->punch_waiting = 0;
-                    traceEvent(TRACE_DEBUG, "round %u (no handoff) for %s",
-                               (unsigned)scan->punch_round, PEER_ID(mac_tmp, scan));
-                }
-
                 if ( scan->punch_round >= PUNCH_ROUNDS )
                 {
                     scan->punch_failed = 1;
@@ -5528,14 +5531,13 @@ process_n2n_packet:
                                         &pi.sockets[0], &pi.sockets[1] );
             }
 
-            /* Punch with the address this handoff carried; only the first handoff of
-             * a round punches, later ones would re-anchor the round timer. */
+            /* Punch with the address this handoff carried; the grid is anchored
+             * only by the window start, so the handoff never re-anchors it. */
             if ( pending->punch_start_time != 0 && pending->punch_waiting )
             {
                 punch_round( eee, pending );
                 pending->punch_round++;
                 pending->punch_waiting = 0;
-                pending->punch_round_time = n2n_now();
             }
 
             PEERS_UNLOCK(eee);
