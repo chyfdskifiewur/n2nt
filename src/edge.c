@@ -5522,7 +5522,7 @@ process_n2n_packet:
                     pending->punch_retry_count = 0;
                     pending->punch_failed = 0;
                     traceEvent(TRACE_INFO, "Peer %s re-mapped after give-up, re-arming punch",
-                               PEER_ID(mac_tmp, pending));
+                               PEER_ID(mac_buf1, pending));
                 }
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
