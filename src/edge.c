@@ -68,8 +68,11 @@
 #define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
-#define PUNCH_RETRY_MAX                 3    /* retries (40s apart) before relay only */
+#define PUNCH_RETRY_MAX                 3    /* retries before relay only */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
+/* Experiment knobs, 0-point values: 40 and 0. Set STAGGER to 0 to restore 0-point. */
+#define PUNCH_RETRY_SECS                40   /* sec: wait after round exhaustion before a retry */
+#define PUNCH_RETRY_STAGGER             10   /* sec: per-peer retry offset, breaks two-end lockstep */
 
 /** maximum length of command line arguments */
 #define MAX_CMDLINE_BUFFER_LENGTH       4096
@@ -1769,7 +1772,10 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 scan = scan->next;
                 continue;
             }
-            if ( (now - scan->punch_reset_time) > 40 )
+            /* Experiment: offset the retry gap per peer so both ends stop retrying in lockstep. */
+            time_t retry_gap = PUNCH_RETRY_SECS +
+                               (time_t)( scan->mac_addr[N2N_MAC_SIZE - 1] % 4 ) * PUNCH_RETRY_STAGGER;
+            if ( (now - scan->punch_reset_time) > retry_gap )
             {
                 scan->punch_retry_count++;
                 if ( scan->punch_retry_count > PUNCH_RETRY_MAX ) {
