@@ -5538,12 +5538,21 @@ process_n2n_packet:
             /* Re-arm on a PUNCH: the SN only sends one while the far side is
              * punching, so it is the demand signal that keeps both ends in step.
              * A real address change starts a fresh budget; a same-address re-arm
-             * joins the running attempt and keeps the shared give-up count, and
-             * is refused once that count is spent (relay only until a change). */
+             * joins the running attempt and spends one unit of the same budget,
+             * so give-up stays phase independent instead of being deferred by
+             * every handoff the far side keeps sending. */
             int rearm_ok = ( !punch_running && !direct_alive &&
-                             pending->punch_retry_count <= PUNCH_RETRY_MAX );
+                             pending->punch_retry_count < PUNCH_RETRY_MAX );
             if ( addr_changed || rearm_ok )
             {
+                if ( !addr_changed )
+                {
+                    pending->punch_retry_count++;
+                    traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/%u)",
+                               PEER_ID(pending->mac_addr, pending),
+                               (unsigned)pending->punch_retry_count,
+                               (unsigned)PUNCH_RETRY_MAX);
+                }
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1],
                                         addr_changed ? 0 : 1 );
