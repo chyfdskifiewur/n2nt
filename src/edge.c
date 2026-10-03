@@ -66,7 +66,7 @@
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
 #define PUNCH_ROUNDS                    1    /* punch rounds before giving up */
 #define PUNCH_ROUND_INTERVAL            0    /* sec: time between punch rounds */
-#define PUNCH_RETRY_SECS                10   /* sec: wait after round exhaustion before a retry */
+#define PUNCH_RETRY_SECS                9    /* sec: wait after round exhaustion before a retry */
 #define PUNCH_RETRY_MAX                 30   /* retries before relay only */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
