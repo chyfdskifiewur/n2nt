@@ -272,8 +272,7 @@ struct peer_info {
     uint8_t             keepalive_fails;   /* consecutive keepalive failures */
     time_t              last_query_sent;   /* time last query_peer was sent, for rate-limiting */
     uint8_t             punch_retry_count; /* number of punch retries, remove after max */
-    n2n_sock_tpunch_gaveup_sock; /* peer address when the punch budget ran out; a PUNCH
-                                  * carrying a different one means it re-mapped, so re-arm */
+    n2n_sock_t          punch_gaveup_sock; /* peer address when the punch budget ran out */
     uint8_t             punch_round;       /* current 2s punch round (0-based), reset on start_punch */
     time_t              punch_round_time;  /* round anchor for the 2s punch cadence */
     time_t              direct_seen;       /* time of last direct P2P communication with this peer; 0=never */
