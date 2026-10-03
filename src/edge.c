@@ -5468,11 +5468,29 @@ process_n2n_packet:
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
 
+            /* Same-address handoff must NOT restart the punch cadence: that would
+             * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
+             * A peer with a healthy direct link never reaches here — it returned above.
+             * The round already punched at the address carried above; only a truly
+             * new address (or no cadence at all) starts a fresh punch. */
+            int addr_changed =
+                ( prev_sock.family  != pending->sock.family  ||
+                  sock_equal( &prev_sock,  &pending->sock  ) != 0 ) ||
+                ( prev_sock6.family != pending->sock6.family ||
+                  sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
+
+            /* Rounds exhausted: wait for the 40s retry timer in
+             * check_punch_timeouts. Re-arming here would clear punch_retry_count
+             * and punch_failed, so the attempt counter would never reach 2/3 and
+             * the peer would be punched forever. A new address still restarts,
+             * since that is a genuinely new situation. */
+            int in_retry_wait = ( pending->punch_failed && !addr_changed );
+
             /* This PEER_INFO answers the round registration we just sent: punch the
              * address it carries BEFORE storing it, so the round always uses the
              * address the sn just learned from the other edge, and the stored
              * address only ever reflects an address we punched at. */
-            if ( !direct_alive )
+            if ( !direct_alive && !in_retry_wait )
                 punch_round_at( eee, pending->mac_addr, &pi.sockets[0], &pi.sock6 );
 
             if (pi.sockets[0].family == AF_INET6) pending->sock6 = pi.sockets[0];
@@ -5496,25 +5514,15 @@ process_n2n_packet:
             }
             pending->last_seen = n2n_now();
 
-            int addr_changed =
-                ( prev_sock.family  != pending->sock.family  ||
-                  sock_equal( &prev_sock,  &pending->sock  ) != 0 ) ||
-                ( prev_sock6.family != pending->sock6.family ||
-                  sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
-
-            /* Same-address handoff must NOT restart the punch cadence: that would
-             * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
-             * A peer with a healthy direct link never reaches here — it returned above.
-             * The round already punched at the address carried above; only a truly
-             * new address (or no cadence at all) starts a fresh punch. */
-            if ( addr_changed || (!punch_running && !direct_alive) )
+            if ( !in_retry_wait && ( addr_changed || (!punch_running && !direct_alive) ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
             }
-            /* else: the punch cadence for this peer is already running. The
-             * round registration it sends every 2s brings the next address;
-             * this PEER_INFO already punched at the address it carried. */
+            /* else: the punch cadence for this peer is already running, or it is
+             * waiting out its retry delay. The round registration it sends every
+             * 2s brings the next address; this PEER_INFO already punched at the
+             * address it carried. */
 
             PEERS_UNLOCK(eee);
         }
