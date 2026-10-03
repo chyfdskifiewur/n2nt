@@ -1615,20 +1615,34 @@ static void send_probe_ack( n2n_edge_t * eee,
 
 static int is_empty_ip_address( const n2n_sock_t * sock );
 
-/** One punch round: PROBE+REGISTER back-to-back at the peer's latest known
- *  address (IPv6 only when both sides have a usable IPv6, else IPv4). */
-static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
+/** One punch round at the address the sn just handed us: PROBE+REGISTER
+ *  back-to-back (IPv6 only when both sides have a usable IPv6, else IPv4).
+ *  Called before the new address is stored, so a round always punches the
+ *  address the sn reported for it and never the previous one. */
+static void punch_round_at( n2n_edge_t * eee, const n2n_mac_t dstMac,
+                            const n2n_sock_t * v4, const n2n_sock_t * v6 )
 {
     int we_have_ipv6 = (eee->own_ipv6.family == AF_INET6);
-    int peer_has_ipv6 = (peer->sock6.family == AF_INET6 &&
-                         !is_empty_ip_address(&peer->sock6));
+    int peer_has_ipv6 = (v6->family == AF_INET6 && !is_empty_ip_address(v6));
     if ( we_have_ipv6 && peer_has_ipv6 ) {
-        send_probe(eee, &peer->sock6, peer->mac_addr);
-        send_register(eee, &peer->sock6);
-    } else if ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) {
-        send_probe(eee, &peer->sock, peer->mac_addr);
-        send_register(eee, &peer->sock);
+        send_probe(eee, v6, dstMac);
+        send_register(eee, v6);
+    } else if ( v4->family == AF_INET && eee->udp_sock != -1 ) {
+        send_probe(eee, v4, dstMac);
+        send_register(eee, v4);
     }
+}
+
+/** Open one 5x2s punch round: register with the punch-round flag (the sn hands
+ *  the peer's freshest address back only when both edges did) and ask for that
+ *  address. The punch itself is fired by the answering PEER_INFO, so every round
+ *  uses the newest address instead of the one the previous round left behind. */
+static void punch_round_start( n2n_edge_t * eee, const n2n_mac_t dstMac )
+{
+    eee->punch_round_reg = 1;
+    send_register_super(eee, &eee->supernode, 1, 0, NULL);
+    eee->sn_wait = 1;
+    send_query_peer(eee, dstMac);
 }
 
 /** Start hole-punch for a peer: arm the 5 rounds x 2s punch loop. */
@@ -1641,7 +1655,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
-    /* 5 rounds x 2s: punch, then re-register so the PUNCH handoff refreshes the address. */
+    /* 5 rounds x 2s: register first, then punch at the address the sn hands back. */
     int can_punch = ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) ||
                     ( peer->sock6.family == AF_INET6 &&
                       !is_empty_ip_address(&peer->sock6) &&
@@ -1653,11 +1667,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     peer->punch_round_time = peer->punch_start_time;
     traceEvent(TRACE_INFO, "rounds started for %s",
                macaddr_str(mac_tmp, peer->mac_addr));
-    punch_round(eee, peer); /* round-0: punch with the known address now */
-    eee->punch_round_reg = 1; /* round re-registration refreshes the handoff */
-    send_register_super(eee, &eee->supernode, 1, 0, NULL);
-    eee->sn_wait = 1;
-    send_query_peer(eee, peer->mac_addr);
+    punch_round_start(eee, peer->mac_addr); /* round-0: register first, punch on the sn's answer */
 }
 
 /** Drive the 5 rounds x 2s punch cadence; after a give-up retry every 40s. */
@@ -1717,7 +1727,8 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* Punch with the latest known address; a missing PUNCH handoff never blocks. */
+            /* Each round: register with the sn first, then punch at whatever address the
+             * answering PEER_INFO carries. A missing handoff never blocks. */
             if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
             {
                 if ( scan->punch_round >= PUNCH_ROUNDS - 1 )
@@ -1736,11 +1747,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     scan->punch_round_time = now;
                     traceEvent(TRACE_DEBUG, "round %u for %s",
                                (unsigned)scan->punch_round + 1, PEER_ID(mac_tmp, scan));
-                    punch_round(eee, scan);
-                    eee->punch_round_reg = 1;
-                    send_register_super(eee, &eee->supernode, 1, 0, NULL);
-                    eee->sn_wait = 1;
-                    send_query_peer(eee, scan->mac_addr);
+                    punch_round_start(eee, scan->mac_addr);
                 }
             }
         }
@@ -2118,8 +2125,27 @@ void try_send_register( n2n_edge_t * eee,
         }
         
         scan->last_seen = n2n_now();
-        scan->punch_start_time = 0;
-        scan->punch_failed = 0;
+        /* On first becoming operational via REGISTER_ACK: if there is already a
+         * punch in progress for this peer (we were told its address while
+         * requesting a round), do NOT interrupt the 5x2s cadence. Just mark
+         * that we have a direct path. If not punching, continue with the
+         * existing behaviour. */
+        if (scan->punch_start_time != 0 || scan->lan_punch_start != 0)
+        {
+            traceEvent(TRACE_INFO, "direct up while punch running for %s - leaving punch active",
+                       PEER_ID(mac_buf, scan));
+        }
+        else
+        {
+            scan->punch_start_time = 0;
+            scan->punch_failed = 0;
+            scan->punch_retry_count = 0;
+            scan->punch_reset_time = 0;
+            scan->punch_round = 0;
+            scan->punch_round_time = 0;
+            scan->lan_punch_start = 0;
+            scan->lan_punch_done = 1;
+        }
 
         strncpy(scan->version, n2n_sw_version, sizeof(scan->version) - 1);
         strncpy(scan->os_name, n2n_sw_osName, sizeof(scan->os_name) - 1);
@@ -2224,8 +2250,27 @@ void try_send_register_lan( n2n_edge_t * eee,
         scan->sockets[1]  = *local_sock;
         scan->lan_punch_start = n2n_now();
         scan->lan_punch_done  = 0;
-        scan->punch_start_time = 0;
-        scan->punch_failed = 0;
+        /* On first becoming operational via REGISTER_ACK: if there is already a
+         * punch in progress for this peer (we were told its address while
+         * requesting a round), do NOT interrupt the 5x2s cadence. Just mark
+         * that we have a direct path. If not punching, continue with the
+         * existing behaviour. */
+        if (scan->punch_start_time != 0 || scan->lan_punch_start != 0)
+        {
+            traceEvent(TRACE_INFO, "direct up while punch running for %s - leaving punch active",
+                       PEER_ID(mac_buf, scan));
+        }
+        else
+        {
+            scan->punch_start_time = 0;
+            scan->punch_failed = 0;
+            scan->punch_retry_count = 0;
+            scan->punch_reset_time = 0;
+            scan->punch_round = 0;
+            scan->punch_round_time = 0;
+            scan->lan_punch_start = 0;
+            scan->lan_punch_done = 1;
+        }
         
         /* Save temp_local_sock for LAN punch retransmissions */
         if (found) {
@@ -5454,6 +5499,20 @@ process_n2n_packet:
             n2n_sock_t prev_sock  = pending->sock;
             n2n_sock_t prev_sock6 = pending->sock6;
 
+            /* A direct link that is still alive needs no punch, and a peer we are not
+             * punching yet gets one from restart_punch_for_peer below. */
+            int direct_alive = ( pending->direct_seen != 0 &&
+                                 ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
+            int punch_running = ( pending->punch_start_time != 0 ||
+                                  pending->lan_punch_start != 0 );
+
+            /* This PEER_INFO answers the round registration we just sent: punch the
+             * address it carries BEFORE storing it, so the round always uses the
+             * address the sn just learned from the other edge, and the stored
+             * address only ever reflects an address we punched at. */
+            if ( !direct_alive )
+                punch_round_at( eee, pending->mac_addr, &pi.sockets[0], &pi.sock6 );
+
             if (pi.sockets[0].family == AF_INET6) pending->sock6 = pi.sockets[0];
             else pending->sock = pi.sockets[0];
             pending->sockets[0] = pi.sockets[0];
@@ -5481,19 +5540,19 @@ process_n2n_packet:
                 ( prev_sock6.family != pending->sock6.family ||
                   sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
 
-            /* Same-address handoff must NOT restart the punch: that would
+            /* Same-address handoff must NOT restart the punch cadence: that would
              * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
-             * A peer with a healthy direct link never reaches here — it returned above. */
-            int direct_alive = ( pending->direct_seen != 0 &&
-                                 ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
-            int punch_running = ( pending->punch_start_time != 0 ||
-                                  pending->lan_punch_start != 0 );
-            if ( addr_changed ||
-                 ( !punch_running && !direct_alive ) )
+             * A peer with a healthy direct link never reaches here — it returned above.
+             * The round already punched at the address carried above; only a truly
+             * new address (or no cadence at all) starts a fresh punch. */
+            if ( addr_changed || (!punch_running && !direct_alive) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
             }
+            /* else: the punch cadence for this peer is already running. The
+             * round registration it sends every 2s brings the next address;
+             * this PEER_INFO already punched at the address it carried. */
 
             PEERS_UNLOCK(eee);
         }
