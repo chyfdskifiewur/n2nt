@@ -64,12 +64,12 @@
 #define REGISTER_SUPER_INTERVAL_MAX     120  /* sec */
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
-#define PUNCH_ROUNDS                    5    /* punch rounds before giving up */
-#define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
+#define PUNCH_ROUNDS                    1    /* punch rounds before giving up */
+#define PUNCH_ROUND_INTERVAL            10   /* sec: time between punch rounds */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
-#define PUNCH_RETRY_MAX                 10   /* retries before relay only */
-#define PUNCH_RETRY_SECS                40   /* sec: wait after round exhaustion before a retry */
+#define PUNCH_RETRY_MAX                 5    /* retries before relay only */
+#define PUNCH_RETRY_SECS                10   /* sec: wait after round exhaustion before a retry */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -1632,7 +1632,7 @@ static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
     }
 }
 
-/** Start hole-punch for a peer: arm the 5 rounds x 2s punch loop. */
+/** Start hole-punch for a peer: arm the PUNCH_ROUNDS x PUNCH_ROUND_INTERVAL punch loop. */
 static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
 {
     MACSTR_TMP(mac_tmp);
@@ -1642,7 +1642,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
-    /* 5 rounds x 2s: register, then punch on the sn handoff at the latest address. */
+    /* Punch rounds: register, then punch on the sn handoff at the latest address. */
     int can_punch = ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) ||
                     ( peer->sock6.family == AF_INET6 &&
                       !is_empty_ip_address(&peer->sock6) &&
@@ -1665,7 +1665,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     send_query_peer(eee, peer->mac_addr);
 }
 
-/** Drive the 5 rounds x 2s punch cadence; after a give-up retry every 40s. */
+/** Drive the punch cadence; after a give-up retry every PUNCH_RETRY_SECS. */
 static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 {
     struct peer_info * scan = eee->pending_peers;
@@ -4617,7 +4617,8 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
 
     pending->punch_failed = 0;
     pending->punch_start_time = 0;
-    pending->punch_retry_count = 0;
+    /* Retry budget is deliberately kept: address flapping must not restart the
+     * whole chain, otherwise PUNCH_RETRY_MAX is never reached. */
     pending->punch_reset_time = 0;
     pending->punch_round = 0;
     pending->punch_round_time = 0;
