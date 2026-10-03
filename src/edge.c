@@ -1653,10 +1653,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     peer->punch_round_time = peer->punch_start_time;
     traceEvent(TRACE_INFO, "rounds started for %s",
                macaddr_str(mac_tmp, peer->mac_addr));
-    /* Strict sn-sequenced order: register (carrying PUNCH_ROUND) + query only.
-     * The sn releases the handoff once both sides re-registered, so the first
-     * punch is emitted by check_punch_timeouts against that fresh address —
-     * no round-0 punch on the stale pre-query address. */
+    punch_round(eee, peer); /* round-0: punch with the known address now */
     eee->punch_round_reg = 1; /* round re-registration refreshes the handoff */
     send_register_super(eee, &eee->supernode, 1, 0, NULL);
     eee->sn_wait = 1;
@@ -1739,10 +1736,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     scan->punch_round_time = now;
                     traceEvent(TRACE_DEBUG, "round %u for %s",
                                (unsigned)scan->punch_round + 1, PEER_ID(mac_tmp, scan));
-                    /* The round only re-registers and re-queries, so the sn collects both
-                     * sides and hands off the peer's freshest address. punch_round() fires
-                     * from handle_PEER_INFO when that PUNCH arrives, so every round punches
-                     * the address learned this round instead of the previous round's. */
+                    punch_round(eee, scan);
                     eee->punch_round_reg = 1;
                     send_register_super(eee, &eee->supernode, 1, 0, NULL);
                     eee->sn_wait = 1;
@@ -1778,10 +1772,6 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
                                PEER_ID(mac_tmp, scan),
                                (unsigned)PUNCH_RETRY_MAX);
-                    /* Remember the address we gave up on: a later PUNCH carrying a
-                     * different one means the peer re-mapped (e.g. it restarted), so
-                     * the budget must be refunded and the punch re-armed. */
-                    scan->punch_gaveup_sock = scan->sock;
                     prev = scan;
                     scan = scan->next;
                     continue;
@@ -2130,9 +2120,7 @@ void try_send_register( n2n_edge_t * eee,
         scan->last_seen = n2n_now();
         scan->punch_start_time = 0;
         scan->punch_failed = 0;
-        /* P2P is up: the punch budget is spent, restore it for any future re-punch. */
-        scan->punch_retry_count = 0;
-        memset(&scan->punch_gaveup_sock, 0, sizeof(n2n_sock_t));
+
         strncpy(scan->version, n2n_sw_version, sizeof(scan->version) - 1);
         strncpy(scan->os_name, n2n_sw_osName, sizeof(scan->os_name) - 1);
 
@@ -2316,9 +2304,6 @@ void set_peer_operational( n2n_edge_t * eee,
         scan->p2p_est_time = scan->direct_seen;
         scan->punch_start_time = 0;
         scan->punch_failed = 0;
-        /* P2P is up: the punch budget is spent, restore it for any future re-punch. */
-        scan->punch_retry_count = 0;
-        memset(&scan->punch_gaveup_sock, 0, sizeof(n2n_sock_t));
 
         if (memcmp(scan->mac_addr, eee->last_p2p_log_mac, N2N_MAC_SIZE) ||
             memcmp(peer, &eee->last_p2p_log_addr, sizeof(n2n_sock_t))) {
@@ -4627,8 +4612,7 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
 
     pending->punch_failed = 0;
     pending->punch_start_time = 0;
-    /* Keep punch_retry_count across restart_punch_for_peer: only reset on
-     * successful P2P establishment or explicit retry timeout re-arm. */
+    pending->punch_retry_count = 0;
     pending->punch_reset_time = 0;
     pending->punch_round = 0;
     pending->punch_round_time = 0;
@@ -5504,42 +5488,11 @@ process_n2n_packet:
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
-            /* Given up on this peer, yet the sn hands a different address than the one we
-             * gave up on: the peer re-mapped (restart / new NAT binding), so the
-             * exhausted budget must be refunded and the punch re-armed. */
-            int remapped_after_giveup =
-                ( pending->punch_failed &&
-                  pending->punch_retry_count > PUNCH_RETRY_MAX &&
-                  pending->punch_gaveup_sock.family != 0 &&
-                  ( pending->punch_gaveup_sock.family != pending->sock.family ||
-                    sock_equal( &pending->punch_gaveup_sock, &pending->sock ) != 0 ) );
             if ( addr_changed ||
-                 ( !punch_running && !direct_alive && !pending->punch_failed ) ||
-                 remapped_after_giveup )
+                 ( !punch_running && !direct_alive ) )
             {
-                if ( remapped_after_giveup )
-                {
-                    pending->punch_retry_count = 0;
-                    pending->punch_failed = 0;
-                    traceEvent(TRACE_INFO, "Peer %s re-mapped after give-up, re-arming punch",
-                               PEER_ID(mac_buf1, pending));
-                }
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
-                /* Round 0 punch on the address this PUNCH just delivered: restart_punch_for_peer
-                 * only re-arms the round loop (register + query), and the first PROBE would
-                 * otherwise wait a full PUNCH_ROUND_INTERVAL for the next handoff. */
-                if ( !direct_alive && pending->punch_start_time != 0 )
-                {
-                    punch_round(eee, pending);
-                }
-            }
-            else if ( punch_running && !direct_alive )
-            {
-                /* Same-address per-round handoff: re-arm nothing, but punch the address
-                 * the sn just handed us. This is the round's punch, so it must use
-                 * pending->sock as refreshed above — never the previous round's. */
-                punch_round(eee, pending);
             }
 
             PEERS_UNLOCK(eee);
