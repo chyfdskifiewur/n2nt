@@ -1653,7 +1653,10 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     peer->punch_round_time = peer->punch_start_time;
     traceEvent(TRACE_INFO, "rounds started for %s",
                macaddr_str(mac_tmp, peer->mac_addr));
-    punch_round(eee, peer); /* round-0: punch with the known address now */
+    /* Strict sn-sequenced order: register (carrying PUNCH_ROUND) + query only.
+     * The sn releases the handoff once both sides re-registered, so the first
+     * punch is emitted by check_punch_timeouts against that fresh address —
+     * no round-0 punch on the stale pre-query address. */
     eee->punch_round_reg = 1; /* round re-registration refreshes the handoff */
     send_register_super(eee, &eee->supernode, 1, 0, NULL);
     eee->sn_wait = 1;
