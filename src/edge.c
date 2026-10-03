@@ -69,7 +69,6 @@
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define PUNCH_RETRY_MAX                 3    /* retries (40s apart) before relay only */
-#define PUNCH_REVIVE_COOLDOWN_SECS      30   /* sec: a given-up peer may rejoin an active punch */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -5254,6 +5253,15 @@ process_n2n_packet:
                             eee->cached_dst_valid = 0;
                         }
                     }
+                    /* Last SN-advertised socket: relayed frames rewrite sock in place,
+                     * which would otherwise hide a real change from the checks above. */
+                    if (!addr_changed && pi.sockets[0].family == AF_INET) {
+                        if (known->sockets[0].family != pi.sockets[0].family ||
+                            sock_equal(&known->sockets[0], &pi.sockets[0]) != 0) {
+                            addr_changed = 1;
+                            eee->cached_dst_valid = 0;
+                        }
+                    }
                     if (addr_changed && known->direct_seen != 0 &&
                         (now - known->direct_seen) < PUNCH_DIRECT_ALIVE_SECS) {
                         traceEvent(TRACE_DEBUG, "P2P already direct for %s, ignoring address change from SN",
@@ -5310,6 +5318,15 @@ process_n2n_packet:
                         if (!addr_changed && pi.sock6.family == AF_INET6) {
                             if (pending->sock6.family != AF_INET6 ||
                                 sock_equal(&pending->sock6, &pi.sock6) != 0) {
+                                addr_changed = 1;
+                                eee->cached_dst_valid = 0;
+                            }
+                        }
+                        /* Last SN-advertised socket: relayed frames rewrite sock in
+                         * place, which would otherwise hide a real change here. */
+                        if (!addr_changed && pi.sockets[0].family == AF_INET) {
+                            if (pending->sockets[0].family != pi.sockets[0].family ||
+                                sock_equal(&pending->sockets[0], &pi.sockets[0]) != 0) {
                                 addr_changed = 1;
                                 eee->cached_dst_valid = 0;
                             }
@@ -5462,9 +5479,12 @@ process_n2n_packet:
             }
 
             /* Snapshot pre-refresh addresses: a genuinely new PUNCH address restarts
-             * the punch; a same-address per-round handoff must not. */
+             * the punch; a same-address per-round handoff must not. prev_pub is the
+             * last SN-advertised socket: relayed frames rewrite sock in place, which
+             * would otherwise hide a real change from the sock/sock6 comparison. */
             n2n_sock_t prev_sock  = pending->sock;
             n2n_sock_t prev_sock6 = pending->sock6;
+            n2n_sock_t prev_pub   = pending->sockets[0];
 
             if (pi.sockets[0].family == AF_INET6) pending->sock6 = pi.sockets[0];
             else pending->sock = pi.sockets[0];
@@ -5491,18 +5511,18 @@ process_n2n_packet:
                 ( prev_sock.family  != pending->sock.family  ||
                   sock_equal( &prev_sock,  &pending->sock  ) != 0 ) ||
                 ( prev_sock6.family != pending->sock6.family ||
-                  sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
+                  sock_equal( &prev_sock6, &pending->sock6 ) != 0 ) ||
+                ( prev_pub.family   != pending->sockets[0].family ||
+                  sock_equal( &prev_pub, &pending->sockets[0] ) != 0 );
 
             int direct_alive = ( pending->direct_seen != 0 &&
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
-            /* A given-up peer rejoins when the far end is still punching, but only
-             * after a cooldown so two exhausted peers cannot re-arm each other. */
-            int revive = ( !pending->punch_failed ||
-                           ( n2n_now() - pending->punch_reset_time ) >= PUNCH_REVIVE_COOLDOWN_SECS );
+            /* A same-address handoff never revives a peer that used up its punch
+             * retries; only a real address change starts a fresh punch. */
             if ( addr_changed ||
-                 ( !punch_running && !direct_alive && revive ) )
+                 ( !punch_running && !direct_alive && !pending->punch_failed ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
