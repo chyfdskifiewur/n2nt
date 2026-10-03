@@ -2125,27 +2125,8 @@ void try_send_register( n2n_edge_t * eee,
         }
         
         scan->last_seen = n2n_now();
-        /* On first becoming operational via REGISTER_ACK: if there is already a
-         * punch in progress for this peer (we were told its address while
-         * requesting a round), do NOT interrupt the 5x2s cadence. Just mark
-         * that we have a direct path. If not punching, continue with the
-         * existing behaviour. */
-        if (scan->punch_start_time != 0 || scan->lan_punch_start != 0)
-        {
-            traceEvent(TRACE_INFO, "direct up while punch running for %s - leaving punch active",
-                       PEER_ID(mac_buf, scan));
-        }
-        else
-        {
-            scan->punch_start_time = 0;
-            scan->punch_failed = 0;
-            scan->punch_retry_count = 0;
-            scan->punch_reset_time = 0;
-            scan->punch_round = 0;
-            scan->punch_round_time = 0;
-            scan->lan_punch_start = 0;
-            scan->lan_punch_done = 1;
-        }
+        scan->punch_start_time = 0;
+        scan->punch_failed = 0;
 
         strncpy(scan->version, n2n_sw_version, sizeof(scan->version) - 1);
         strncpy(scan->os_name, n2n_sw_osName, sizeof(scan->os_name) - 1);
@@ -2250,27 +2231,8 @@ void try_send_register_lan( n2n_edge_t * eee,
         scan->sockets[1]  = *local_sock;
         scan->lan_punch_start = n2n_now();
         scan->lan_punch_done  = 0;
-        /* On first becoming operational via REGISTER_ACK: if there is already a
-         * punch in progress for this peer (we were told its address while
-         * requesting a round), do NOT interrupt the 5x2s cadence. Just mark
-         * that we have a direct path. If not punching, continue with the
-         * existing behaviour. */
-        if (scan->punch_start_time != 0 || scan->lan_punch_start != 0)
-        {
-            traceEvent(TRACE_INFO, "direct up while punch running for %s - leaving punch active",
-                       PEER_ID(mac_buf, scan));
-        }
-        else
-        {
-            scan->punch_start_time = 0;
-            scan->punch_failed = 0;
-            scan->punch_retry_count = 0;
-            scan->punch_reset_time = 0;
-            scan->punch_round = 0;
-            scan->punch_round_time = 0;
-            scan->lan_punch_start = 0;
-            scan->lan_punch_done = 1;
-        }
+        scan->punch_start_time = 0;
+        scan->punch_failed = 0;
         
         /* Save temp_local_sock for LAN punch retransmissions */
         if (found) {
