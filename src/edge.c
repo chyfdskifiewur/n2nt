@@ -5499,6 +5499,13 @@ process_n2n_packet:
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
+                /* Round 0 punch on the address this PUNCH just delivered: restart_punch_for_peer
+                 * only re-arms the round loop (register + query), and the first PROBE would
+                 * otherwise wait a full PUNCH_ROUND_INTERVAL for the next handoff. */
+                if ( !direct_alive && pending->punch_start_time != 0 )
+                {
+                    punch_round(eee, pending);
+                }
             }
             else if ( punch_running && !direct_alive )
             {
