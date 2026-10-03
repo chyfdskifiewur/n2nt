@@ -4617,7 +4617,8 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
 
     pending->punch_failed = 0;
     pending->punch_start_time = 0;
-    pending->punch_retry_count = 0;
+    /* Retry budget is deliberately kept: address flapping must not restart the
+     * whole chain, otherwise PUNCH_RETRY_MAX is never reached. */
     pending->punch_reset_time = 0;
     pending->punch_round = 0;
     pending->punch_round_time = 0;
