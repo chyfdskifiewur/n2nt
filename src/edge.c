@@ -1641,19 +1641,19 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
+    /* 5 rounds x 2s: punch, then re-register so the PUNCH handoff refreshes the address. */
     int can_punch = ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) ||
                     ( peer->sock6.family == AF_INET6 &&
                       !is_empty_ip_address(&peer->sock6) &&
                       eee->own_ipv6.family == AF_INET6 );
     if ( !can_punch ) return;   /* no usable route to punch */
 
-    /* Register first; the punch follows the SN handoff carrying the peer's address. */
     peer->punch_start_time = n2n_now();
     peer->punch_round = 0;
-    peer->punch_waiting = 1;
     peer->punch_round_time = peer->punch_start_time;
     traceEvent(TRACE_INFO, "rounds started for %s",
                macaddr_str(mac_tmp, peer->mac_addr));
+    punch_round(eee, peer); /* round-0: punch with the known address now */
     eee->punch_round_reg = 1; /* round re-registration refreshes the handoff */
     send_register_super(eee, &eee->supernode, 1, 0, NULL);
     eee->sn_wait = 1;
@@ -1678,7 +1678,6 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                            PEER_ID(mac_tmp, scan));
             scan->punch_start_time = 0;
             scan->punch_round = 0;
-            scan->punch_waiting = 0;
             scan->punch_round_time = 0;
             scan->lan_punch_start = 0;
             scan->lan_punch_done = 1;
@@ -1718,24 +1717,14 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* Each round registers first and punches on the SN handoff; a handoff
-             * that never lands falls back to the known address here. */
+            /* Punch with the latest known address; a missing PUNCH handoff never blocks. */
             if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
             {
-                if ( scan->punch_waiting )
-                {
-                    punch_round(eee, scan);
-                    scan->punch_round++;
-                    scan->punch_waiting = 0;
-                    traceEvent(TRACE_DEBUG, "round %u (no handoff) for %s",
-                               (unsigned)scan->punch_round, PEER_ID(mac_tmp, scan));
-                }
-
-                if ( scan->punch_round >= PUNCH_ROUNDS )
+                if ( scan->punch_round >= PUNCH_ROUNDS - 1 )
                 {
                     scan->punch_failed = 1;
                     scan->punch_reset_time = now;
-                    /* Leave the running state; only a later address change re-arms us. */
+                    /* Leave the running state so an incoming PUNCH can re-arm us. */
                     scan->punch_start_time = 0;
                     scan->lan_punch_start = 0;
                     traceEvent(TRACE_INFO, "rounds exhausted for %s",
@@ -1743,14 +1732,16 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 }
                 else
                 {
-                    /* Start the round: register first, punch on the handoff. */
+                    scan->punch_round++;
+                    scan->punch_round_time = now;
+                    traceEvent(TRACE_DEBUG, "round %u for %s",
+                               (unsigned)scan->punch_round + 1, PEER_ID(mac_tmp, scan));
+                    punch_round(eee, scan);
                     eee->punch_round_reg = 1;
                     send_register_super(eee, &eee->supernode, 1, 0, NULL);
                     eee->sn_wait = 1;
                     send_query_peer(eee, scan->mac_addr);
-                    scan->punch_waiting = 1;
                 }
-                scan->punch_round_time = now;
             }
         }
         else if ( scan->punch_start_time == 0 && !scan->punch_failed &&
@@ -1786,6 +1777,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     continue;
                 }
                 scan->punch_failed = 0;
+                scan->lan_punch_done = 0;
                 traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/%u)",
                            PEER_ID(mac_tmp, scan),
                            (unsigned)scan->punch_retry_count,
@@ -1933,7 +1925,6 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                     scan->punch_failed       = 0;
                     scan->punch_retry_count  = 0;
                     scan->punch_reset_time   = 0;
-                    scan->punch_waiting      = 0;
                     scan->lan_punch_start    = 0;
                     scan->lan_punch_done     = 0;
                     scan->keepalive_fails    = 0;
@@ -2158,7 +2149,6 @@ void try_send_register( n2n_edge_t * eee,
             scan->punch_failed = 0;
             scan->punch_retry_count = 0;
             scan->punch_reset_time = 0;
-            scan->punch_waiting = 0;
             scan->lan_punch_start = 0;
             scan->lan_punch_done = 0;
             send_register(eee, peer);
@@ -4610,28 +4600,21 @@ static void try_peer_lan_ipv4( n2n_edge_t * eee,
 
 /** Stop any running punch and start a brand-new complete punch against a
  *  peer's freshly-learned address. LAN-first via try_peer_lan_ipv4; WAN punch
- *  follows on LAN timeout. No-op in WS mode. Must be called with PEERS_LOCK held.
- *  keep_retry_budget: a same-address re-arm joins the running attempt and must
- *  not refund the give-up count, else two peers renew each other forever. */
+ *  follows on LAN timeout. No-op in WS mode. Must be called with PEERS_LOCK held. */
 static void restart_punch_for_peer( n2n_edge_t * eee,
                                     struct peer_info * pending,
                                     uint16_t aflags,
                                     const n2n_sock_t * pub_sock,
-                                    const n2n_sock_t * lan_sock,
-                                    int keep_retry_budget )
+                                    const n2n_sock_t * lan_sock )
 {
     if ( eee->use_ws )
         return;
 
-    if ( !keep_retry_budget )
-    {
-        pending->punch_retry_count = 0;
-        pending->punch_reset_time = 0;
-    }
     pending->punch_failed = 0;
     pending->punch_start_time = 0;
+    pending->punch_retry_count = 0;
+    pending->punch_reset_time = 0;
     pending->punch_round = 0;
-    pending->punch_waiting = 0;
     pending->punch_round_time = 0;
     pending->lan_punch_start = 0;
     pending->lan_punch_done = 0;
@@ -5259,15 +5242,6 @@ process_n2n_packet:
                             eee->cached_dst_valid = 0;
                         }
                     }
-                    /* Last SN-advertised socket: relayed frames rewrite sock in place,
-                     * which would otherwise hide a real change from the checks above. */
-                    if (!addr_changed && pi.sockets[0].family == AF_INET) {
-                        if (known->sockets[0].family != pi.sockets[0].family ||
-                            sock_equal(&known->sockets[0], &pi.sockets[0]) != 0) {
-                            addr_changed = 1;
-                            eee->cached_dst_valid = 0;
-                        }
-                    }
                     if (addr_changed && known->direct_seen != 0 &&
                         (now - known->direct_seen) < PUNCH_DIRECT_ALIVE_SECS) {
                         traceEvent(TRACE_DEBUG, "P2P already direct for %s, ignoring address change from SN",
@@ -5328,15 +5302,6 @@ process_n2n_packet:
                                 eee->cached_dst_valid = 0;
                             }
                         }
-                        /* Last SN-advertised socket: relayed frames rewrite sock in
-                         * place, which would otherwise hide a real change here. */
-                        if (!addr_changed && pi.sockets[0].family == AF_INET) {
-                            if (pending->sockets[0].family != pi.sockets[0].family ||
-                                sock_equal(&pending->sockets[0], &pi.sockets[0]) != 0) {
-                                addr_changed = 1;
-                                eee->cached_dst_valid = 0;
-                            }
-                        }
                     }
                     if (pi.sockets[0].family == AF_INET) {
                         pending->sock = pi.sockets[0];
@@ -5359,7 +5324,7 @@ process_n2n_packet:
                     /* SN metadata is not peer communication; refreshing last_seen here would false-arm the punch gate. */
                     if (addr_changed && was_communicating)
                         restart_punch_for_peer(eee, pending, pi.aflags,
-                                               &pi.sockets[0], &pi.sockets[1], 0);
+                                               &pi.sockets[0], &pi.sockets[1]);
                     PEERS_UNLOCK(eee);
                     if (eee->enable_gaming_mode && pi.assigned_ip != 0) {
                         uint8_t probe[42];
@@ -5485,12 +5450,9 @@ process_n2n_packet:
             }
 
             /* Snapshot pre-refresh addresses: a genuinely new PUNCH address restarts
-             * the punch; a same-address per-round handoff must not. prev_pub is the
-             * last SN-advertised socket: relayed frames rewrite sock in place, which
-             * would otherwise hide a real change from the sock/sock6 comparison. */
+             * the punch; a same-address per-round handoff must not. */
             n2n_sock_t prev_sock  = pending->sock;
             n2n_sock_t prev_sock6 = pending->sock6;
-            n2n_sock_t prev_pub   = pending->sockets[0];
 
             if (pi.sockets[0].family == AF_INET6) pending->sock6 = pi.sockets[0];
             else pending->sock = pi.sockets[0];
@@ -5517,45 +5479,20 @@ process_n2n_packet:
                 ( prev_sock.family  != pending->sock.family  ||
                   sock_equal( &prev_sock,  &pending->sock  ) != 0 ) ||
                 ( prev_sock6.family != pending->sock6.family ||
-                  sock_equal( &prev_sock6, &pending->sock6 ) != 0 ) ||
-                ( prev_pub.family   != pending->sockets[0].family ||
-                  sock_equal( &prev_pub, &pending->sockets[0] ) != 0 );
+                  sock_equal( &prev_sock6, &pending->sock6 ) != 0 );
 
+            /* Same-address handoff must NOT restart the punch: that would
+             * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
+             * A peer with a healthy direct link never reaches here — it returned above. */
             int direct_alive = ( pending->direct_seen != 0 &&
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
             int punch_running = ( pending->punch_start_time != 0 ||
                                   pending->lan_punch_start != 0 );
-            /* Punch only on the handoff that answers our registration. The frame
-             * that merely starts a round (punch_start_time == 0) is consumed by
-             * the registration below instead, so the punch never precedes it. */
-            if ( pending->punch_start_time != 0 && pending->punch_waiting )
+            if ( addr_changed ||
+                 ( !punch_running && !direct_alive ) )
             {
-                punch_round( eee, pending );
-                pending->punch_round++;
-                pending->punch_waiting = 0;
-            }
-
-            /* Re-arm on a PUNCH: the SN only sends one while the far side is
-             * punching, so it is the demand signal that keeps both ends in step.
-             * A real address change starts a fresh budget; a same-address re-arm
-             * joins the running attempt and spends one unit of the same budget,
-             * so give-up stays phase independent instead of being deferred by
-             * every handoff the far side keeps sending. */
-            int rearm_ok = ( !punch_running && !direct_alive &&
-                             pending->punch_retry_count < PUNCH_RETRY_MAX );
-            if ( addr_changed || rearm_ok )
-            {
-                if ( !addr_changed )
-                {
-                    pending->punch_retry_count++;
-                    traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/%u)",
-                               PEER_ID(pending->mac_addr, pending),
-                               (unsigned)pending->punch_retry_count,
-                               (unsigned)PUNCH_RETRY_MAX);
-                }
                 restart_punch_for_peer( eee, pending, pi.aflags,
-                                        &pi.sockets[0], &pi.sockets[1],
-                                        addr_changed ? 0 : 1 );
+                                        &pi.sockets[0], &pi.sockets[1] );
             }
 
             PEERS_UNLOCK(eee);
