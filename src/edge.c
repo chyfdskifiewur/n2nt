@@ -1632,7 +1632,7 @@ static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
     }
 }
 
-/** Start hole-punch for a peer: arm the 5 rounds x 2s punch loop. */
+/** Start hole-punch for a peer: arm the PUNCH_ROUNDS x PUNCH_ROUND_INTERVAL punch loop. */
 static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
 {
     MACSTR_TMP(mac_tmp);
@@ -1642,7 +1642,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
-    /* 5 rounds x 2s: register, then punch on the sn handoff at the latest address. */
+    /* Punch rounds: register, then punch on the sn handoff at the latest address. */
     int can_punch = ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) ||
                     ( peer->sock6.family == AF_INET6 &&
                       !is_empty_ip_address(&peer->sock6) &&
@@ -1665,7 +1665,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     send_query_peer(eee, peer->mac_addr);
 }
 
-/** Drive the 5 rounds x 2s punch cadence; after a give-up retry every 40s. */
+/** Drive the punch cadence; after a give-up retry every PUNCH_RETRY_SECS. */
 static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 {
     struct peer_info * scan = eee->pending_peers;
