@@ -2763,7 +2763,12 @@ static void push_nat_to_community( n2n_sn_t *sss,
                                 (now - changed->last_fwd_time) < SN_FWD_PUNCH_ACTIVE_SECS &&
                                 memcmp(changed->last_fwd_mac, p->mac_addr, N2N_MAC_SIZE) == 0)) );
         if ( communicating )
+        {
+            /* Fresh address to the counterpart, and a PUNCH back to the changed edge
+             * so both sides restart the punch from scratch. */
             sn_send_punch_info( sss, community, p, changed );
+            sn_send_punch_info( sss, community, changed, p );
+        }
     }
     /* Then the plain PEER_INFO (no PUNCH) to everyone else, so they just
      * refresh their local info without starting a punch. */
@@ -3613,6 +3618,7 @@ static int process_udp( n2n_sn_t * sss,
             {
                 struct peer_info *sender_edge = find_peer_by_mac(sss->edges, pkt.srcMac);
                 if (sender_edge) {
+                    int addr_changed = 0;
                     sender_edge->transform_id = pkt.transform;
                     if (sender_sock->sa_family == AF_INET && sender_edge->sock.family == AF_INET) {
                         struct sockaddr_in *si = (struct sockaddr_in *)sender_sock;
@@ -3621,6 +3627,7 @@ static int process_udp( n2n_sn_t * sss,
                             sender_edge->sock.port = ntohs(si->sin_port);
                             memcpy(sender_edge->sock.addr.v4, &si->sin_addr, IPV4_SIZE);
                             sender_edge->last_seen = now;
+                            addr_changed = 1;
                             traceEvent(TRACE_DEBUG, "Edge %s addr updated from PACKET",
                                        macaddr_str(mac_buf, pkt.srcMac));
                         }
@@ -3631,10 +3638,14 @@ static int process_udp( n2n_sn_t * sss,
                             sender_edge->sock6.port = ntohs(si6->sin6_port);
                             memcpy(sender_edge->sock6.addr.v6, &si6->sin6_addr, IPV6_SIZE);
                             sender_edge->last_seen = now;
+                            addr_changed = 1;
                             traceEvent(TRACE_DEBUG, "Edge %s addr updated from PACKET",
                                        macaddr_str(mac_buf, pkt.srcMac));
                         }
                     }
+                    /* Relayed traffic just revealed the new endpoint: punch the pair at once. */
+                    if (addr_changed && unicast)
+                        push_nat_to_community(sss, sender_edge, cmn.community, 1);
                 }
             }
         }
