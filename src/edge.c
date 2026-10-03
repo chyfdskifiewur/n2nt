@@ -1739,7 +1739,10 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                     scan->punch_round_time = now;
                     traceEvent(TRACE_DEBUG, "round %u for %s",
                                (unsigned)scan->punch_round + 1, PEER_ID(mac_tmp, scan));
-                    punch_round(eee, scan);
+                    /* The round only re-registers and re-queries, so the sn collects both
+                     * sides and hands off the peer's freshest address. punch_round() fires
+                     * from handle_PEER_INFO when that PUNCH arrives, so every round punches
+                     * the address learned this round instead of the previous round's. */
                     eee->punch_round_reg = 1;
                     send_register_super(eee, &eee->supernode, 1, 0, NULL);
                     eee->sn_wait = 1;
@@ -5496,6 +5499,13 @@ process_n2n_packet:
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
+            }
+            else if ( punch_running && !direct_alive )
+            {
+                /* Same-address per-round handoff: re-arm nothing, but punch the address
+                 * the sn just handed us. This is the round's punch, so it must use
+                 * pending->sock as refreshed above — never the previous round's. */
+                punch_round(eee, pending);
             }
 
             PEERS_UNLOCK(eee);
