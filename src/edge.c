@@ -4610,20 +4610,26 @@ static void try_peer_lan_ipv4( n2n_edge_t * eee,
 
 /** Stop any running punch and start a brand-new complete punch against a
  *  peer's freshly-learned address. LAN-first via try_peer_lan_ipv4; WAN punch
- *  follows on LAN timeout. No-op in WS mode. Must be called with PEERS_LOCK held. */
+ *  follows on LAN timeout. No-op in WS mode. Must be called with PEERS_LOCK held.
+ *  keep_retry_budget: a same-address re-arm joins the running attempt and must
+ *  not refund the give-up count, else two peers renew each other forever. */
 static void restart_punch_for_peer( n2n_edge_t * eee,
                                     struct peer_info * pending,
                                     uint16_t aflags,
                                     const n2n_sock_t * pub_sock,
-                                    const n2n_sock_t * lan_sock )
+                                    const n2n_sock_t * lan_sock,
+                                    int keep_retry_budget )
 {
     if ( eee->use_ws )
         return;
 
+    if ( !keep_retry_budget )
+    {
+        pending->punch_retry_count = 0;
+        pending->punch_reset_time = 0;
+    }
     pending->punch_failed = 0;
     pending->punch_start_time = 0;
-    pending->punch_retry_count = 0;
-    pending->punch_reset_time = 0;
     pending->punch_round = 0;
     pending->punch_waiting = 0;
     pending->punch_round_time = 0;
@@ -5353,7 +5359,7 @@ process_n2n_packet:
                     /* SN metadata is not peer communication; refreshing last_seen here would false-arm the punch gate. */
                     if (addr_changed && was_communicating)
                         restart_punch_for_peer(eee, pending, pi.aflags,
-                                               &pi.sockets[0], &pi.sockets[1]);
+                                               &pi.sockets[0], &pi.sockets[1], 0);
                     PEERS_UNLOCK(eee);
                     if (eee->enable_gaming_mode && pi.assigned_ip != 0) {
                         uint8_t probe[42];
@@ -5529,14 +5535,18 @@ process_n2n_packet:
                 pending->punch_waiting = 0;
             }
 
-            /* An idle peer re-arms on a PUNCH: the SN only sends one while the
-             * far side is actually punching (throttled pushes), so this is the
-             * demand signal that keeps both ends punching together. */
-            if ( addr_changed ||
-                 ( !punch_running && !direct_alive ) )
+            /* Re-arm on a PUNCH: the SN only sends one while the far side is
+             * punching, so it is the demand signal that keeps both ends in step.
+             * A real address change starts a fresh budget; a same-address re-arm
+             * joins the running attempt and keeps the shared give-up count, and
+             * is refused once that count is spent (relay only until a change). */
+            int rearm_ok = ( !punch_running && !direct_alive &&
+                             pending->punch_retry_count <= PUNCH_RETRY_MAX );
+            if ( addr_changed || rearm_ok )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
-                                        &pi.sockets[0], &pi.sockets[1] );
+                                        &pi.sockets[0], &pi.sockets[1],
+                                        addr_changed ? 0 : 1 );
             }
 
             PEERS_UNLOCK(eee);
