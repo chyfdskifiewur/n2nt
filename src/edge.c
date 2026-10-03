@@ -5529,10 +5529,11 @@ process_n2n_packet:
                 pending->punch_waiting = 0;
             }
 
-            /* A same-address handoff never revives a peer that used up its punch
-             * retries; only a real address change starts a fresh punch. */
+            /* An idle peer re-arms on a PUNCH: the SN only sends one while the
+             * far side is actually punching (throttled pushes), so this is the
+             * demand signal that keeps both ends punching together. */
             if ( addr_changed ||
-                 ( !punch_running && !direct_alive && !pending->punch_failed ) )
+                 ( !punch_running && !direct_alive ) )
             {
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
