@@ -64,10 +64,10 @@
 #define REGISTER_SUPER_INTERVAL_MAX     120  /* sec */
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
-#define PUNCH_ROUNDS                    2    /* punch rounds before giving up */
 #define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
-#define PUNCH_RETRY_SECS                5    /* sec: wait after round exhaustion before a retry */
-#define PUNCH_RETRY_MAX                 20   /* retries before relay only */
+#define PUNCH_ROUNDS                    2    /* punch rounds before giving up */
+#define PUNCH_RETRY_SECS                20   /* sec: wait after round exhaustion before a retry */
+#define PUNCH_RETRY_MAX                 6    /* retries before relay only */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
@@ -4617,7 +4617,8 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
 
     pending->punch_failed = 0;
     pending->punch_start_time = 0;
-    pending->punch_retry_count = 0;
+    /* Retry budget is deliberately kept: address flapping must not restart the
+     * whole chain, otherwise PUNCH_RETRY_MAX is never reached. */
     pending->punch_reset_time = 0;
     pending->punch_round = 0;
     pending->punch_round_time = 0;
