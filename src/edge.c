@@ -64,8 +64,10 @@
 #define REGISTER_SUPER_INTERVAL_MAX     120  /* sec */
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
-#define PUNCH_TOTAL                     40   /* total punches before relay only */
-#define PUNCH_INTERVAL                  10   /* sec: time between punches */
+#define PUNCH_ROUNDS                    1    /* punch rounds before giving up */
+#define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
+#define PUNCH_RETRY_SECS                8    /* sec: wait after round exhaustion before a retry */
+#define PUNCH_RETRY_MAX                 30   /* retries before relay only */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
@@ -1618,13 +1620,7 @@ static int is_empty_ip_address( const n2n_sock_t * sock );
  *  address (IPv6 only when both sides have a usable IPv6, else IPv4). */
 static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
 {
-    MACSTR_TMP(mac_tmp);
     int we_have_ipv6 = (eee->own_ipv6.family == AF_INET6);
-
-    if ( peer->punch_round < PUNCH_TOTAL )
-        peer->punch_round++;
-    traceEvent(TRACE_INFO, "punch %u/%u for %s",
-               (unsigned)peer->punch_round, (unsigned)PUNCH_TOTAL, PEER_ID(mac_tmp, peer));
     int peer_has_ipv6 = (peer->sock6.family == AF_INET6 &&
                          !is_empty_ip_address(&peer->sock6));
     if ( we_have_ipv6 && peer_has_ipv6 ) {
@@ -1636,7 +1632,7 @@ static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
     }
 }
 
-/** Start hole-punch for a peer: arm the PUNCH_TOTAL x PUNCH_INTERVAL punch loop. */
+/** Start hole-punch for a peer: arm the PUNCH_ROUNDS x PUNCH_ROUND_INTERVAL punch loop. */
 static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
 {
     MACSTR_TMP(mac_tmp);
@@ -1646,7 +1642,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
-    /* Punch loop: register, then punch at the latest address. */
+    /* Punch rounds: register, then punch on the sn handoff at the latest address. */
     int can_punch = ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) ||
                     ( peer->sock6.family == AF_INET6 &&
                       !is_empty_ip_address(&peer->sock6) &&
@@ -1654,23 +1650,22 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( !can_punch ) return;   /* no usable route to punch */
 
     peer->punch_start_time = n2n_now();
+    peer->punch_round = 0;
     peer->punch_round_time = peer->punch_start_time;
-    peer->punch_beat_time = peer->punch_start_time;
     /* Address-change reference: only a punch start writes it, so other paths
      * updating the peer address cannot consume the change signal. */
     peer->punch_base_sock = peer->sock;
     peer->punch_base_sock6 = peer->sock6;
-    traceEvent(TRACE_INFO, "punch started for %s",
+    traceEvent(TRACE_INFO, "rounds started for %s",
                macaddr_str(mac_tmp, peer->mac_addr));
     /* Register; the sn handoff then carries the peer's latest address. */
-    eee->punch_round_reg = 1; /* punch re-registration refreshes the handoff */
+    eee->punch_round_reg = 1; /* round re-registration refreshes the handoff */
     send_register_super(eee, &eee->supernode, 1, 0, NULL);
     eee->sn_wait = 1;
     send_query_peer(eee, peer->mac_addr);
-    punch_round(eee, peer);
 }
 
-/** Drive the punch cadence: one punch every PUNCH_INTERVAL, PUNCH_TOTAL then relay only. */
+/** Drive the punch cadence; after a give-up retry every PUNCH_RETRY_SECS. */
 static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 {
     struct peer_info * scan = eee->pending_peers;
@@ -1689,7 +1684,6 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             scan->punch_start_time = 0;
             scan->punch_round = 0;
             scan->punch_round_time = 0;
-            scan->punch_beat_time = 0;
             scan->lan_punch_start = 0;
             scan->lan_punch_done = 1;
             scan = scan->next;
@@ -1728,32 +1722,30 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* Beat every PUNCH_INTERVAL: re-register so the sn hands the peer's
-             * address to both ends; punching happens when that handoff arrives. */
-            if ( (now - scan->punch_beat_time) >= PUNCH_INTERVAL )
+            /* Punch with the latest known address; a missing PUNCH handoff never blocks. */
+            if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
             {
-                scan->punch_beat_time = now;
-                if ( scan->punch_round >= PUNCH_TOTAL )
+                if ( scan->punch_round >= PUNCH_ROUNDS - 1 )
                 {
                     scan->punch_failed = 1;
+                    scan->punch_reset_time = now;
                     /* Leave the running state so an incoming PUNCH can re-arm us. */
                     scan->punch_start_time = 0;
                     scan->lan_punch_start = 0;
-                    traceEvent(TRACE_NORMAL, "gave up on %s after %u punches, relay only",
-                               PEER_ID(mac_tmp, scan), (unsigned)PUNCH_TOTAL);
+                    traceEvent(TRACE_INFO, "rounds exhausted for %s",
+                               PEER_ID(mac_tmp, scan));
                 }
                 else
                 {
+                    scan->punch_round++;
+                    scan->punch_round_time = now;
+                    traceEvent(TRACE_DEBUG, "round %u for %s",
+                               (unsigned)scan->punch_round + 1, PEER_ID(mac_tmp, scan));
+                    /* Register; the sn handoff then punches at the latest address. */
                     eee->punch_round_reg = 1;
                     send_register_super(eee, &eee->supernode, 1, 0, NULL);
                     eee->sn_wait = 1;
                     send_query_peer(eee, scan->mac_addr);
-                    /* Fallback: no handoff arrived this beat, punch locally. */
-                    if ( (now - scan->punch_round_time) > PUNCH_INTERVAL )
-                    {
-                        scan->punch_round_time = now;
-                        punch_round(eee, scan);
-                    }
                 }
             }
         }
@@ -1770,6 +1762,33 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             scan = scan->next;
             free(tmp);
             continue;
+        } else if ( scan->punch_failed )
+        {
+            if ( scan->punch_retry_count > PUNCH_RETRY_MAX ) {
+                /* Retries used up: stay relay only. */
+                prev = scan;
+                scan = scan->next;
+                continue;
+            }
+            if ( (now - scan->punch_reset_time) > PUNCH_RETRY_SECS )
+            {
+                scan->punch_retry_count++;
+                if ( scan->punch_retry_count > PUNCH_RETRY_MAX ) {
+                    traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
+                               PEER_ID(mac_tmp, scan),
+                               (unsigned)PUNCH_RETRY_MAX);
+                    prev = scan;
+                    scan = scan->next;
+                    continue;
+                }
+                scan->punch_failed = 0;
+                scan->lan_punch_done = 0;
+                traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/%u)",
+                           PEER_ID(mac_tmp, scan),
+                           (unsigned)scan->punch_retry_count,
+                           (unsigned)PUNCH_RETRY_MAX);
+                start_punch(eee, scan);
+            }
         }
         prev = scan;
         scan = scan->next;
@@ -1909,7 +1928,8 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                     scan->direct_seen        = 0;
                     scan->punch_start_time   = 0;
                     scan->punch_failed       = 0;
-                    scan->punch_round        = 0;   /* link died: fresh punch budget */
+                    scan->punch_retry_count  = 0;
+                    scan->punch_reset_time   = 0;
                     scan->lan_punch_start    = 0;
                     scan->lan_punch_done     = 0;
                     scan->keepalive_fails    = 0;
@@ -2132,6 +2152,8 @@ void try_send_register( n2n_edge_t * eee,
             scan->sockets[0] = *peer;
             scan->punch_start_time = 0;
             scan->punch_failed = 0;
+            scan->punch_retry_count = 0;
+            scan->punch_reset_time = 0;
             scan->lan_punch_start = 0;
             scan->lan_punch_done = 0;
             send_register(eee, peer);
@@ -4595,10 +4617,11 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
 
     pending->punch_failed = 0;
     pending->punch_start_time = 0;
-    /* Punch budget is deliberately kept: address flapping must not restart the
-     * whole chain, otherwise PUNCH_TOTAL is never reached. */
+    /* Retry budget is deliberately kept: address flapping must not restart the
+     * whole chain, otherwise PUNCH_RETRY_MAX is never reached. */
+    pending->punch_reset_time = 0;
+    pending->punch_round = 0;
     pending->punch_round_time = 0;
-    pending->punch_beat_time = 0;
     pending->lan_punch_start = 0;
     pending->lan_punch_done = 0;
     /* Drop stale LAN sockets[1] from a previous same-LAN phase; the LAN path rebuilds both. */
@@ -5469,8 +5492,8 @@ process_n2n_packet:
                     addr_changed = 1;
             }
 
-            /* Same-address handoff must NOT restart the punch: each re-arm would
-             * consume the PUNCH_TOTAL budget before its time and never let it expire.
+            /* Same-address handoff must NOT restart the punch: that would
+             * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
              * A peer with a healthy direct link never reaches here — it returned above. */
             int direct_alive = ( pending->direct_seen != 0 &&
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
@@ -5484,20 +5507,15 @@ process_n2n_packet:
             }
             else if ( !punch_running && !direct_alive && !pending->punch_failed )
             {
-                /* Idle peer woken by the sn; a peer that used up its punches stays relay only. */
+                /* Idle peer woken by the sn; a peer that used up its retries stays relay only. */
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
             }
-            else if ( pending->punch_start_time != 0 && !direct_alive && !pending->punch_failed &&
-                      pending->punch_round < PUNCH_TOTAL &&
-                      n2n_now() > pending->punch_round_time )
+            else if ( pending->punch_start_time != 0 && !pending->punch_failed )
             {
-                /* Sn handoff carries the peer's latest address: punch at once and re-anchor
-                 * the beat, so both ends punch on the same sn tick. */
-                pending->punch_round_time = n2n_now();
+                /* Round handoff: punch with the address the sn just delivered. */
                 punch_round( eee, pending );
             }
-            
 
             PEERS_UNLOCK(eee);
         }
