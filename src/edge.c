@@ -1655,6 +1655,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
 
     peer->punch_start_time = n2n_now();
     peer->punch_round_time = peer->punch_start_time;
+    peer->punch_beat_time = peer->punch_start_time;
     /* Address-change reference: only a punch start writes it, so other paths
      * updating the peer address cannot consume the change signal. */
     peer->punch_base_sock = peer->sock;
@@ -1726,8 +1727,8 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* One punch every PUNCH_INTERVAL, whatever the sn pushes. */
-            if ( (now - scan->punch_round_time) >= PUNCH_INTERVAL )
+            /* Sn handoff drives the beat; this timer is only the fallback for a missed handoff. */
+            if ( (now - scan->punch_round_time) > PUNCH_INTERVAL )
             {
                 scan->punch_round_time = now;
                 if ( scan->punch_round >= PUNCH_TOTAL )
@@ -5479,6 +5480,15 @@ process_n2n_packet:
                 /* Idle peer woken by the sn; a peer that used up its punches stays relay only. */
                 restart_punch_for_peer( eee, pending, pi.aflags,
                                         &pi.sockets[0], &pi.sockets[1] );
+            }
+            else if ( pending->punch_start_time != 0 && !direct_alive && !pending->punch_failed &&
+                      pending->punch_round < PUNCH_TOTAL &&
+                      n2n_now() > pending->punch_round_time )
+            {
+                /* Sn handoff carries the peer's latest address: punch at once and re-anchor
+                 * the beat, so both ends punch on the same sn tick. */
+                pending->punch_round_time = n2n_now();
+                punch_round( eee, pending );
             }
             
 

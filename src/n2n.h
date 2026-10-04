@@ -271,7 +271,8 @@ struct peer_info {
     uint8_t             keepalive_fails;   /* consecutive keepalive failures */
     time_t              last_query_sent;   /* time last query_peer was sent, for rate-limiting */
     uint8_t             punch_round;       /* punches already sent in the current cycle (caps at PUNCH_TOTAL) */
-    time_t              punch_round_time;  /* time of the last punch, drives the PUNCH_INTERVAL cadence */
+    time_t              punch_round_time;  /* time of the last punch, drives the PUNCH_INTERVAL fallback */
+    time_t              punch_beat_time;   /* time of the last "ready" beat: re-register drives the sn handoff */
     n2n_sock_t          punch_base_sock;   /* IPv4 address this punch cycle was launched from (0=unset) */
     n2n_sock_t          punch_base_sock6;  /* IPv6 address this punch cycle was launched from (0=unset) */
     time_t              direct_seen;       /* time of last direct P2P communication with this peer; 0=never */
