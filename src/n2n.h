@@ -265,15 +265,13 @@ struct peer_info {
     uint32_t            assigned_ip;
     time_t              punch_start_time;
     uint8_t             punch_failed;
-    time_t              punch_reset_time;
     time_t              lan_punch_start;   /* when LAN punch started, 0=not started */
     uint8_t             lan_punch_done;    /* 1=LAN succeeded or timed out, proceed to WAN */
     time_t              last_probe_sent;   /* time last keepalive PROBE was sent */
     uint8_t             keepalive_fails;   /* consecutive keepalive failures */
     time_t              last_query_sent;   /* time last query_peer was sent, for rate-limiting */
-    uint8_t             punch_retry_count; /* number of punch retries, remove after max */
-    uint8_t             punch_round;       /* current 2s punch round (0-based), reset on start_punch */
-    time_t              punch_round_time;  /* round anchor for the 2s punch cadence */
+    uint8_t             punch_round;       /* punches already sent in the current cycle (caps at PUNCH_TOTAL) */
+    time_t              punch_round_time;  /* time of the last punch, drives the PUNCH_INTERVAL cadence */
     n2n_sock_t          punch_base_sock;   /* IPv4 address this punch cycle was launched from (0=unset) */
     n2n_sock_t          punch_base_sock6;  /* IPv6 address this punch cycle was launched from (0=unset) */
     time_t              direct_seen;       /* time of last direct P2P communication with this peer; 0=never */

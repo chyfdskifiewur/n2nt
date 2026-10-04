@@ -1618,7 +1618,13 @@ static int is_empty_ip_address( const n2n_sock_t * sock );
  *  address (IPv6 only when both sides have a usable IPv6, else IPv4). */
 static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
 {
+    MACSTR_TMP(mac_tmp);
     int we_have_ipv6 = (eee->own_ipv6.family == AF_INET6);
+
+    if ( peer->punch_round < PUNCH_TOTAL )
+        peer->punch_round++;
+    traceEvent(TRACE_INFO, "punch %u/%u for %s",
+               (unsigned)peer->punch_round, (unsigned)PUNCH_TOTAL, PEER_ID(mac_tmp, peer));
     int peer_has_ipv6 = (peer->sock6.family == AF_INET6 &&
                          !is_empty_ip_address(&peer->sock6));
     if ( we_have_ipv6 && peer_has_ipv6 ) {
@@ -1648,7 +1654,6 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( !can_punch ) return;   /* no usable route to punch */
 
     peer->punch_start_time = n2n_now();
-    peer->punch_round++;                      /* the punch below is one more */
     peer->punch_round_time = peer->punch_start_time;
     /* Address-change reference: only a punch start writes it, so other paths
      * updating the peer address cannot consume the change signal. */
@@ -1725,8 +1730,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             if ( (now - scan->punch_round_time) >= PUNCH_INTERVAL )
             {
                 scan->punch_round_time = now;
-                scan->punch_round++;
-                if ( scan->punch_round > PUNCH_TOTAL )
+                if ( scan->punch_round >= PUNCH_TOTAL )
                 {
                     scan->punch_failed = 1;
                     /* Leave the running state so an incoming PUNCH can re-arm us. */
@@ -5457,8 +5461,8 @@ process_n2n_packet:
                     addr_changed = 1;
             }
 
-            /* Same-address handoff must NOT restart the punch: that would
-             * re-arm rounds endlessly (direct link / QUERY-PUNCH loop / retry chain).
+            /* Same-address handoff must NOT restart the punch: each re-arm would
+             * consume the PUNCH_TOTAL budget before its time and never let it expire.
              * A peer with a healthy direct link never reaches here — it returned above. */
             int direct_alive = ( pending->direct_seen != 0 &&
                                  ( n2n_now() - pending->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
