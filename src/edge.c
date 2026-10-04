@@ -1689,6 +1689,7 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             scan->punch_start_time = 0;
             scan->punch_round = 0;
             scan->punch_round_time = 0;
+            scan->punch_beat_time = 0;
             scan->lan_punch_start = 0;
             scan->lan_punch_done = 1;
             scan = scan->next;
@@ -1727,10 +1728,11 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
-            /* Sn handoff drives the beat; this timer is only the fallback for a missed handoff. */
-            if ( (now - scan->punch_round_time) > PUNCH_INTERVAL )
+            /* Beat every PUNCH_INTERVAL: re-register so the sn hands the peer's
+             * address to both ends; punching happens when that handoff arrives. */
+            if ( (now - scan->punch_beat_time) >= PUNCH_INTERVAL )
             {
-                scan->punch_round_time = now;
+                scan->punch_beat_time = now;
                 if ( scan->punch_round >= PUNCH_TOTAL )
                 {
                     scan->punch_failed = 1;
@@ -1742,12 +1744,16 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
                 }
                 else
                 {
-                    /* Register; the sn handoff carries the peer's latest address. */
                     eee->punch_round_reg = 1;
                     send_register_super(eee, &eee->supernode, 1, 0, NULL);
                     eee->sn_wait = 1;
                     send_query_peer(eee, scan->mac_addr);
-                    punch_round(eee, scan);
+                    /* Fallback: no handoff arrived this beat, punch locally. */
+                    if ( (now - scan->punch_round_time) > PUNCH_INTERVAL )
+                    {
+                        scan->punch_round_time = now;
+                        punch_round(eee, scan);
+                    }
                 }
             }
         }
@@ -4592,6 +4598,7 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
     /* Punch budget is deliberately kept: address flapping must not restart the
      * whole chain, otherwise PUNCH_TOTAL is never reached. */
     pending->punch_round_time = 0;
+    pending->punch_beat_time = 0;
     pending->lan_punch_start = 0;
     pending->lan_punch_done = 0;
     /* Drop stale LAN sockets[1] from a previous same-LAN phase; the LAN path rebuilds both. */
