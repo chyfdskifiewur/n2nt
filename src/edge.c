@@ -64,7 +64,7 @@
 #define REGISTER_SUPER_INTERVAL_MAX     120  /* sec */
 #define IFACE_UPDATE_INTERVAL           (30) /* sec. How long it usually takes to get an IP lease. */
 #define TRANSOP_TICK_INTERVAL           (10) /* sec */
-#define PUNCH_ROUNDS                    10   /* punch rounds before giving up */
+#define PUNCH_ROUNDS                    11   /* punch rounds before giving up */
 #define PUNCH_ROUND_INTERVAL            5    /* sec: time between punch rounds */
 #define PUNCH_RETRY_SECS                5    /* sec: wait after round exhaustion before a retry */
 #define PUNCH_RETRY_MAX                 5    /* retries before relay only */
