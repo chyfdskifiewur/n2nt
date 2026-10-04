@@ -99,3 +99,5 @@ If you have any questions about n2n6, feel free to join the QQ groups to contact
 
 - [mxre/n2n](https://github.com/mxre/n2n) - Upstream
 - [ntop/n2n](https://github.com/ntop/n2n) - Official n2n project
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/lucktu/n2n6)

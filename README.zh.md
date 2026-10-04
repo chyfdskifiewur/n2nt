@@ -99,3 +99,5 @@ sudo make install
 
 - [mxre/n2n](https://github.com/mxre/n2n) - 上游项目
 - [ntop/n2n](https://github.com/ntop/n2n) - n2n官方项目
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/lucktu/n2n6)
