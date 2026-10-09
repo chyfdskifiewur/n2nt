@@ -3447,8 +3447,11 @@ static int find_peer_destination(n2n_edge_t * eee,
                    scan->mac_addr[3] & 0xFF, scan->mac_addr[4] & 0xFF, scan->mac_addr[5] & 0xFF
             );
 
+        /* A proven direct link outranks a stale punch_failed flag. */
+        int link_alive = ( scan->direct_seen != 0 &&
+                           (now - scan->direct_seen) < PUNCH_DIRECT_ALIVE_SECS );
         if((scan->last_seen > 0) &&
-           !scan->punch_failed &&
+           ( !scan->punch_failed || link_alive ) &&
            (memcmp(mac_address, scan->mac_addr, N2N_MAC_SIZE) == 0))
         {
             /* If never had direct P2P communication, use relay */
@@ -5430,10 +5433,17 @@ process_n2n_packet:
                 if ( NULL == pscan ) {
                     try_send_register(eee, 0, probe.srcMac, &sender);
                 } else {
-                    if (sender.family == AF_INET6) {
-                        pscan->sock6 = sender;
-                    } else {
-                        pscan->sock = sender;
+                    /* Fresh aux-port PROBE: open the mapping but keep the main address. */
+                    int aux_port = ( pscan->sock.family == AF_INET && pscan->sock.port != 0 &&
+                                     sender.family == AF_INET && sender.port != pscan->sock.port &&
+                                     pscan->signal_seen != 0 &&
+                                     ( now - pscan->signal_seen ) <= KEEPALIVE_SIGNAL_GRACE );
+                    if ( !aux_port ) {
+                        if (sender.family == AF_INET6) {
+                            pscan->sock6 = sender;
+                        } else {
+                            pscan->sock = sender;
+                        }
                     }
                     candidate_learn(eee, pscan, &sender, now);
                     pscan->signal_seen = now;
@@ -5736,7 +5746,20 @@ process_n2n_packet:
                  * differs from the working direct port, so never require a match. */
                 int link_alive = ( known->direct_seen != 0 &&
                                    ( n2n_now() - known->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
-                if ( link_alive ) {
+                /* Same-exit: peer shares our public NAT, so its LAN endpoint is the
+                 * real path; a public-port drift must not tear it down. */
+                int lan_hold = 0;
+                if ( eee->my_public_sock.family == AF_INET &&
+                     pi.sockets[0].family == AF_INET &&
+                     memcmp(eee->my_public_sock.addr.v4, pi.sockets[0].addr.v4, IPV4_SIZE) == 0 ) {
+                    int ci;
+                    for (ci = 0; ci < known->cand_cnt; ci++)
+                        if ( known->cand_kind[ci] == 1 && known->cand_seen[ci] != 0 &&
+                             ( n2n_now() - known->cand_seen[ci] ) <= KEEPALIVE_SIGNAL_GRACE ) {
+                            lan_hold = 1; break;
+                        }
+                }
+                if ( link_alive || lan_hold ) {
                     if ( (pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
                          pi.sockets[1].family != 0 && pi.sockets[1].port != 0 ) {
                         known->sockets[1] = pi.sockets[1];
