@@ -68,6 +68,7 @@
 #define PUNCH_ROUND_INTERVAL            2    /* sec: time between punch rounds */
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
+#define PUNCH_PORT_WINDOW               16   /* ports swept either side of a symmetric peer's known port */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -1614,6 +1615,37 @@ static void send_probe_ack( n2n_edge_t * eee,
 
 static int is_empty_ip_address( const n2n_sock_t * sock );
 
+/** Sweep PROBE+REGISTER over a window of ports around the peer's known port.
+ *  A symmetric NAT maps a different egress port per destination, so the single
+ *  port the supernode observed can miss; spraying the neighbourhood gives the
+ *  peer several chances to hear us. The window width comes from the peer's NAT
+ *  type (supernode reflection - no STUN involved). radius 0 = single shot. */
+static void punch_send_window( n2n_edge_t * eee, struct peer_info * peer, int radius )
+{
+    n2n_sock_t target = peer->sock;
+    uint16_t base = target.port;
+    int lo, hi, p;
+
+    send_probe(eee, &target, peer->mac_addr);
+    send_register(eee, &target);
+
+    if ( radius <= 0 ) return;
+    lo = (int)base - radius;
+    hi = (int)base + radius;
+    if ( lo < 1 ) lo = 1;
+    if ( hi > 65535 ) hi = 65535;
+    for ( p = lo; p <= hi; p++ ) {
+        if ( (uint16_t)p == base ) continue;
+        target.port = (uint16_t)p;
+        send_probe(eee, &target, peer->mac_addr);
+        send_register(eee, &target);
+    }
+
+    MACSTR_TMP(mac_tmp);
+    traceEvent(TRACE_DEBUG, "port-sweep: %d ports around %u for %s",
+               hi - lo, (unsigned)base, macaddr_str(mac_tmp, peer->mac_addr));
+}
+
 /** One punch round: PROBE+REGISTER back-to-back at the peer's latest known
  *  address (IPv6 only when both sides have a usable IPv6, else IPv4). */
 static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
@@ -1625,8 +1657,13 @@ static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
         send_probe(eee, &peer->sock6, peer->mac_addr);
         send_register(eee, &peer->sock6);
     } else if ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) {
-        send_probe(eee, &peer->sock, peer->mac_addr);
-        send_register(eee, &peer->sock);
+        /* A symmetric-NAT peer on the far side uses a different egress port
+         * toward us than the one the supernode observed, so sweep a window of
+         * ports around it; an unmeasured (unknown) peer is swept as a hedge.
+         * Cone NATs keep the single-shot send. */
+        int radius = (peer->nat_type == N2N_NAT_SYMMETRIC ||
+                      peer->nat_type == N2N_NAT_UNKNOWN) ? PUNCH_PORT_WINDOW : 0;
+        punch_send_window(eee, peer, radius);
     }
 }
 
