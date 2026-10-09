@@ -5399,6 +5399,37 @@ process_n2n_packet:
             }
 
             if (known) {
+                /* A live direct link must survive a same-address PUNCH handoff.
+                 * Demoting it to pending re-opens the REGISTER path, which re-arms
+                 * the punch round, which re-registers, which makes the SN push
+                 * another PUNCH, which demotes again: a self-sustaining loop that
+                 * floods the log. Refresh in place and keep it operational. */
+                int handoff_same = ( ( pi.sockets[0].family == AF_INET &&
+                                       known->sock.family == AF_INET &&
+                                       sock_equal( &known->sock, &pi.sockets[0] ) == 0 ) ||
+                                     ( pi.sockets[0].family == AF_INET6 &&
+                                       known->sock6.family == AF_INET6 &&
+                                       sock_equal( &known->sock6, &pi.sockets[0] ) == 0 ) );
+                int handoff_live = ( known->direct_seen != 0 &&
+                                     ( n2n_now() - known->direct_seen ) < PUNCH_DIRECT_ALIVE_SECS );
+                if ( handoff_live && handoff_same ) {
+                    if ( (pi.aflags & N2N_AFLAGS_LOCAL_SOCKET) &&
+                         pi.sockets[1].family != 0 && pi.sockets[1].port != 0 ) {
+                        known->sockets[1] = pi.sockets[1];
+                        known->num_sockets = 2;
+                    }
+                    if ( (pi.aflags & N2N_AFLAGS_IPV6_SOCKET) && pi.sock6.family == AF_INET6 )
+                        known->sock6 = pi.sock6;
+                    if (pi.version[0]) strncpy(known->version, pi.version, sizeof(known->version) - 1);
+                    if (pi.os_name[0]) strncpy(known->os_name, pi.os_name, sizeof(known->os_name) - 1);
+                    if (pi.assigned_ip) known->assigned_ip = pi.assigned_ip;
+                    {
+                        uint8_t nt = N2N_NAT_FROM_AFLAGS(pi.aflags);
+                        if (nt) known->nat_type = nt;
+                    }
+                    PEERS_UNLOCK(eee);
+                    return 1;
+                }
                 struct peer_info *prev = NULL, *scan = eee->known_peers;
                 while (scan && memcmp(scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
                     prev = scan; scan = scan->next;
