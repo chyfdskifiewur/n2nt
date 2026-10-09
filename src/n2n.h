@@ -495,6 +495,8 @@ struct n2n_edge
 
     SOCKET              udp_sock;
     SOCKET              udp_sock6;
+    SOCKET              punch_aux_sock[3]; /* extra local ports for multi-socket hole punching */
+    int                 punch_aux_count;   /* aux sockets to open (0 = single-socket) */
     SOCKET              mgmt_sock;
 
     uint16_t            local_port; /* user-specified UDP port, 0 = any */

@@ -69,6 +69,7 @@
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define PUNCH_PORT_WINDOW               16   /* ports swept either side of a symmetric peer's known port */
+#define PUNCH_AUX_SOCKETS               2    /* extra local ports for multi-socket hole punching */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -388,6 +389,10 @@ static int edge_init(n2n_edge_t * eee)
     memset(&eee->sn1_probe_addr, 0, sizeof(n2n_sock_t));
     eee->sn_probe_cookie_valid = 0;
     eee->nat_type = N2N_NAT_UNKNOWN;
+    eee->punch_aux_count = PUNCH_AUX_SOCKETS;
+    eee->punch_aux_sock[0] = -1;
+    eee->punch_aux_sock[1] = -1;
+    eee->punch_aux_sock[2] = -1;
     memset(&eee->nat_seen_sn1, 0, sizeof(n2n_sock_t));
     memset(&eee->nat_seen_sn2, 0, sizeof(n2n_sock_t));
     memset(&eee->nat_seen_sn2_alt, 0, sizeof(n2n_sock_t));
@@ -1615,35 +1620,130 @@ static void send_probe_ack( n2n_edge_t * eee,
 
 static int is_empty_ip_address( const n2n_sock_t * sock );
 
-/** Sweep PROBE+REGISTER over a window of ports around the peer's known port.
- *  A symmetric NAT maps a different egress port per destination, so the single
- *  port the supernode observed can miss; spraying the neighbourhood gives the
- *  peer several chances to hear us. The window width comes from the peer's NAT
- *  type (supernode reflection - no STUN involved). radius 0 = single shot. */
-static void punch_send_window( n2n_edge_t * eee, struct peer_info * peer, int radius )
+/** Send a PROBE from an explicit local socket (multi-port hole punching). */
+static void send_probe_fd( n2n_edge_t * eee, SOCKET fd,
+                           const n2n_sock_t * peer_sock, const n2n_mac_t dstMac )
+{
+    uint8_t pktbuf[N2N_PKT_BUF_SIZE];
+    size_t idx = 0;
+    n2n_common_t cmn;
+    n2n_PROBE_t probe;
+    n2n_sock_str_t sockbuf;
+
+    memset(&cmn, 0, sizeof(cmn));
+    cmn.ttl = N2N_DEFAULT_TTL;
+    cmn.pc = n2n_probe;
+    cmn.flags = 0;
+    memcpy(cmn.community, eee->community_name, N2N_COMMUNITY_SIZE);
+
+    memcpy(probe.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
+    memcpy(probe.dstMac, dstMac, N2N_MAC_SIZE);
+
+    encode_PROBE(pktbuf, &idx, &cmn, &probe);
+
+    traceEvent(TRACE_DEBUG, "send PROBE(%s) to %s",
+        (fd == eee->udp_sock) ? "main" : "aux",
+        sock_to_cstr(sockbuf, peer_sock));
+    sendto_sock(fd, pktbuf, idx, peer_sock);
+}
+
+/** Send a REGISTER directly to another edge from an explicit local socket. */
+static void send_register_fd( n2n_edge_t * eee, SOCKET fd,
+                              const n2n_sock_t * remote_peer )
+{
+    uint8_t pktbuf[N2N_PKT_BUF_SIZE];
+    size_t idx;
+    n2n_common_t cmn;
+    n2n_REGISTER_t reg;
+    n2n_sock_str_t sockbuf;
+
+    memset(&cmn, 0, sizeof(cmn));
+    memset(&reg, 0, sizeof(reg));
+    cmn.ttl = N2N_DEFAULT_TTL;
+    cmn.pc = n2n_register;
+    cmn.flags = 0;
+    memcpy(cmn.community, eee->community_name, N2N_COMMUNITY_SIZE);
+
+    strncpy(reg.version, n2n_sw_version, sizeof(reg.version) - 1);
+    strncpy(reg.os_name, n2n_sw_osName, sizeof(reg.os_name) - 1);
+
+    random_bytes(NULL, reg.cookie, N2N_COOKIE_SIZE);
+    idx = 0;
+    encode_mac(reg.srcMac, &idx, eee->device.mac_addr);
+
+    idx = 0;
+    encode_REGISTER(pktbuf, &idx, &cmn, &reg);
+
+    traceEvent(TRACE_DEBUG, "send REGISTER(%s) %s",
+        (fd == eee->udp_sock) ? "main" : "aux",
+        sock_to_cstr(sockbuf, remote_peer));
+
+    sendto_sock(fd, pktbuf, idx, remote_peer);
+}
+
+/** Open up to punch_aux_count extra UDP sockets for multi-port hole punching.
+ *  Each maps to an independent public port, so the peer has more chances to
+ *  learn one of our mappings. Skipped on a symmetric NAT, where a mapping is
+ *  per-destination and extra ports only confuse the peer. */
+static void punch_aux_open( n2n_edge_t * eee )
+{
+    int i;
+    if ( eee->punch_aux_count <= 0 ) return;
+    if ( eee->nat_type == N2N_NAT_SYMMETRIC ) return;
+    for ( i = 0; i < eee->punch_aux_count && i < 3; i++ ) {
+        if ( eee->punch_aux_sock[i] != -1 ) continue;
+        eee->punch_aux_sock[i] = open_socket(0, 1 /* bind ANY */);
+        if ( eee->punch_aux_sock[i] == -1 ) break;
+        traceEvent(TRACE_DEBUG, "punch aux socket %d opened", i);
+    }
+}
+
+static void punch_aux_close( n2n_edge_t * eee )
+{
+    int i;
+    for ( i = 0; i < 3; i++ )
+        if ( eee->punch_aux_sock[i] != -1 ) {
+            closesocket(eee->punch_aux_sock[i]);
+            eee->punch_aux_sock[i] = -1;
+        }
+}
+
+/** Sweep PROBE+REGISTER from one local socket over a window of ports around
+ *  the peer's known port. A symmetric NAT maps a different egress port per
+ *  destination, so the single port the supernode observed can miss; spraying
+ *  the neighbourhood gives the peer several chances to hear us. The window
+ *  width comes from the peer's NAT type (supernode reflection - no STUN
+ *  involved). radius 0 = single shot. */
+static void punch_send_window( n2n_edge_t * eee, SOCKET fd, struct peer_info * peer,
+                               int radius, const char * tag )
 {
     n2n_sock_t target = peer->sock;
     uint16_t base = target.port;
-    int lo, hi, p;
+    int lo, hi, p, sent = 0;
 
-    send_probe(eee, &target, peer->mac_addr);
-    send_register(eee, &target);
+    send_probe_fd(eee, fd, &target, peer->mac_addr);
+    send_register_fd(eee, fd, &target);
+    ++sent;
 
-    if ( radius <= 0 ) return;
-    lo = (int)base - radius;
-    hi = (int)base + radius;
-    if ( lo < 1 ) lo = 1;
-    if ( hi > 65535 ) hi = 65535;
-    for ( p = lo; p <= hi; p++ ) {
-        if ( (uint16_t)p == base ) continue;
-        target.port = (uint16_t)p;
-        send_probe(eee, &target, peer->mac_addr);
-        send_register(eee, &target);
+    if ( radius > 0 ) {
+        lo = (int)base - radius;
+        hi = (int)base + radius;
+        if ( lo < 1 ) lo = 1;
+        if ( hi > 65535 ) hi = 65535;
+        for ( p = lo; p <= hi; p++ ) {
+            if ( (uint16_t)p == base ) continue;
+            target.port = (uint16_t)p;
+            send_probe_fd(eee, fd, &target, peer->mac_addr);
+            send_register_fd(eee, fd, &target);
+            ++sent;
+        }
     }
 
-    MACSTR_TMP(mac_tmp);
-    traceEvent(TRACE_DEBUG, "port-sweep: %d ports around %u for %s",
-               hi - lo, (unsigned)base, macaddr_str(mac_tmp, peer->mac_addr));
+    {
+        MACSTR_TMP(mac_tmp);
+        traceEvent(TRACE_INFO, "punch %s for %s: %d port(s) around %u",
+                   tag, macaddr_str(mac_tmp, peer->mac_addr), sent, (unsigned)base);
+    }
 }
 
 /** One punch round: PROBE+REGISTER back-to-back at the peer's latest known
@@ -1663,7 +1763,18 @@ static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
          * Cone NATs keep the single-shot send. */
         int radius = (peer->nat_type == N2N_NAT_SYMMETRIC ||
                       peer->nat_type == N2N_NAT_UNKNOWN) ? PUNCH_PORT_WINDOW : 0;
-        punch_send_window(eee, peer, radius);
+        static const char *aux_tag[3] = { "aux0", "aux1", "aux2" };
+        int i;
+        punch_send_window(eee, eee->udp_sock, peer, radius, "main");
+        /* Multi-port: fan out from each aux socket, unless our own NAT is
+         * symmetric (extra local ports then map per-destination and give the
+         * peer a target that flips every round). Cone NATs keep the fan-out. */
+        if ( eee->nat_type != N2N_NAT_SYMMETRIC ) {
+            for ( i = 0; i < eee->punch_aux_count && i < 3; i++ ) {
+                if ( eee->punch_aux_sock[i] != -1 )
+                    punch_send_window(eee, eee->punch_aux_sock[i], peer, radius, aux_tag[i]);
+            }
+        }
     }
 }
 
@@ -1689,6 +1800,7 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     peer->punch_round_time = peer->punch_start_time;
     traceEvent(TRACE_INFO, "rounds started for %s",
                macaddr_str(mac_tmp, peer->mac_addr));
+    punch_aux_open(eee); /* arm extra local ports for the multi-socket fan-out */
     punch_round(eee, peer); /* round-0: punch with the known address now */
     eee->punch_round_reg = 1; /* round re-registration refreshes the handoff */
     send_register_super(eee, &eee->supernode, 1, 0, NULL);
@@ -4620,6 +4732,8 @@ static void restart_punch_for_peer( n2n_edge_t * eee,
 {
     if ( eee->use_ws )
         return;
+
+    punch_aux_close(eee); /* aux mappings are stale too - reopened on next start_punch */
 
     pending->punch_failed = 0;
     pending->punch_start_time = 0;
@@ -7636,6 +7750,12 @@ static int run_loop(n2n_edge_t * eee )
         FD_ZERO(&socket_mask);
         FD_SET(eee->udp_sock, &socket_mask);
         max_sock = (int) eee->udp_sock;
+        for (int _ai = 0; _ai < eee->punch_aux_count && _ai < 3; _ai++) {
+            if (eee->punch_aux_sock[_ai] != -1) {
+                FD_SET(eee->punch_aux_sock[_ai], &socket_mask);
+                max_sock = max(max_sock, (int)eee->punch_aux_sock[_ai]);
+            }
+        }
         if (eee->udp_sock6 != -1) {
             FD_SET(eee->udp_sock6, &socket_mask);
             max_sock = max(max_sock, (int) eee->udp_sock6);
@@ -7807,6 +7927,17 @@ static int run_loop(n2n_edge_t * eee )
                 for (int _di = 0; _di < 128; _di++) {
                     if (!readFromIPSocket(eee, eee->udp_sock6))
                         break;
+                }
+            }
+
+            /* aux punch sockets: replies/peer PROBEs arrive here too */
+            for (int _ai = 0; _ai < eee->punch_aux_count && _ai < 3; _ai++) {
+                if (eee->punch_aux_sock[_ai] != -1 &&
+                    FD_ISSET(eee->punch_aux_sock[_ai], &socket_mask)) {
+                    for (int _di = 0; _di < 128; _di++) {
+                        if (!readFromIPSocket(eee, eee->punch_aux_sock[_ai]))
+                            break;
+                    }
                 }
             }
 
