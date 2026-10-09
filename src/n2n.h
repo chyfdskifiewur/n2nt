@@ -248,8 +248,6 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
 #define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE || \
                                    (t) == N2N_NAT_RESTRICTED )
 
-#define N2N_CAND_MAX 4  /* directly-observed candidate endpoints kept per peer */
-
 struct peer_info {
     struct peer_info *  next;
     n2n_community_t     community_name;
@@ -282,29 +280,10 @@ struct peer_info {
     uint8_t             temp_local_sock_valid; /* 1 if temp_local_sock is valid */
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
-    time_t              signal_seen;       /* time of last direct signalling (direct PROBE/REGISTER/data); gates the punch cadence */
-    /* candidate ring: directly-observed endpoints, preferred over the SN's observation */
-    n2n_sock_t          cand_sock[N2N_CAND_MAX];
-    uint8_t             cand_kind[N2N_CAND_MAX];   /* 1=LAN/private, 2=public */
-    time_t              cand_seen[N2N_CAND_MAX];
-    int                 cand_cnt;
-    /* egress-port observation: predicts the peer's next mapping port for the sweep */
-    uint16_t            obs_port[8];
-    time_t              obs_port_t[8];
-    int                 obs_port_cnt;
-    int                 obs_inc;           /* last observed port increment */
-    uint8_t             port_seq;          /* 0=unknown, 1=sequential, 2=random */
-    uint16_t            pred_port;         /* predicted next egress port (0 if none) */
-    time_t              pred_port_t;
-    time_t              last_learn_send;   /* throttle for the reverse re-register in port_observe */
     time_t              relay_adv_time;    /* sn: last time this edge was advertised as the relay (throttle) */
     time_t              sn_fwd_first;      /* sn: first time this edge's unicast data was relayed via SN (0=never); gates community-relay announcement */
     uint8_t             last_fwd_mac[N2N_MAC_SIZE]; /* sn: last unicast peer this edge's data was relayed to (communicating-pair tracking) */
     time_t              last_fwd_time;     /* sn: time of that last relayed unicast (0=never) */
-    time_t              first_seen;        /* sn: when this edge record was created (PUNCH-announceable window) */
-    time_t              last_punch_rx;     /* sn: last PUNCH handoff sent TO this edge (per-receiver debounce) */
-    time_t              last_punch_bcast;  /* sn: last PUNCH handoff this edge triggered as the changed peer */
-    time_t              last_pi_bcast;     /* sn: last plain PEER_INFO broadcast this edge triggered as the changed peer */
     uint8_t             relay_willing;     /* sn: edge's relay stance: 0=refuse,1=default,2=willing,3=force */
     time_t              relay_adv_live;    /* sn: last time this peer was advertised AS the community relay (0=never) */
     /* Compact packet protocol support (version 0xE5 header) */
@@ -516,8 +495,6 @@ struct n2n_edge
 
     SOCKET              udp_sock;
     SOCKET              udp_sock6;
-    SOCKET              punch_aux_sock[3]; /* extra local ports for multi-socket hole punching */
-    int                 punch_aux_count;   /* aux sockets to open (0 = single-socket) */
     SOCKET              mgmt_sock;
 
     uint16_t            local_port; /* user-specified UDP port, 0 = any */
