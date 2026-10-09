@@ -303,6 +303,10 @@ struct peer_info {
     time_t              sn_fwd_first;      /* sn: first time this edge's unicast data was relayed via SN (0=never); gates community-relay announcement */
     uint8_t             last_fwd_mac[N2N_MAC_SIZE]; /* sn: last unicast peer this edge's data was relayed to (communicating-pair tracking) */
     time_t              last_fwd_time;     /* sn: time of that last relayed unicast (0=never) */
+    time_t              first_seen;        /* sn: when this edge record was created (PUNCH-announceable window) */
+    time_t              last_punch_rx;     /* sn: last PUNCH handoff sent TO this edge (per-receiver debounce) */
+    time_t              last_punch_bcast;  /* sn: last PUNCH handoff this edge triggered as the changed peer */
+    time_t              last_pi_bcast;     /* sn: last plain PEER_INFO broadcast this edge triggered as the changed peer */
     uint8_t             relay_willing;     /* sn: edge's relay stance: 0=refuse,1=default,2=willing,3=force */
     time_t              relay_adv_live;    /* sn: last time this peer was advertised AS the community relay (0=never) */
     /* Compact packet protocol support (version 0xE5 header) */
