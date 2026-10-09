@@ -69,6 +69,9 @@
 #define PUNCH_ACTIVE_WINDOW             30   /* sec: peer heard from within this window counts as communicating */
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define PUNCH_PORT_WINDOW               16   /* ports swept either side of a symmetric peer's known port */
+#define PUNCH_WIN_RADIUS_BASE           10   /* default sweep half-width around the known port */
+#define PUNCH_WIN_RADIUS_MAX            32   /* cap when a seen port step suggests a wide sweep */
+#define PUNCH_RETRY_MAX                 3    /* punch retries before falling back to relay only */
 #define PUNCH_AUX_SOCKETS               2    /* extra local ports for multi-socket hole punching */
 #define KEEPALIVE_SIGNAL_GRACE          30   /* sec: fresh direct signalling pauses punch cadence */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
@@ -1935,20 +1938,31 @@ static void punch_send_window( n2n_edge_t * eee, SOCKET fd, struct peer_info * p
     }
 }
 
-/** One punch round: PROBE+REGISTER back-to-back at the peer's latest known
- *  address (IPv6 only when both sides have a usable IPv6, else IPv4). */
+/** One punch round: IPv6 first (a native path skips NAT entirely), then the
+ *  IPv4 sweep back-to-back at the peer's latest known address. */
 static void punch_round( n2n_edge_t * eee, struct peer_info * peer )
 {
     int we_have_ipv6 = (eee->own_ipv6.family == AF_INET6);
     int peer_has_ipv6 = (peer->sock6.family == AF_INET6 &&
                          !is_empty_ip_address(&peer->sock6));
+    /* Adaptive sweep: base 10, widened by a seen port step, floored at 16 for
+     * symmetric/unknown peers whose mapped port is unpredictable. */
+    int radius = PUNCH_WIN_RADIUS_BASE;
+
+    if ( peer->port_seq == 1 && peer->obs_inc != 0 ) {
+        int want = abs( peer->obs_inc ) * 2;
+        if ( want > radius ) radius = ( want > PUNCH_WIN_RADIUS_MAX ) ? PUNCH_WIN_RADIUS_MAX : want;
+    }
+    if ( ( peer->nat_type == N2N_NAT_SYMMETRIC || peer->nat_type == N2N_NAT_UNKNOWN ) &&
+         radius < PUNCH_PORT_WINDOW )
+        radius = PUNCH_PORT_WINDOW;
+
     if ( we_have_ipv6 && peer_has_ipv6 ) {
         send_probe(eee, &peer->sock6, peer->mac_addr);
         send_register(eee, &peer->sock6);
-    } else if ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) {
-        /* Symmetric/unknown peers: sweep a port window; cone NATs single-shot. */
-        int radius = (peer->nat_type == N2N_NAT_SYMMETRIC ||
-                      peer->nat_type == N2N_NAT_UNKNOWN) ? PUNCH_PORT_WINDOW : 0;
+    }
+
+    if ( peer->sock.family == AF_INET && eee->udp_sock != -1 ) {
         static const char *aux_tag[3] = { "aux0", "aux1", "aux2" };
         int i;
         punch_send_window(eee, eee->udp_sock, peer, radius, "main");
@@ -1991,7 +2005,82 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     send_query_peer(eee, peer->mac_addr);
 }
 
-/** Drive the 5 rounds x 2s punch cadence; after a give-up retry every 40s. */
+/** Advance one peer's punch cadence: run the 5 rounds x 2s, then retry with an
+ *  escalating 10/20/30s backoff on fresh local ports (max PUNCH_RETRY_MAX). */
+static void drive_punch_cadence( n2n_edge_t * eee, struct peer_info * scan, time_t now )
+{
+    MACSTR_TMP(mac_tmp);
+    time_t backoff;
+    int sig_alive;
+
+    if ( scan->punch_start_time != 0 && !scan->punch_failed )
+    {
+        /* Fresh signalling already proves the endpoint; resume once it goes cold. */
+        if ( scan->signal_seen != 0 &&
+             ( now - scan->signal_seen ) <= KEEPALIVE_SIGNAL_GRACE )
+            return;
+        /* Punch with the latest known address; a missing PUNCH handoff never blocks. */
+        if ( (now - scan->punch_round_time) < PUNCH_ROUND_INTERVAL )
+            return;
+        if ( scan->punch_round >= PUNCH_ROUNDS - 1 )
+        {
+            scan->punch_failed = 1;
+            scan->punch_reset_time = now;
+            if ( scan->punch_retry_count >= PUNCH_RETRY_MAX )
+                traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
+                           PEER_ID(mac_tmp, scan), scan->punch_retry_count);
+            else
+                traceEvent(TRACE_INFO, "rounds exhausted for %s", PEER_ID(mac_tmp, scan));
+        }
+        else
+        {
+            scan->punch_round++;
+            scan->punch_round_time = now;
+            traceEvent(TRACE_DEBUG, "round %u for %s",
+                       (unsigned)scan->punch_round + 1, PEER_ID(mac_tmp, scan));
+            punch_round(eee, scan);
+            eee->punch_round_reg = 1;
+            send_register_super(eee, &eee->supernode, 1, 0, NULL);
+            send_query_peer(eee, scan->mac_addr);
+        }
+        return;
+    }
+
+    if ( !scan->punch_failed )
+        return;
+
+    if ( scan->punch_retry_count >= PUNCH_RETRY_MAX )
+        return;   /* retries exhausted: relay only */
+
+    /* Fresh signalling: endpoint reachable, re-punching is pointless. */
+    sig_alive = ( scan->signal_seen != 0 &&
+                  ( now - scan->signal_seen ) <= KEEPALIVE_SIGNAL_GRACE );
+    if ( sig_alive )
+        return;
+
+    /* Escalating backoff before each retry: 10s, 20s, then 30s. */
+    backoff = 30;
+    if ( scan->punch_retry_count == 0 ) backoff = 10;
+    else if ( scan->punch_retry_count == 1 ) backoff = 20;
+
+    if ( (now - scan->punch_reset_time) <= backoff )
+        return;
+
+    scan->punch_retry_count++;
+    scan->punch_failed = 0;
+    scan->punch_start_time = 0;
+    scan->lan_punch_done = 0;
+    scan->lan_punch_start = 0;
+    traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/%u)",
+               PEER_ID(mac_tmp, scan), scan->punch_retry_count, PUNCH_RETRY_MAX);
+    send_query_peer(eee, scan->mac_addr);
+    /* Fresh local ports: a NAT that dropped the old mapping gets another chance. */
+    punch_aux_close( eee );
+    punch_aux_open( eee );
+    start_punch(eee, scan);
+}
+
+/** Drive each peer's punch cadence (pending and known peers alike). */
 static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 {
     struct peer_info * scan = eee->pending_peers;
@@ -2028,41 +2117,10 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             }
         }
 
-        if ( scan->punch_start_time != 0 && !scan->punch_failed )
-        {
-            /* Fresh signalling already proves the endpoint; resume once it goes cold. */
-            if ( scan->signal_seen != 0 &&
-                 ( now - scan->signal_seen ) <= KEEPALIVE_SIGNAL_GRACE ) {
-                prev = scan;
-                scan = scan->next;
-                continue;
-            }
-            /* Punch with the latest known address; a missing PUNCH handoff never blocks. */
-            if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
-            {
-                if ( scan->punch_round >= PUNCH_ROUNDS - 1 )
-                {
-                    scan->punch_failed = 1;
-                    scan->punch_reset_time = now;
-                    traceEvent(TRACE_INFO, "rounds exhausted for %s",
-                               PEER_ID(mac_tmp, scan));
-                }
-                else
-                {
-                    scan->punch_round++;
-                    scan->punch_round_time = now;
-                    traceEvent(TRACE_DEBUG, "round %u for %s",
-                               (unsigned)scan->punch_round + 1, PEER_ID(mac_tmp, scan));
-                    punch_round(eee, scan);
-                    eee->punch_round_reg = 1;
-                    send_register_super(eee, &eee->supernode, 1, 0, NULL);
-                    send_query_peer(eee, scan->mac_addr);
-                }
-            }
-        }
-        else if ( scan->punch_start_time == 0 && !scan->punch_failed &&
-                    scan->last_seen != 0 &&
-                    (now - scan->last_seen) > 1800 )
+        /* Remove a stuck pending peer (idle > 1800s, no punch possible). */
+        if ( scan->punch_start_time == 0 && !scan->punch_failed &&
+             scan->last_seen != 0 &&
+             (now - scan->last_seen) > 1800 )
         {
             traceEvent(TRACE_NORMAL, "Removing stuck pending peer %s (no punch possible, idle %lus)",
                        PEER_ID(mac_tmp, scan),
@@ -2073,43 +2131,25 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
             scan = scan->next;
             free(tmp);
             continue;
-        } else if ( scan->punch_failed )
-        {
-            if ( scan->punch_retry_count >= 3 ) {
-                prev = scan;
-                scan = scan->next;
-                continue;
-            }
-            /* Fresh signalling: endpoint reachable, re-punching is pointless. */
-            if ( scan->signal_seen != 0 &&
-                 ( now - scan->signal_seen ) <= KEEPALIVE_SIGNAL_GRACE ) {
-                prev = scan;
-                scan = scan->next;
-                continue;
-            }
-            if ( (now - scan->punch_reset_time) > 40 )
-            {
-                scan->punch_retry_count++;
-                if ( scan->punch_retry_count >= 3 ) {
-                    traceEvent(TRACE_NORMAL, "Giving up on %s after %u punch retries, relay only",
-                               PEER_ID(mac_tmp, scan),
-                               scan->punch_retry_count);
-                    prev = scan;
-                    scan = scan->next;
-                    continue;
-                }
-                scan->punch_failed = 0;
-                scan->punch_start_time = 0;
-                scan->lan_punch_done = 0;
-                scan->lan_punch_start = 0;
-                traceEvent(TRACE_INFO, "Retrying P2P punch for %s (attempt %u/3)",
-                           PEER_ID(mac_tmp, scan),
-                           scan->punch_retry_count);
-                start_punch(eee, scan);
-            }
         }
+
+        /* Round cadence + exhausted/retry backoff (shared with known_peers). */
+        drive_punch_cadence( eee, scan, now );
+
         prev = scan;
         scan = scan->next;
+    }
+
+    /* A known peer whose direct link died is re-punched by check_keepalive but
+     * stays in known_peers; drive its cadence too, else only round-0 fires. */
+    {
+        struct peer_info * kscan = eee->known_peers;
+        while ( kscan ) {
+            struct peer_info * knext = kscan->next;
+            if ( kscan->punch_start_time != 0 || kscan->punch_failed )
+                drive_punch_cadence( eee, kscan, now );
+            kscan = knext;
+        }
     }
 }
 
