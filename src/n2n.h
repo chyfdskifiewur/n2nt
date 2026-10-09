@@ -283,14 +283,12 @@ struct peer_info {
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
     time_t              signal_seen;       /* time of last direct signalling (direct PROBE/REGISTER/data); gates the punch cadence */
-    /* candidate ring: directly-observed peer endpoints, preferred over the SN's
-     * observation when punching (public) or activating a LAN path (private). */
+    /* candidate ring: directly-observed endpoints, preferred over the SN's observation */
     n2n_sock_t          cand_sock[N2N_CAND_MAX];
     uint8_t             cand_kind[N2N_CAND_MAX];   /* 1=LAN/private, 2=public */
     time_t              cand_seen[N2N_CAND_MAX];
     int                 cand_cnt;
-    /* symmetric-NAT egress-port observation: predicts the peer's next mapping
-     * port so the punch sweep can centre on it instead of the SN-observed one. */
+    /* egress-port observation: predicts the peer's next mapping port for the sweep */
     uint16_t            obs_port[8];
     time_t              obs_port_t[8];
     int                 obs_port_cnt;

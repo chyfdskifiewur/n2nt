@@ -19,9 +19,8 @@
 /** An edge relayed here within this window is "communicating": its pair's address change gets a direct PUNCH */
 #define SN_FWD_PUNCH_ACTIVE_SECS    30
 
-/** A newly-registered edge stays PUNCH-announceable to the whole community for
- *  this long: without it a fresh member's endpoint is never broadcast, so peers
- *  already registered never learn to punch it (the "edge4 dead-lock"). */
+/** A newly-registered edge stays PUNCH-announceable to the community for this
+ *  long, so in-net peers learn to punch fresh members (the "edge4 dead-lock"). */
 #define SN_PUNCH_NEW_PEER_SECS      60
 
 /** maximum length of command line arguments */
@@ -2692,8 +2691,7 @@ static void send_fc_probe_request( n2n_sn_t *sss,
 }
 
 /* A loopback-registered edge (co-located with this SN) keeps a fixed 127.x
- * address, so its registration never counts as an address change; the push
- * still fires on every registration to (re)announce it with a PUNCH_REQUEST. */
+ * address, so its registration never counts as an address change. */
 static int sn_peer_is_member( const struct peer_info * p )
 {
     if ( !p ) return 0;
@@ -2765,28 +2763,23 @@ static void push_nat_to_community( n2n_sn_t *sss,
     encode_PEER_INFO(pibuf, &pix, &pi_cmn, &pi);
 
     time_t now = time(NULL);
-    /* A brand-new changed edge has no relayed-unicast record yet, but it must
-     * still reach every member as a PUNCH target, else peers already registered
-     * never learn to punch it (the "edge4 dead-lock"). The first_seen window
-     * makes it punchable to everyone; a loopback-registered edge (fixed 127.x
-     * address, so it never looks "changed") is treated the same each registration. */
+    /* A brand-new edge has no relayed-unicast record yet but must still reach
+     * everyone as a PUNCH target (the "edge4 dead-lock"). A loopback-registered
+     * edge (fixed 127.x, never "changed") is treated the same each registration. */
     int punchable_now = ( addr_changed || sn_peer_is_member(changed) ||
                           ( changed->first_seen != 0 &&
                             (now - changed->first_seen) < SN_PUNCH_NEW_PEER_SECS ) );
     int new_peer_window = ( changed->first_seen != 0 &&
                             (now - changed->first_seen) < SN_PUNCH_NEW_PEER_SECS );
-    /* First the communicating counterpart gets a PUNCH right away: its address
-     * just changed, so both sides must re-punch immediately. */
+    /* Communicating counterparts get a PUNCH right away. */
     for ( p = sss->edges; p; p = p->next )
     {
         if ( p == changed ) continue;
-        /* Never hand an edge its own MAC back (a duplicate SN-side record would
-         * otherwise receive its own PEER_INFO and start a self-loop punch storm). */
+        /* Never hand an edge its own MAC back (self-loop punch storm). */
         if ( memcmp(p->mac_addr, changed->mac_addr, N2N_MAC_SIZE) == 0 ) continue;
         if ( memcmp(p->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
-        /* A communicating counterpart (recent relayed unicast either way) gets a
-         * PUNCH instead of the plain broadcast; during the new-peer window every
-         * member is punchable so an existing member starts punching the newcomer. */
+        /* PUNCH instead of the plain broadcast for a recent relayed-unicast pair;
+         * during the new-peer window every member is punchable. */
         int communicating = ( punchable_now &&
                               ( new_peer_window ||
                                 ((p->last_fwd_time != 0 &&
@@ -2797,9 +2790,8 @@ static void push_nat_to_community( n2n_sn_t *sss,
                                   memcmp(changed->last_fwd_mac, p->mac_addr, N2N_MAC_SIZE) == 0)) ) );
         if ( communicating )
         {
-            /* Per-receiver debounce: a symmetric-NAT edge may report a new source
-             * port on nearly every packet; each member gets at most one PUNCH per
-             * window, but every communicating member gets it in the same round. */
+            /* Per-receiver debounce: a symmetric-NAT edge reports a new source port on
+             * nearly every packet, so cap each member at one PUNCH per window. */
             if ( p->last_punch_rx != 0 && (now - p->last_punch_rx) < 8 )
                 continue;
             p->last_punch_rx = now;
@@ -2807,10 +2799,8 @@ static void push_nat_to_community( n2n_sn_t *sss,
             sn_send_punch_info( sss, community, p, changed );
         }
     }
-    /* Then the plain PEER_INFO (no PUNCH) to everyone else, so they just
-     * refresh their local info without starting a punch. Debounced to >=5s per
-     * changed edge: a symmetric-NAT edge re-registers a fresh source port on
-     * nearly every keepalive and each would otherwise re-broadcast the community. */
+    /* Plain PEER_INFO (no PUNCH) to everyone else; debounced >=5s because a
+     * symmetric-NAT edge re-registers a fresh port on nearly every keepalive. */
     if ( changed->last_pi_bcast != 0 && (now - changed->last_pi_bcast) < 5 )
         return;
     changed->last_pi_bcast = now;
@@ -4346,12 +4336,10 @@ static int process_udp( n2n_sn_t * sss,
 
         /* NAT type/address changed with a stable registration: push the fresh
          * PEER_INFO to the community, else peers keep pointing at the abandoned endpoint. */
-        /* Push on a NEW edge too (is_new_edge==1): without it a fresh member's
-         * endpoint is never broadcast to the existing community, so peers already
-         * registered never learn to punch it (the "edge4 dead-lock"). The
-         * first_seen window keeps it PUNCH-announceable; debounce inside. A
-         * loopback-registered edge (fixed 127.x address, never "changed") is
-         * re-announced on every stable registration. */
+        /* Push on a NEW edge too (is_new_edge==1), else a fresh member's
+         * endpoint is never broadcast and peers never learn to punch it
+         * (the "edge4 dead-lock"). first_seen keeps it announceable; a
+         * loopback-registered edge (fixed 127.x) is re-announced each time. */
         struct peer_info *chg_peer = find_peer_by_mac( sss->edges, reg.edgeMac );
         if ( ( is_new_edge >= 1 && is_new_edge <= 3 ) ||
              ( !query_only && chg_peer && sn_peer_is_member(chg_peer) ) )
