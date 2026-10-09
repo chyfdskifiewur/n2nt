@@ -248,6 +248,8 @@ typedef char macstr_t[N2N_MACSTR_SIZE];
 #define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE || \
                                    (t) == N2N_NAT_RESTRICTED )
 
+#define N2N_CAND_MAX 4  /* directly-observed candidate endpoints kept per peer */
+
 struct peer_info {
     struct peer_info *  next;
     n2n_community_t     community_name;
@@ -280,6 +282,23 @@ struct peer_info {
     uint8_t             temp_local_sock_valid; /* 1 if temp_local_sock is valid */
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
+    time_t              signal_seen;       /* time of last direct signalling (direct PROBE/REGISTER/data); gates the punch cadence */
+    /* candidate ring: directly-observed peer endpoints, preferred over the SN's
+     * observation when punching (public) or activating a LAN path (private). */
+    n2n_sock_t          cand_sock[N2N_CAND_MAX];
+    uint8_t             cand_kind[N2N_CAND_MAX];   /* 1=LAN/private, 2=public */
+    time_t              cand_seen[N2N_CAND_MAX];
+    int                 cand_cnt;
+    /* symmetric-NAT egress-port observation: predicts the peer's next mapping
+     * port so the punch sweep can centre on it instead of the SN-observed one. */
+    uint16_t            obs_port[8];
+    time_t              obs_port_t[8];
+    int                 obs_port_cnt;
+    int                 obs_inc;           /* last observed port increment */
+    uint8_t             port_seq;          /* 0=unknown, 1=sequential, 2=random */
+    uint16_t            pred_port;         /* predicted next egress port (0 if none) */
+    time_t              pred_port_t;
+    time_t              last_learn_send;   /* throttle for the reverse re-register in port_observe */
     time_t              relay_adv_time;    /* sn: last time this edge was advertised as the relay (throttle) */
     time_t              sn_fwd_first;      /* sn: first time this edge's unicast data was relayed via SN (0=never); gates community-relay announcement */
     uint8_t             last_fwd_mac[N2N_MAC_SIZE]; /* sn: last unicast peer this edge's data was relayed to (communicating-pair tracking) */

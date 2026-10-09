@@ -70,6 +70,7 @@
 #define PUNCH_DIRECT_ALIVE_SECS         300  /* sec: an established direct link is alive (no re-punch) */
 #define PUNCH_PORT_WINDOW               16   /* ports swept either side of a symmetric peer's known port */
 #define PUNCH_AUX_SOCKETS               2    /* extra local ports for multi-socket hole punching */
+#define KEEPALIVE_SIGNAL_GRACE          30   /* sec: fresh direct signalling suppresses the punch cadence and non-main port learning */
 #define CACHE_DST_TTL                   5    /* sec: cached P2P destination TTL */
 
 /** maximum length of command line arguments */
@@ -1143,6 +1144,113 @@ static int find_best_local_ip(n2n_edge_t * eee, const n2n_sock_t * peer_lan_sock
     return 0;  /* No matching IP found */
 }
 
+/* =====================================================================
+ * Hole-punch helpers (ported from the reference punch logic).
+ * ===================================================================== */
+
+/* Is this host-order IP inside our own TAP virtual subnet (SN-assigned range)? */
+static int is_sn_assigned_subnet(const n2n_edge_t *eee, uint32_t ip_host)
+{
+    uint32_t tap, mask;
+    int bits;
+    if (!eee || eee->device.ip_addr == 0) return 0;
+    tap = ntohl(eee->device.ip_addr);
+    bits = eee->device.ip_prefixlen;
+    if (bits <= 0 || bits > 32) bits = 24;
+    mask = (bits == 32) ? 0xFFFFFFFFu : (0xFFFFFFFFu << (32 - bits));
+    return (ip_host & mask) == (tap & mask);
+}
+
+/* Classify a directly-observed endpoint: 1=LAN/private, 0=WAN/public. */
+static int cand_addr_is_lan(const n2n_edge_t *eee, const n2n_sock_t *s)
+{
+    uint32_t ip;
+    if (s->family != AF_INET) return 0;
+    ip = ntohl(*(uint32_t*)s->addr.v4);
+    if ((ip >> 24) == 10) return 1;
+    if ((ip & 0xFFF00000) == 0xAC100000) return 1;         /* 172.16/12 */
+    if ((ip >> 16) == ((192u << 8) | 168)) return 1;       /* 192.168/16 */
+    if (is_sn_assigned_subnet(eee, ip)) return 1;          /* SN-assigned TAP range */
+    return 0;
+}
+
+/* Add/refresh a directly-observed peer endpoint in the candidate ring. */
+static void candidate_learn(n2n_edge_t *eee, struct peer_info *scan,
+                            const n2n_sock_t *s, time_t now)
+{
+    int i;
+    if (s == NULL || s->family == 0) return;
+    /* A fresh direct link advertises its main egress port; any different source
+     * port then is an aux punch socket that answers signalling but carries no
+     * data frames — keep the ring main-port only while the link is fresh. A
+     * still-punching peer is NOT guarded: symmetric-NAT learning needs every
+     * egress port. */
+    if (scan->sock.family == AF_INET && scan->sock.port != 0 &&
+        scan->sock.port != s->port &&
+        scan->signal_seen != 0 &&
+        (now - scan->signal_seen) <= KEEPALIVE_SIGNAL_GRACE)
+        return;
+    /* Never keep our own TAP virtual-subnet address as a direct candidate. */
+    if (s->family == AF_INET &&
+        is_sn_assigned_subnet(eee, ntohl(*(uint32_t*)s->addr.v4)))
+        return;
+    /* Refresh an already-known candidate (cheap path — this runs per direct
+     * data packet, so the interface enumeration below is only for new ones). */
+    for (i = 0; i < scan->cand_cnt; i++) {
+        if (scan->cand_sock[i].family == s->family &&
+            sock_equal(&scan->cand_sock[i], s) == 0) {
+            scan->cand_seen[i] = now;
+            return;
+        }
+    }
+    /* A LAN-kind candidate is only reachable when this host has an interface in
+     * the same subnet; a peer behind another router advertises a dead path. */
+    if (s->family == AF_INET) {
+        n2n_sock_t probe;
+        if (cand_addr_is_lan(eee, s) && !find_best_local_ip(eee, s, &probe))
+            return;
+    }
+    if (scan->cand_cnt < N2N_CAND_MAX) {
+        int k = scan->cand_cnt++;
+        scan->cand_sock[k] = *s;
+        scan->cand_kind[k] = (uint8_t)(cand_addr_is_lan(eee, s) ? 1 : 2);
+        scan->cand_seen[k] = now;
+    } else {
+        int oldest = 0;
+        for (i = 1; i < N2N_CAND_MAX; i++)
+            if (scan->cand_seen[i] < scan->cand_seen[oldest]) oldest = i;
+        scan->cand_sock[oldest] = *s;
+        scan->cand_kind[oldest] = (uint8_t)(cand_addr_is_lan(eee, s) ? 1 : 2);
+        scan->cand_seen[oldest] = now;
+    }
+}
+
+/* Predicted next egress port for a sequential peer; 0 if not predictable. */
+static uint16_t port_predict(struct peer_info *peer)
+{
+    if (peer && peer->port_seq == 1 && peer->pred_port != 0)
+        return peer->pred_port;
+    return 0;
+}
+
+/* Same-exit LAN learn: a peer exiting through our own public IP advertises a
+ * private LAN endpoint (sockets[1]) that is a real direct path; keep it as a
+ * LAN candidate (kind=1) so it is not lost behind the public NAT hairpin. */
+static void same_exit_learn_lan(n2n_edge_t *eee, struct peer_info *peer,
+                                const n2n_sock_t *pub, const n2n_sock_t *lan,
+                                time_t now)
+{
+    if (pub == NULL || lan == NULL || peer == NULL) return;
+    if (eee->my_public_sock.family != AF_INET ||
+        pub->family != AF_INET || lan->family != AF_INET) return;
+    if (lan->port == 0) return;
+    if (memcmp(eee->my_public_sock.addr.v4, pub->addr.v4, IPV4_SIZE) != 0) return;
+    if (cand_addr_is_lan(eee, lan) == 0) return;
+    if (is_sn_assigned_subnet(eee, ntohl(*(uint32_t*)lan->addr.v4))) return;
+
+    candidate_learn(eee, peer, lan, now);
+}
+
 
 /** Send a REGISTER packet to another edge (using global local_sock). */
 static void send_register( n2n_edge_t * eee,
@@ -1708,30 +1816,136 @@ static void punch_aux_close( n2n_edge_t * eee )
         }
 }
 
-/** Sweep PROBE+REGISTER from one local socket over a window of ports around
- *  the peer's known port. A symmetric NAT maps a different egress port per
+/* Observe a peer's egress source ports (its current NAT mapping) and decide
+ * whether its NAT allocates ports sequentially or randomly; a sequential
+ * allocator lets the punch sweep centre on the predicted next port. */
+static void port_observe( n2n_edge_t * eee, struct peer_info * peer,
+                          const n2n_sock_t * src, time_t now )
+{
+    int i, inc, prev;
+    uint16_t port;
+
+    if ( !peer || !src || src->family != AF_INET ) return;
+    port = src->port;
+
+    /* On a fresh direct link any different source port is an aux punch socket;
+     * skip it so the ring keeps main-port egress only. A still-punching peer is
+     * NOT guarded: symmetric-NAT learning must observe every egress port. */
+    if ( peer->sock.family == AF_INET && peer->sock.port != 0 &&
+         peer->sock.port != port &&
+         peer->signal_seen != 0 &&
+         ( now - peer->signal_seen ) <= KEEPALIVE_SIGNAL_GRACE )
+        return;
+
+    /* Fast path: same egress port as last time — nothing new to learn. */
+    if ( peer->obs_port_cnt > 0 && peer->obs_port[0] == port )
+        return;
+
+    if ( peer->obs_port_cnt < 8 ) peer->obs_port_cnt++;
+    for ( i = peer->obs_port_cnt - 1; i > 0; i-- ) {
+        peer->obs_port[i]   = peer->obs_port[i-1];
+        peer->obs_port_t[i] = peer->obs_port_t[i-1];
+    }
+    peer->obs_port[0]   = port;
+    peer->obs_port_t[0] = now;
+
+    if ( peer->obs_port_cnt < 2 ) return;
+
+    prev = (int)peer->obs_port[1];
+    inc  = (int)port - prev;
+    if ( inc == 0 ) return;  /* port reused: cone-ish mapping, prediction moot */
+
+    /* Stability across the last two deltas distinguishes sequential from random. */
+    if ( peer->obs_port_cnt >= 3 ) {
+        int inc2 = (int)peer->obs_port[1] - (int)peer->obs_port[2];
+        if ( inc != inc2 ) {
+            peer->port_seq  = 2;   /* random */
+            peer->pred_port = 0;
+            return;
+        }
+    }
+
+    /* Sequential allocators use a small, fixed step (typically +/-1 or +/-2). */
+    if ( (inc > 0 && inc <= 64) || (inc < 0 && inc >= -64) ) {
+        peer->obs_inc     = inc;
+        peer->port_seq    = 1;   /* sequential */
+        peer->pred_port   = (uint16_t)((int)port + inc);
+        peer->pred_port_t = now;
+        traceEvent(TRACE_DEBUG, "port-seq inc=%d -> predict %u (observed %u)",
+                   inc, (unsigned)peer->pred_port, (unsigned)port);
+    } else {
+        peer->port_seq  = 2;     /* wild jump -> treat as random */
+        peer->pred_port = 0;
+    }
+
+    /* Learn the peer's freshest mapping port and reply immediately so its
+     * symmetric NAT keeps a live bidirectional mapping (covers sequential +
+     * random). Throttled to the punch interval while punching, else 10s. */
+    if ( peer->sock.family == AF_INET && port != peer->sock.port ) {
+        peer->sock.port  = port;
+        peer->sockets[0] = peer->sock;
+        time_t learn_throttle = 10;
+        if ( peer->punch_start_time != 0 && peer->punch_failed == 0 &&
+             peer->direct_seen == 0 )
+            learn_throttle = PUNCH_ROUND_INTERVAL;  /* 2s while punching */
+        if ( now - peer->last_learn_send >= learn_throttle ) {
+            peer->last_learn_send = now;
+            send_probe( eee, &peer->sock, peer->mac_addr );
+            send_register( eee, &peer->sock );
+        }
+    }
+}
+
+/** Sweep PROBE+REGISTER from one local socket over a window of ports. The
+ *  centre is the peer's predicted next egress port (sequential symmetric NAT),
+ *  else its known port. A symmetric NAT maps a different egress port per
  *  destination, so the single port the supernode observed can miss; spraying
- *  the neighbourhood gives the peer several chances to hear us. The window
- *  width comes from the peer's NAT type (supernode reflection - no STUN
- *  involved). radius 0 = single shot. */
+ *  the neighbourhood gives the peer several chances to hear us. The target is
+ *  the peer's own directly-observed mapping when the candidate ring holds one
+ *  (for endpoint-dependent NAT that differs from the SN's observation).
+ *  radius 0 = single shot. */
 static void punch_send_window( n2n_edge_t * eee, SOCKET fd, struct peer_info * peer,
                                int radius, const char * tag )
 {
+    time_t now = n2n_now();
     n2n_sock_t target = peer->sock;
-    uint16_t base = target.port;
+    uint16_t base, pred;
     int lo, hi, p, sent = 0;
+
+    if ( fd == -1 || target.family != AF_INET ) return;
+
+    /* Prefer the freshest public candidate over the SN's observation, guarded
+     * like port_observe so an aux port cannot hijack a fresh link. */
+    {
+        int best = -1, i;
+        time_t best_t = 0;
+        for ( i = 0; i < peer->cand_cnt; i++ ) {
+            if ( peer->cand_sock[i].family != AF_INET ) continue;
+            if ( peer->cand_kind[i] != 2 ) continue;              /* public only */
+            if ( now - peer->cand_seen[i] > KEEPALIVE_SIGNAL_GRACE ) continue;
+            if ( best < 0 || peer->cand_seen[i] > best_t ) { best = i; best_t = peer->cand_seen[i]; }
+        }
+        if ( best >= 0 &&
+             ( peer->cand_sock[best].port != target.port ||
+               memcmp( peer->cand_sock[best].addr.v4, target.addr.v4, IPV4_SIZE ) != 0 ) )
+            target = peer->cand_sock[best];
+    }
+
+    base = target.port;
 
     send_probe_fd(eee, fd, &target, peer->mac_addr);
     send_register_fd(eee, fd, &target);
     ++sent;
 
-    if ( radius > 0 ) {
-        lo = (int)base - radius;
-        hi = (int)base + radius;
+    pred = port_predict( peer );
+    if ( radius > 0 && pred == 0 ) pred = base;   /* no prediction: sweep the known port */
+    if ( radius > 0 && pred != 0 ) {
+        lo = (int)pred - radius;
+        hi = (int)pred + radius;
         if ( lo < 1 ) lo = 1;
         if ( hi > 65535 ) hi = 65535;
         for ( p = lo; p <= hi; p++ ) {
-            if ( (uint16_t)p == base ) continue;
+            if ( (uint16_t)p == target.port ) continue;
             target.port = (uint16_t)p;
             send_probe_fd(eee, fd, &target, peer->mac_addr);
             send_register_fd(eee, fd, &target);
@@ -1846,6 +2060,15 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
 
         if ( scan->punch_start_time != 0 && !scan->punch_failed )
         {
+            /* Fresh direct signalling already proves the endpoint bidirectionally;
+             * advancing punch rounds (and force-re-registering every round) is
+             * waste. Resume only once signalling goes cold. */
+            if ( scan->signal_seen != 0 &&
+                 ( now - scan->signal_seen ) <= KEEPALIVE_SIGNAL_GRACE ) {
+                prev = scan;
+                scan = scan->next;
+                continue;
+            }
             /* Punch with the latest known address; a missing PUNCH handoff never blocks. */
             if ( (now - scan->punch_round_time) >= PUNCH_ROUND_INTERVAL )
             {
@@ -1885,6 +2108,14 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
         } else if ( scan->punch_failed )
         {
             if ( scan->punch_retry_count >= 3 ) {
+                prev = scan;
+                scan = scan->next;
+                continue;
+            }
+            /* Signalling still fresh means the endpoint is reachable — re-punching
+             * is pointless until the signalling path itself goes cold. */
+            if ( scan->signal_seen != 0 &&
+                 ( now - scan->signal_seen ) <= KEEPALIVE_SIGNAL_GRACE ) {
                 prev = scan;
                 scan = scan->next;
                 continue;
@@ -3981,6 +4212,12 @@ static int handle_PACKET( n2n_edge_t * eee,
                 scan->direct_seen = now;
                 scan->last_probe_sent = 0;
                 scan->keepalive_fails = 0;
+                /* Learn the endpoint before refreshing signal_seen, so the
+                 * learning guards still see the previous (possibly stale)
+                 * signal time and accept a changed mapping. */
+                candidate_learn(eee, scan, orig_sender, now);
+                port_observe(eee, scan, orig_sender, now);
+                scan->signal_seen = now;   /* a direct data frame proves the endpoint */
                 
                 int peer_uses_ipv4 = (scan->sock.family == AF_INET);
                 int peer_uses_ipv6 = (scan->sock6.family == AF_INET6);
@@ -4700,6 +4937,11 @@ static void try_peer_lan_ipv4( n2n_edge_t * eee,
                     memcmp(eee->my_public_sock.addr.v4, pub_sock->addr.v4, IPV4_SIZE) == 0;
     pending->p2p_is_lan = same_lan ? 1 : 0;
 
+    /* Same public exit as us: keep the peer's private LAN endpoint as a LAN
+     * candidate so the direct path is not lost behind the public hairpin. */
+    if (same_lan)
+        same_exit_learn_lan(eee, pending, pub_sock, lan_sock, n2n_now());
+
     if (same_lan) {
         n2n_sock_t lan = *lan_sock;
         n2n_sock_str_t lanbuf;
@@ -5141,6 +5383,10 @@ process_n2n_packet:
                             scan->last_seen = n2n_now();
                         }
                     }
+                    if (!from_supernode) {
+                        candidate_learn(eee, scan, orig_sender, n2n_now());
+                        scan->signal_seen = n2n_now();
+                    }
                     /* Update version/os_name from REGISTER */
                     if (reg.version[0] != '\0') {
                         strncpy(scan->version, reg.version, sizeof(scan->version) - 1);
@@ -5225,11 +5471,15 @@ process_n2n_packet:
                     } else {
                         pscan->sock = sender;
                     }
+                    candidate_learn(eee, pscan, &sender, now);
+                    pscan->signal_seen = now;
                     send_register(eee, &sender);
                 }
             } else {
                 known->last_seen = now;
                 known->direct_seen = now;
+                candidate_learn(eee, known, &sender, now);
+                known->signal_seen = now;
             }
             PEERS_UNLOCK(eee);
         }
@@ -5247,6 +5497,8 @@ process_n2n_packet:
             if (kp) {
                 kp->last_seen = now;
                 kp->direct_seen = now;
+                port_observe(eee, kp, &sender, now);
+                kp->signal_seen = now;
                 kp->last_probe_sent = 0;
                 kp->keepalive_fails = 0;
             }
