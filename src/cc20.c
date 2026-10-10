@@ -258,7 +258,7 @@ int cc20_crypt (unsigned char *out, const unsigned char *in, size_t in_len,
 }
 
 
-#elif defined (__ARM_NEON) && !defined (N2N_NO_NEON)
+#elif defined (__ARM_NEON)
 // NEON support ---------------------------------------------------------------------------------
 
 

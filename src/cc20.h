@@ -61,7 +61,7 @@ typedef struct cc20_context {
 } cc20_context_t;
 
 
-#elif defined (__ARM_NEON) && !defined (N2N_NO_NEON)
+#elif defined (__ARM_NEON)
 // NEON support ---------------------------------------------------------------------------------
 
 
