@@ -363,8 +363,8 @@ static int edge_init(n2n_edge_t * eee)
     eee->upnp_mapped_port = 0;
 #ifdef _WIN32
     InitializeCriticalSection(&eee->peers_lock);
-#endif
     eee->keep_running   = 1;
+#endif
     eee->last_register_req = 0;
     eee->register_lifetime = 120;
     eee->last_p2p = 0;
@@ -511,54 +511,7 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
     }
 
     eee->udp_sock6 = open_socket6(local_port, 1 /*bind ANY*/);
-
-#ifdef _WIN32
-    /* Bind a WSA event to each UDP socket so the main loop can
-     *   WaitForMultipleObjects() on them alongside the TAP overlapped
-     *   event.  The event fires for FD_READ | FD_CLOSE; the loop drains
-     *   via the same FD_ISSET/select(timeout=0) path so we never need
-     *   WSAEnumNetworkEvents.
-     *
-     *   Race: if a previous socket was closed (e.g. supernode reconnect
-     *   path) its old event handle is leaked — guard against that by
-     *   closing the previous one before re-binding. */
-    if (eee->device.udp_sock_event) {
-        WSAEventSelect(eee->udp_sock, NULL, 0);
-        CloseHandle(eee->device.udp_sock_event);
-        eee->device.udp_sock_event = NULL;
-    }
-    eee->device.udp_sock_event = WSACreateEvent();
-    if (!eee->device.udp_sock_event ||
-        WSAEventSelect(eee->udp_sock, eee->device.udp_sock_event,
-                       FD_READ | FD_CLOSE) == SOCKET_ERROR)
-    {
-        traceEvent(TRACE_ERROR, "WSAEventSelect(udp_sock) failed: %d", WSAGetLastError());
-        if (eee->device.udp_sock_event) {
-            CloseHandle(eee->device.udp_sock_event);
-            eee->device.udp_sock_event = NULL;
-        }
-    }
-
-    if (eee->device.udp_sock6_event) {
-        WSAEventSelect(eee->udp_sock6, NULL, 0);
-        CloseHandle(eee->device.udp_sock6_event);
-        eee->device.udp_sock6_event = NULL;
-    }
-    if (eee->udp_sock6 != -1) {
-        eee->device.udp_sock6_event = WSACreateEvent();
-        if (!eee->device.udp_sock6_event ||
-            WSAEventSelect(eee->udp_sock6, eee->device.udp_sock6_event,
-                           FD_READ | FD_CLOSE) == SOCKET_ERROR)
-        {
-            traceEvent(TRACE_ERROR, "WSAEventSelect(udp_sock6) failed: %d", WSAGetLastError());
-            if (eee->device.udp_sock6_event) {
-                CloseHandle(eee->device.udp_sock6_event);
-                eee->device.udp_sock6_event = NULL;
-            }
-        }
-    }
-#endif
-
+    
     int has_ipv4 = (eee->udp_sock != -1);
     int has_ipv6 = 0;
     memset(&eee->own_ipv6, 0, sizeof(n2n_sock_t));
@@ -783,8 +736,7 @@ static void help() {
     printf("-k <encrypt key>         | Encryption key (ASCII, max 32) - also N2N_KEY=<encrypt key>.\n");
     printf("-l <supernode host:port> | Supernode address Formats:\n");
     printf("                         : host:port - direct address, common format (e.g. 1.2.3.4:5678)\n");
-    printf("                         : host      - dns txt address (e.g. n2n6.ouno.eu.org, it's default)\n");
-    printf("                         : max 2 supernodes (-l xxx again), first is primary, failover auto.\n");
+    printf("                         : host      - dns txt address (e.g. n2n6.ouno.eu.org, it's default).\n");
     printf("-4/-6                    | Resolve supernode DNS name as IPv4 or IPv6 (default: auto).\n");
     printf("-b <port>                | Enable bypass (no port = default port %d).\n", BYPASS_DEFAULT_PORT);
 #if N2N_CAN_NAME_IFACE && !defined(_WIN32)
@@ -832,23 +784,6 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
 
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
-
-    /* Single-thread design: a retry loop would block the main thread,
-     * preventing UDP ACK processing and destroying throughput.
-     * If the send buffer is full, drop the packet — TCP retransmits.
-     * The 128-loop in the main loop processes ACKs quickly so TCP
-     * can recover from any loss. */
-#ifndef _WIN32
-    for( int retry = 0; retry < 50 && sent < 0; retry++ )
-    {
-        if( errno != EAGAIN && errno != EWOULDBLOCK )
-            break;
-        usleep(1000);
-        sent = sendto( fd, buf, len, 0/*flags*/,
-                       (struct sockaddr*) &peer_addr, addr_len );
-    }
-#endif
-
     if ( sent < 0 )
     {
 #ifdef _WIN32
@@ -1340,50 +1275,6 @@ static void send_register_super( n2n_edge_t * eee,
             sendto_sock(alt_sock, pktbuf, idx, &eee->supernode_alt);
         }
     }
-}
-
-/** Send a lightweight REGISTER_SUPER "heartbeat" to a specific supernode.
- *  Used to probe the primary while operating on the backup so failback can
- *  happen as soon as the primary is reachable again. Reuses the current
- *  cookie and does NOT disturb the active registration state. */
-static void send_supernode_heartbeat( n2n_edge_t * eee,
-                                      const n2n_sock_t * target )
-{
-    uint8_t pktbuf[N2N_PKT_BUF_SIZE];
-    size_t idx;
-    n2n_common_t cmn;
-    n2n_REGISTER_SUPER_t reg;
-    n2n_sock_str_t sockbuf;
-
-    memset(&cmn, 0, sizeof(cmn) );
-    memset(&reg, 0, sizeof(reg) );
-    cmn.ttl = N2N_DEFAULT_TTL;
-    cmn.pc = n2n_register_super;
-    cmn.flags = 0;
-    memcpy( cmn.community, eee->community_name, N2N_COMMUNITY_SIZE );
-
-    /* Reuse the live cookie so its ACK passes the cookie check. */
-    memcpy( reg.cookie, eee->last_cookie, N2N_COOKIE_SIZE );
-    reg.auth.scheme = 0;
-
-    idx = 0;
-    encode_mac( reg.edgeMac, &idx, eee->device.mac_addr );
-
-    reg.dev_addr.net_addr   = default_ip_assignment ? 0 : ntohl(eee->device.ip_addr);
-    reg.dev_addr.net_bitlen = eee->device.ip_prefixlen;
-
-    if ( eee->local_sock_ena ) {
-        reg.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
-        reg.local_sock = eee->local_sock;
-    }
-
-    idx = 0;
-    encode_REGISTER_SUPER( pktbuf, &idx, &cmn, &reg );
-
-    traceEvent( TRACE_INFO, "heartbeat REGISTER_SUPER to %s",
-                sock_to_cstr( sockbuf, target ) );
-
-    sendto_sock( sock_for_dest( eee, target ), pktbuf, idx, target );
 }
 
 /** Send a REGISTER_ACK packet to a peer edge. */
@@ -2342,77 +2233,11 @@ static void update_peer_address(n2n_edge_t * eee,
  *
  *  This is frequently called by the main loop.
  */
-/* ------------------------------------------------------------------ */
-/* Supernode selection (mirrors cnn2n): a plain circular list.        */
-/*                                                                    */
-/*   - the edge tries the active supernode first (eee->sn_idx)        */
-/*   - if the ACK does not arrive within the retry budget, it moves    */
-/*     on to the next one (++sn_idx, wrap-around)                     */
-/*   - the first REGISTER_SUPER_ACK of each registration resets the   */
-/*     retry budget (sup_attempts), so a healthy supernode is never    */
-/*     left (later/alt ACKs only refresh last_sup)                     */
-/*   - with two SNs, while on the backup the primary is probed every   */
-/*     30 s; as soon as the primary answers, the edge returns to it    */
-/*   - switching/returning ALWAYS re-resolves the active address into  */
-/*     eee->supernode (+ the other into eee->sn_backup; + alternate     */
-/*     family into eee->supernode_alt). Without this the switch would   */
-/*     silently keep talking to the old, dead supernode.                */
-/* ------------------------------------------------------------------ */
-
-/* Switch the active supernode to index idx and resolve all addresses. */
-static void sn_switch_to( n2n_edge_t * eee, size_t idx )
-{
-    eee->sn_idx = idx;
-    eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;   /* fresh retry budget */
-
-    /* Active supernode address. */
-    supernode2addr( &(eee->supernode), eee->sn_af, eee->sn_ip_array[idx] );
-
-    /* Dual-SN: resolve the other one for probing / failback. */
-    if ( eee->sn_num >= 2 )
-    {
-        size_t other = 1 - idx;
-        memset(&(eee->sn_backup), 0, sizeof(n2n_sock_t));
-        supernode2addr( &(eee->sn_backup), eee->sn_af, eee->sn_ip_array[other] );
-    }
-
-    /* Alternate address family of the active supernode (dual-stack).
-     * WS mode uses one connection, skip. */
-    if ( !eee->use_ws )
-    {
-        int alt_af = ( eee->supernode.family == AF_INET6 ) ? AF_INET : AF_INET6;
-        memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
-        if ( ( alt_af == AF_INET6 ) ? ( eee->udp_sock6 != -1 )
-                                    : ( eee->udp_sock  != -1 ) )
-            supernode2addr( &eee->supernode_alt, alt_af,
-                           eee->sn_ip_array[idx] );
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/* update_supernode_reg: supernode periodic registration + failover.
- * KNOWN ISSUES (not yet fixed / not supported) --
- * [1] No visible indication of an SN switch at all from the edge side
- *     when it happens. TODO: show a clear "currently using supernode
- *     X/Y" message on switch.
- * [2] WS mode (eee->use_ws) skips the failback probe here (heartbeat
- *     is gated by !eee->use_ws) because it has a single connection;
- *     its SN re-selection is instead driven by the main-loop reconnect
- *     logic, so switching a WS edge takes effect only on reconnect. */
 static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 {
-    /* While on the backup supernode, keep the primary probed so we can
-     * return as soon as it comes back (failback). Every ~30 s. */
-    if ( eee->sn_num >= 2 && eee->sn_idx != 0 && !eee->use_ws &&
-         ( nowTime - eee->last_primary_probe >= 30 ) )
-    {
-        eee->last_primary_probe = nowTime;
-        send_supernode_heartbeat( eee, &(eee->sn_backup) );
-    }
-
-    /* Periodic registration (30 s). A fresh cycle resets the budget. */
     if ( nowTime > (time_t) (eee->last_register_req + 30) )
     {
+        eee->sn_wait = 0;
         eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
         send_register_super( eee, &(eee->supernode) );
         eee->sn_wait = 1;
@@ -2420,7 +2245,6 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         return;
     }
 
-    /* Fast retry while an ACK is still pending, else not yet due. */
     if ( eee->sn_wait && ( nowTime > (time_t) (eee->last_register_req + (eee->register_lifetime/10) ) ) )
     {
         /* fall through - fast retry */
@@ -2432,21 +2256,69 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
 
     if ( 0 == eee->sup_attempts )
     {
-        /* Give up on this supernode and move to the next one (circular). */
-        size_t next = eee->sn_idx + 1;
-        if ( next >= eee->sn_num ) next = 0;
-        sn_switch_to( eee, next );
+        if ( eee->sn_num > 1 )
+        {
+            ++(eee->sn_idx);
+            if (eee->sn_idx >= eee->sn_num) eee->sn_idx=0;
+            traceEvent(TRACE_WARNING, "Supernode not responding - moving to %u of %u",
+                       (unsigned int)eee->sn_idx, (unsigned int)eee->sn_num);
+        } else {
+            /* Single supernode: no point "switching", just retry */
+            traceEvent(TRACE_DEBUG, "Supernode not responding - retrying same supernode");
+        }
+        eee->sup_attempts = N2N_EDGE_SUP_ATTEMPTS;
 
-        traceEvent( TRACE_WARNING, "Supernode not responding - now trying %u/%u",
-                    (unsigned int)(eee->sn_idx + 1), (unsigned int)eee->sn_num );
+        /* Only re-open the UDP sockets when the supernode is unreachable AND
+         * the local connection is completely dead (no P2P direct traffic and
+         * no supernode traffic for a while). Re-opening changes the local UDP
+         * port, which invalidates the NAT mapping of healthy P2P direct paths
+         * — a busy supernode (e.g. evening peak) missing registration ACKs is
+         * NOT a reason to disturb working direct links. But if everything is
+         * truly dead, a fresh socket may clear a stale local state and help
+         * reconnect to the supernode. */
+        {
+            int local_alive = 0;
+            if (eee->last_p2p > 0 && (nowTime - eee->last_p2p) < 30)
+                local_alive = 1;   /* recent direct traffic: local net is fine */
+            else if (eee->last_sup > 0 && (nowTime - eee->last_sup) < 30)
+                local_alive = 1;   /* recent supernode reply: local net is fine */
+
+            if ( !local_alive && ( eee->local_port == 0 || eee->local_port > 1024 ) )
+            {
+                if (eee->udp_sock != -1) closesocket(eee->udp_sock);
+                if (eee->udp_sock6 != -1) closesocket(eee->udp_sock6);
+                eee->udp_sock  = open_socket(eee->local_port, 1);
+                eee->udp_sock6 = open_socket6(eee->local_port, 1);
+                traceEvent(TRACE_NORMAL, "Supernode unreachable and no local traffic: re-opened UDP sockets");
+            }
+        }
+
+        /* Re-resolve supernode address when switching to a different supernode */
+        if(eee->re_resolve_supernode_ip)
+        {
+            supernode2addr(&(eee->supernode), eee->sn_af, eee->sn_ip_array[eee->sn_idx]);
+            
+            /* Re-resolve alternate address for dual-stack registration */
+            {
+                int alt_af = (eee->supernode.family == AF_INET6) ? AF_INET : AF_INET6;
+                int can_resolve = (alt_af == AF_INET6) ? (eee->udp_sock6 != -1) : (eee->udp_sock != -1);
+                memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
+                if (can_resolve) {
+                    supernode2addr(&eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx]);
+                }
+            }
+        }
     }
     else
     {
         --(eee->sup_attempts);
     }
 
+    /* Note: Domain re-resolution during normal registration is handled by
+     * check_supernode_domain_and_update() which runs every 300 seconds when idle. */
+
     send_register_super( eee, &(eee->supernode) );
-    eee->sn_wait = 1;
+    eee->sn_wait=1;
     eee->last_register_req = nowTime;
 }
 
@@ -2851,41 +2723,6 @@ static int is_ethMulticast( const void * buf, size_t bufsize )
         }
     }
     return retval;
-}
-
-/** Process one raw Ethernet frame from TAP RX: apply multicast drop,
- *  then try bypass fast-path, otherwise send via n2n overlay.
- *  This is the EXACT same downstream path readFromTAPSocket uses,
- *  extracted to a helper so we can call it from three places:
- *    (1) pre-loop sync-drain of tuntap_read_begin_overlapped,
- *    (2) after WaitForSingleObject returns on overlap_read.hEvent,
- *    (3) sync-completion loop after re-submitting a read. */
-static inline void process_tap_rx_frame(n2n_edge_t *eee,
-                                        const uint8_t *buf, ssize_t len) {
-    macstr_t mac_buf;
-    const uint8_t *mac = buf;
-
-    /* Defensive — never pass garbage down. */
-    if (!eee || !buf || len <= 0 || len > 1600)
-        return;
-
-    traceEvent(TRACE_DEBUG, "### Rx TAP packet (%4d) for %s",
-               (int)len, macaddr_str(mac_buf, mac));
-
-    if (eee->drop_multicast && is_ethMulticast(buf, len)) {
-        traceEvent(TRACE_DEBUG, "Dropping multicast");
-        return;
-    }
-
-    /* bypass_has_peers already handles NULL ctx (returns 0).  The
-     *   || short-circuit guarantees bypass_tap_forward is never called
-     *   with a NULL ctx, but we guard it explicitly anyway so future
-     *   refactors of the condition can never accidentally null-deref. */
-    if (!bypass_has_peers(eee->bp) ||
-        (eee->bp && bypass_tap_forward(eee->bp, (uint8_t*)buf, len) == 0))
-    {
-        send_packet2net(eee, (uint8_t*)buf, len);
-    }
 }
 
 /** Read a single packet from the TAP interface, process it and write out the
@@ -4413,23 +4250,6 @@ process_n2n_packet:
 
                 if ( 0 == memcmp( ra.cookie, eee->last_cookie, N2N_COOKIE_SIZE ) )
                 {
-                    /* Failback: the primary just answered a heartbeat while we were on
-                     * the backup — switch the active supernode back to it.
-                     * (Re-registration to the primary happens on the next
-                     * registration cycle.) */
-                    if ( eee->sn_num >= 2 && eee->sn_idx != 0 &&
-                         eee->sn_backup.family != 0 &&
-                         sock_equal( &sender, &eee->sn_backup ) == 0 )
-                    {
-                        sn_switch_to( eee, 0 );
-                        eee->sn_ack_count = 0;
-                        eee->sn_wait = 0;
-                        eee->last_sup = now;
-                        traceEvent( TRACE_WARNING,
-                                    "Primary supernode back online - returning to 1/%u",
-                                    (unsigned int)eee->sn_num );
-                    }
-
                     eee->sn_ack_count++;
 
                     if ( ra.num_sn > 0 )
@@ -4493,12 +4313,8 @@ process_n2n_packet:
                             else
                                 caps_str = "unknown (old supernode)";
                             traceEvent(TRACE_NORMAL, "Supernode support: %s", caps_str);
-                            char sn_suffix[16] = "";
-                            if (eee->sn_idx > 0)
-                                snprintf(sn_suffix, sizeof(sn_suffix), " %u",
-                                         (unsigned int)(eee->sn_idx + 1));
-                            traceEvent(TRACE_NORMAL, "[OK] edge <<< ======= %s ======= >>> supernode%s",
-                                       sender.family == AF_INET6 ? "IPv6" : "IPv4", sn_suffix);
+                            traceEvent(TRACE_NORMAL, "[OK] edge <<< ======= %s ======= >>> supernode",
+                                       sender.family == AF_INET6 ? "IPv6" : "IPv4");
                             first_ok_message_shown = 1;
                         } else {
                             traceEvent(TRACE_DEBUG, "[OK] edge <<< ======= %s ======= >>> supernode",
@@ -4619,6 +4435,38 @@ process_n2n_packet:
 
 /* ***************************************************** */
 
+
+#ifdef _WIN32
+static DWORD tunReadThread(LPVOID lpArg )
+{
+    n2n_edge_t *eee = (n2n_edge_t*)lpArg;
+
+    while(eee->keep_running)
+    {
+        readFromTAPSocket(eee);
+    }
+
+    return 0;
+}
+
+/** Start a second thread in Windows because TUNTAP interfaces do not expose
+ *  file descriptors. */
+static void startTunReadThread(n2n_edge_t *eee)
+{
+    HANDLE hThread;
+    DWORD dwThreadId;
+
+    hThread = CreateThread(NULL,         /* security attributes */
+                           0,            /* use default stack size */
+                           (LPTHREAD_START_ROUTINE)tunReadThread, /* thread function */
+                           (void*)eee,   /* argument to thread function */
+                           0,            /* thread creation flags */
+                           &dwThreadId); /* thread id out */
+    eee->tun_thread_handle = (hThread != NULL) ? hThread : NULL;
+}
+#endif
+
+/* ***************************************************** */
 
 /** Build DNS query packet for TXT record.
  *  Returns the length of the query packet.
@@ -5300,13 +5148,8 @@ static int scan_route(char* optarg, struct tuntap_config* tuntap_config) {
     }
     else if ((tuntap_config->routes_count % 16) == 15)
     {
-        route *_new = (route*)realloc(tuntap_config->routes,
+        tuntap_config->routes = (route*)realloc(tuntap_config->routes,
             ((tuntap_config->routes_count / 16 + 2) * 16) * sizeof(route));
-        if (!_new) {
-            traceEvent(TRACE_ERROR, "Out of memory for routes");
-            return 0;
-        }
-        tuntap_config->routes = _new;
     }
 
     route* r = &tuntap_config->routes[tuntap_config->routes_count];
@@ -5354,17 +5197,14 @@ fail:
     }
     else if ((tuntap_config->routes_count % 16) == 15)
     {
-        route *_new = (route*) reallocarray(tuntap_config->routes, ((tuntap_config->routes_count / 16 + 1) * 16), sizeof(route));
-        if (_new)
-            tuntap_config->routes = _new;
-        /* else: keep the original allocation, leak is insignificant */
+        tuntap_config->routes = (route*) reallocarray(tuntap_config->routes, ((tuntap_config->routes_count / 16 + 1) * 16), sizeof(route));
     }
     return 0;
 }
 
 /** In the main loop: start bypass negotiation for known_peers that have
- *  had P2P established for >= 2 seconds (principle 10: bypass is only a
- *  fallback). The 2s guard is enforced by bypass_start_negotiation(). */
+ *  had P2P established for >= 2 seconds (principle 10: "旁路只是备选项").
+ *  The 2s guard is enforced by bypass_start_negotiation(). */
 static void check_delayed_bypass(n2n_edge_t *eee, time_t now)
 {
     if (!eee->bp) return;
@@ -5779,22 +5619,12 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
 
     for (int i = 0; i < eee.sn_num; ++i) {
         if (strcmp(eee.sn_ip_array[i], "n2n6.ouno.eu.org") == 0) continue;
-        traceEvent(TRACE_NORMAL, "Supernode %u => %s", (unsigned int)(i + 1), (eee.sn_ip_array[i]));
+        traceEvent(TRACE_NORMAL, "Supernode %u => %s", i, (eee.sn_ip_array[i]));
     }
 
     while (supernode2addr(&(eee.supernode), eee.sn_af, eee.sn_ip_array[eee.sn_idx]) != 0) {
         if (!g_edge_running) break;
-
-        if (eee.sn_num > 1) {
-            /* Try the next configured supernode first before sleeping */
-            traceEvent(TRACE_WARNING, "Failed to resolve supernode %s, trying next (%u of %u)...",
-                       eee.sn_ip_array[eee.sn_idx],
-                       (unsigned int)(eee.sn_idx + 1), (unsigned int)eee.sn_num);
-            eee.sn_idx = (eee.sn_idx + 1) % eee.sn_num;
-        } else {
-            traceEvent(TRACE_WARNING, "Failed to resolve supernode, retrying in 5 seconds...");
-        }
-
+        traceEvent(TRACE_WARNING, "Failed to resolve supernode, retrying in 5 seconds...");
 #ifdef _WIN32
         Sleep(5000);
 #else
@@ -6038,45 +5868,7 @@ static int run_loop(n2n_edge_t * eee )
     int   retval = 0;
 
 #ifdef _WIN32
-    /* Single-threaded TAP reader using OVERLAPPED I/O —
-     *   architecture 100% aligned with cnn2n.  No tunReadThread,
-     *   no ring buffer, no cross-thread events.  TAP reads are
-     *   submitted as overlapped IRPs, completions are signalled
-     *   via overlap_read.hEvent directly to the main loop's
-     *   WaitForSingleObject, and frames flow straight from
-     *   tuntap_dev.read_buf → bypass_tap_forward → send_packet2net
-     *   on the SAME thread with zero intermediate queueing.  If
-     *   send_packet2net blocks on a full SO_SNDBUF, no further
-     *   TAP reads are submitted until it unblocks, so the TAP
-     *   driver's RX ring fills up and the user-space TCP that is
-     *   writing to the TAP gets back-pressure automatically —
-     *   zero parameters, fully auto-tuning to the real uplink
-     *   capacity just like cnn2n.
-     *
-     *   Pre-submit the first overlapped read before entering the
-     *   loop, draining any synchronously-completed frames (driver
-     *   backlog on startup).  On any transient error we silently
-     *   skip; the per-tick lazy-init block inside the loop will
-     *   re-try the submission so we never get stuck with no IRP
-     *   in flight. */
-    if (eee->device.overlap_read.hEvent != NULL &&
-        eee->device.device_handle != INVALID_HANDLE_VALUE)
-    {
-        ssize_t slen;
-        while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
-            process_tap_rx_frame(eee, eee->device.read_buf, slen);
-        }
-        traceEvent(TRACE_DEBUG,
-                   "TAP overlapped reader primed (read_pending=%u, last_begin=%d)",
-                   (unsigned)eee->device.read_pending, (int)slen);
-    }
-    else
-    {
-        traceEvent(TRACE_WARNING,
-                   "TAP overlapped reader skipped (hEvent=%p device_handle=%p)",
-                   eee->device.overlap_read.hEvent,
-                   (void*)(UINT_PTR)eee->device.device_handle);
-    }
+    startTunReadThread(eee);
 #endif
 
     /* Main loop
@@ -6109,18 +5901,17 @@ static int run_loop(n2n_edge_t * eee )
         max_sock = max( (int) max_sock, (int) eee->device.fd );
 #endif
 
-        /* Add bypass proxy and connection sockets to select */
-        fd_set bypass_write_mask;
-        int bypass_active = bypass_has_peers(eee->bp);
-        FD_ZERO(&bypass_write_mask);
-
-        /* WS mode: add the WebSocket connection fd to select (reads only) */
+        /* WS mode: add WebSocket connection fd to select */
         if (eee->use_ws && eee->ws_conn.state == WS_OPEN && eee->ws_conn.fd >= 0) {
             FD_SET(eee->ws_conn.fd, &socket_mask);
             max_sock = max(max_sock, (int)eee->ws_conn.fd);
         }
 
+        /* Add bypass proxy and connection sockets to select */
+        fd_set bypass_write_mask;
+        int bypass_active = bypass_has_peers(eee->bp);
         if (bypass_active) {
+            FD_ZERO(&bypass_write_mask);
             if (eee->bp->proxy_sock >= 0) {
                 FD_SET(eee->bp->proxy_sock, &socket_mask);
                 max_sock = max(max_sock, eee->bp->proxy_sock);
@@ -6140,135 +5931,15 @@ static int run_loop(n2n_edge_t * eee )
             }
         }
 
-        /* ---------- Wait / wake-up.
-         *   One fixed tick cadence (N2N_MAINLOOP_TICK_MS = 10 ms) for
-         *   EVERY deployment — it covers KCP's 100 Hz update cadence,
-         *   and 0-10 ms added ingress latency on non-TAP fds is
-         *   invisible on any real WAN RTT.  Completely generic.
-         *
-         *   Windows: single-threaded OVERLAPPED I/O — no separate tunReadThread.
-         *            We block on overlap_read.hEvent (the single kernel
-         *            notification that TAP driver has completed a read
-         *            IRP we submitted) and combine that with a 10 ms
-         *            upper bound for polling all ingress socket fds.
-         *            Architecture = cnn2n exactly:
-         *              WFSO → TAP frame ready? → process → send_packet2net
-         *                → if send_packet2net blocks on SO_SNDBUF full,
-         *                  we stall here; further TAP reads won't be
-         *                  submitted until it unblocks → TAP driver RX
-         *                  ring fills up → user-space TCP writing to
-         *                  TAP gets blocked → TCP cwnd auto-tunes to
-         *                  real uplink capacity.
-         *            After every wakeup (signal or timeout) we run
-         *            select(timeout=0) on the same fd sets as Linux,
-         *            so UDP/mgmt/WS/bypass TCP fds never need WinSock
-         *            event binding (which silently breaks SO_SNDBUF
-         *            back-pressure by forcing non-blocking mode).
-         *   Linux:   Classic select(timeout = 10 ms) — TAP fd already
-         *            lives in socket_mask so no extra handle is needed,
-         *            all I/O stays single-threaded. ---------- */
-#ifdef _WIN32
-        {
-            /* Single-threaded, fully event-driven Windows I/O.
-             *
-             *   WaitForMultipleObjects() on:
-             *     [0] TAP overlapped read completion event
-             *     [1] UDP v4 socket WSA event (FD_READ | FD_CLOSE)
-             *     [2] UDP v6 socket WSA event (FD_READ | FD_CLOSE)  [optional]
-             *   Timeout = N2N_MAINLOOP_TICK_MS (10 ms) guarantees we
-             *   always wake up to drive the periodic tick (KCP,
-             *   supernode reg, keepalive, ...).
-             *
-             *   WFSO manual-reset events stay signalled until WE reset
-             *   them, so a single fire handles "frame available" and
-             *   draining happens via the post-WFSO select(timeout=0)
-             *   pass below — exactly the same FD walk as Linux. */
-            HANDLE handles[3];
-            int n_handles = 0;
-            HANDLE h_tap = eee->device.overlap_read.hEvent;
-            if (h_tap != NULL) handles[n_handles++] = h_tap;       /* [0] */
-            if (eee->device.udp_sock_event)  handles[n_handles++] = eee->device.udp_sock_event;  /* [1] */
-            if (eee->device.udp_sock6_event) handles[n_handles++] = eee->device.udp_sock6_event; /* [2] */
-
-            DWORD wfso_rc;
-            if (n_handles > 0) {
-                wfso_rc = WaitForMultipleObjects((DWORD)n_handles, handles,
-                                                 FALSE, N2N_MAINLOOP_TICK_MS);
-            } else {
-                /* No events bound (extreme init failure). Fall back to
-                 *   a pure sleep so we don't spin. */
-                static unsigned warn_suppress = 0;
-                if (warn_suppress == 0)
-                    traceEvent(TRACE_WARNING,
-                               "TAP event handle unavailable, falling back to sleep");
-                warn_suppress = (warn_suppress + 1) & 0xFFu;
-                Sleep((DWORD)N2N_MAINLOOP_TICK_MS);
-                wfso_rc = WAIT_TIMEOUT;
-            }
-
-            /* After a UDP WSAEvent fires, the FD_READ/FD_CLOSE events are
-             *   still queued in the socket's internal network-event
-             *   structure.  Calling select() on the same socket
-             *   de-queues them AND un-signals the WSA event (since the
-             *   event is edge-triggered in that sense: re-arming only
-             *   happens after the network events are consumed).  This
-             *   is the same approach cnn2n uses. */
-            if (wfso_rc != WAIT_TIMEOUT && n_handles > 0 &&
-                (wfso_rc - WAIT_OBJECT_0) < (DWORD)n_handles)
-            {
-                /* Signalled index = (wfso_rc - WAIT_OBJECT_0).
-                 *   We don't need to act on the WSA events directly —
-                 *   the select(timeout=0) pass below picks them up. */
-                (void)0;
-            }
-
-            /* TAP RX harvesting: same careful rules as before.
-             *   - Only touch overlap_read if TAP event fired (index 0).
-             *   - GetOverlappedResult(bWait=FALSE) on a still-pending
-             *     IRP fails with ERROR_IO_INCOMPLETE — never do that.
-             *   - On async completion, ResetEvent + harvest + resubmit,
-             *     draining any synchronously-completed frames. */
-            bool tap_signalled = (wfso_rc != WAIT_TIMEOUT &&
-                                  n_handles > 0 &&
-                                  (wfso_rc - WAIT_OBJECT_0) == 0);
-            if (tap_signalled && eee->device.read_pending) {
-                ResetEvent(eee->device.overlap_read.hEvent);
-                ssize_t len = tuntap_read_complete_overlapped(&eee->device);
-                if (len > 0) {
-                    process_tap_rx_frame(eee, eee->device.read_buf, len);
-                }
-                ssize_t slen;
-                while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
-                    process_tap_rx_frame(eee, eee->device.read_buf, slen);
-                }
-            } else if (!eee->device.read_pending) {
-                /* No IRP in flight (lost one, or first tick). Resubmit. */
-                ssize_t slen;
-                while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
-                    process_tap_rx_frame(eee, eee->device.read_buf, slen);
-                }
-            }
-            /* else: WFSO timed out (or UDP fired, not TAP) and a TAP
-             *       IRP is still pending — leave it. */
-
-            /* Zero-timeout select walk so UDP/mgmt/WS/bypass fds get
-             *   serviced without blocking.  Zero timeout is correct:
-             *   WFSO above already gated on I/O availability. */
-            struct timeval zt;
-            zt.tv_sec  = 0;
-            zt.tv_usec = 0;
-            rc = select(max_sock + 1, &socket_mask,
-                        bypass_active ? &bypass_write_mask : NULL, NULL, &zt);
+        wait_time.tv_sec = SOCKET_TIMEOUT_INTERVAL_SECS; wait_time.tv_usec = 0;
+        /* When KCP connections are active, use 10ms select timeout
+         * for responsive KCP updates (ikcp_update every 10ms). */
+        if (bypass_has_kcp_conns(eee->bp)) {
+            wait_time.tv_sec = 0;
+            wait_time.tv_usec = 10000;  /* 10ms */
         }
-#else
-        {
-            struct timeval tick;
-            tick.tv_sec  = 0;
-            tick.tv_usec = N2N_MAINLOOP_TICK_MS * 1000;  /* 10 ms */
-            rc = select(max_sock + 1, &socket_mask,
-                        bypass_active ? &bypass_write_mask : NULL, NULL, &tick);
-        }
-#endif
+
+        rc = select(max_sock+1, &socket_mask, bypass_active ? &bypass_write_mask : NULL, NULL, &wait_time);
         nowTime=n2n_now();
 
         /* Handle signal interruption */
@@ -6324,16 +5995,11 @@ static int run_loop(n2n_edge_t * eee )
                 }
             }
 
-            /* WS mode: handle WebSocket fd read — drain like the UDP loop
-             * (128 cap) because ws_recv decodes ONE frame per call;
-             * a single recv per select tick caps WS throughput at ~1 Mbps. */
+            /* WS mode: handle WebSocket fd read */
             if (eee->use_ws && eee->ws_conn.state == WS_OPEN &&
                 eee->ws_conn.fd >= 0 &&
                 FD_ISSET(eee->ws_conn.fd, &socket_mask)) {
-                for (int _wi = 0; _wi < 128; _wi++) {
-                    if (readFromIPSocket(eee, eee->ws_conn.fd) == 0)
-                        break;
-                }
+                readFromIPSocket(eee, eee->ws_conn.fd);
             }
 
             if(eee->mgmt_sock != -1 && FD_ISSET(eee->mgmt_sock, &socket_mask))
@@ -6362,10 +6028,6 @@ static int run_loop(n2n_edge_t * eee )
                     }
                 }
             }
-
-            /* WS mode: reads are handled above with the other socket reads.
-             * No writable flush is needed: ws_send sends directly (blocking,
-             * bounded by the 3s SO_SNDTIMEO) and drops the frame on timeout. */
 
 #ifndef _WIN32
             if(FD_ISSET(eee->device.fd, &socket_mask))
@@ -6441,57 +6103,55 @@ static int run_loop(n2n_edge_t * eee )
                                                eee->device.ip_addr, eee->device.mac_addr);
             for (int _pi = 0; _pi < n; _pi++) {
                 uint8_t *frame = probe_buf + _pi * 19;
-                /* Find the peer matching this probe frame's destination MAC
-                 * (frame[0..5] was set by bypass_get_pending_probes).  The
-                 * old code searched for the first PROBING peer, which always
-                 * returned the same peer for every frame — breaking bypass
-                 * negotiation when multiple peers were being probed. */
-                n2n_mac_t dst_mac;
-                memcpy(dst_mac, frame, N2N_MAC_SIZE);
-                struct peer_info *pi = NULL;
-                for (struct peer_info *_scan = eee->known_peers; _scan; _scan = _scan->next) {
-                    if (memcmp(_scan->mac_addr, dst_mac, N2N_MAC_SIZE) == 0) {
-                        pi = _scan;
+                /* Look up peer to get its P2P UDP address */
+                uint32_t p_virt_ip = 0;
+                for (int _bi = 0; _bi < BYPASS_MAX_PEERS; _bi++) {
+                    if (eee->bp->peers[_bi].state == BYPASS_PEER_PROBING &&
+                        eee->bp->peers[_bi].virt_ip != 0) {
+                        p_virt_ip = eee->bp->peers[_bi].virt_ip;
                         break;
                     }
                 }
-                if (pi) {
-                    n2n_sock_t p2p_dest;
-                    int have_p2p = 0;
-                    if (pi->sock.family == AF_INET && eee->udp_sock != -1) {
-                        p2p_dest = pi->sock; have_p2p = 1;
-                    } else if (pi->sock6.family == AF_INET6 && eee->udp_sock6 != -1) {
-                        p2p_dest = pi->sock6; have_p2p = 1;
-                    }
-                    if (have_p2p) {
-                        /* Build encrypted n2n PACKET */
-                        n2n_mac_t destMac;
-                        uint8_t pktbuf[N2N_PKT_BUF_SIZE];
-                        size_t idx = 0;
-                        n2n_common_t cmn;
-                        n2n_PACKET_t pkt;
-                        size_t tx_transop_idx = edge_choose_tx_transop(eee);
-                        memcpy(destMac, frame, N2N_MAC_SIZE);
-                        memset(&cmn, 0, sizeof(cmn));
-                        cmn.ttl = N2N_DEFAULT_TTL;
-                        cmn.pc = n2n_packet;
-                        cmn.flags = 0;
-                        memcpy(cmn.community, eee->community_name, N2N_COMMUNITY_SIZE);
-                        memset(&pkt, 0, sizeof(pkt));
-                        memcpy(pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
-                        memcpy(pkt.dstMac, destMac, N2N_MAC_SIZE);
-                        pkt.sock.family = 0;
-                        pkt.transform = eee->transop[tx_transop_idx].transform_id;
-                        encode_PACKET(pktbuf, &idx, &cmn, &pkt);
-                        idx += eee->transop[tx_transop_idx].fwd(
-                            &(eee->transop[tx_transop_idx]),
-                            pktbuf+idx, N2N_PKT_BUF_SIZE-idx,
-                            frame, 19, destMac);
-                        ++(eee->transop[tx_transop_idx].tx_cnt);
-                        /* Send directly to peer's P2P address */
-                        sendto_sock(sock_for_dest(eee, &p2p_dest),
-                                    pktbuf, idx, &p2p_dest);
-                        continue;
+                if (p_virt_ip != 0) {
+                    struct peer_info *pi = bypass_find_peer_info(eee, p_virt_ip);
+                    if (pi) {
+                        n2n_sock_t p2p_dest;
+                        int have_p2p = 0;
+                        if (pi->sock.family == AF_INET && eee->udp_sock != -1) {
+                            p2p_dest = pi->sock; have_p2p = 1;
+                        } else if (pi->sock6.family == AF_INET6 && eee->udp_sock6 != -1) {
+                            p2p_dest = pi->sock6; have_p2p = 1;
+                        }
+                        if (have_p2p) {
+                            /* Build encrypted n2n PACKET */
+                            n2n_mac_t destMac;
+                            uint8_t pktbuf[N2N_PKT_BUF_SIZE];
+                            size_t idx = 0;
+                            n2n_common_t cmn;
+                            n2n_PACKET_t pkt;
+                            size_t tx_transop_idx = edge_choose_tx_transop(eee);
+                            memcpy(destMac, frame, N2N_MAC_SIZE);
+                            memset(&cmn, 0, sizeof(cmn));
+                            cmn.ttl = N2N_DEFAULT_TTL;
+                            cmn.pc = n2n_packet;
+                            cmn.flags = 0;
+                            memcpy(cmn.community, eee->community_name, N2N_COMMUNITY_SIZE);
+                            memset(&pkt, 0, sizeof(pkt));
+                            memcpy(pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
+                            memcpy(pkt.dstMac, destMac, N2N_MAC_SIZE);
+                            pkt.sock.family = 0;
+                            pkt.transform = eee->transop[tx_transop_idx].transform_id;
+                            encode_PACKET(pktbuf, &idx, &cmn, &pkt);
+                            idx += eee->transop[tx_transop_idx].fwd(
+                                &(eee->transop[tx_transop_idx]),
+                                pktbuf+idx, N2N_PKT_BUF_SIZE-idx,
+                                frame, 19, destMac);
+                            ++(eee->transop[tx_transop_idx].tx_cnt);
+                            /* Send directly to peer's P2P address */
+                            sendto_sock(sock_for_dest(eee, &p2p_dest),
+                                        pktbuf, idx, &p2p_dest);
+                            continue;
+                        }
                     }
                 }
                 /* Fallback: normal path */
@@ -6635,12 +6295,19 @@ static int run_loop(n2n_edge_t * eee )
     } /* while */
 
 cleanup:
+#ifdef _WIN32
     eee->keep_running = 0;
-    /* Close TAP first: any pending overlapped read is cancelled by
-     *   CancelIo() inside tuntap_close(), which causes the WFSO
-     *   overlap_read.hEvent to fire and lets the main loop (if still
-     *   alive) wake up cleanly. */
+    /* Close TAP first to wake up the TUN reader thread blocked on tuntap_read() */
     tuntap_close(&(eee->device));
+    if (eee->tun_thread_handle != NULL) {
+        if (WaitForSingleObject(eee->tun_thread_handle, 5000) != WAIT_OBJECT_0)
+            traceEvent(TRACE_WARNING, "TUN thread did not exit in 5s, terminating");
+        CloseHandle(eee->tun_thread_handle);
+        eee->tun_thread_handle = NULL;
+    }
+#else
+    tuntap_close(&(eee->device));
+#endif
 
     send_deregister( eee, &(eee->supernode));
     if (eee->supernode_alt.family != 0) {

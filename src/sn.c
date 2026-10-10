@@ -462,9 +462,8 @@ static void save_community_stats(n2n_sn_t *sss, time_t now)
                 s->min_idx, (int64_t)s->last_minute);
         for (int i = 0; i < COMM_STATS_DAYS; i++)
             fprintf(fp, "%" PRIu64 "%c", s->bytes_30d[i], i == COMM_STATS_DAYS-1 ? '\n' : ' ');
-        /* 24h minute buckets: 6 rows x 240 values each.
-         * Must be persisted, otherwise the sliding window cannot decay
-         * across restarts and the 24h rate limit would hit permanently. */
+        /* 24h 分钟桶：每行 240 个值，共 6 行。
+         * 必须持久化，否则重启后滑动窗口无法衰减，24h 限速会永久命中。 */
         for (int i = 0, c = 0; i < COMM_STATS_MINUTES; i++) {
             fprintf(fp, "%" PRIu64 "%c", s->bytes_1440[i], c == 239 ? '\n' : ' ');
             if (++c == 240) c = 0;
@@ -521,7 +520,7 @@ static void load_community_stats(n2n_sn_t *sss)
             p++;
         }
 
-        /* 24h minute buckets: 6 rows x 240 values each */
+        /* 24h 分钟桶：每行 240 个值，共 6 行 */
         int got = 0;
         char mline[6144];
         while (got < COMM_STATS_MINUTES) {
@@ -1622,7 +1621,7 @@ static int process_mgmt( n2n_sn_t * sss,
             const char *tarrow = (total_kbps >= 0.1) ? "--->" : "    ";
             ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
                                "----------------\n"
-                               "Total_traffic                                              %s %-7.1f  %-7.1f  %-10.1f\n",
+                               "Total traffic                                              %s %-7.1f  %-7.1f  %-10.1f\n",
                                tarrow, total_kbps, total_24h, total_30d);
             sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
         }
@@ -1635,16 +1634,12 @@ static int process_mgmt( n2n_sn_t * sss,
     time_t uptime = now - sss->start_time;
     int days = uptime / 86400;
     int hours = (uptime % 86400) / 3600;
-    char time_buf[32];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", localtime(&now));
-
-    int mins = (uptime % 3600) / 60;
 
     ressize += snprintf(resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize,
-                       "%s up %dd_%dh_%dm | cmnts %u | edges %u | reg_nak %u | errs %u | last_reg/fwd %lus/%lus ago\n",
-                       time_buf, days, hours, mins,
-                       num_communities,
+                       "uptime %dd_%dh | edges %u | cmnts %u | reg_nak %u | errs %u | last_reg %lus ago | last_fwd %lus ago\n",
+                       days, hours,
                        num_edges,
+                       num_communities,
                        (unsigned int)sss->stats.reg_super_nak,
                        (unsigned int)sss->stats.errors,
                        (long unsigned int)(now - sss->stats.last_reg_super),
@@ -1661,6 +1656,9 @@ static int process_mgmt( n2n_sn_t * sss,
         ip_support = "None";
     }
 
+    char time_buf[32];
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
     if (ressize < N2N_SN_PKTBUF_SIZE)
         ressize += snprintf(resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize,
                            "broadcast %u | reg_sup %u | fwd %u | ip_support: %s | %s\n",
@@ -1668,7 +1666,7 @@ static int process_mgmt( n2n_sn_t * sss,
                            (unsigned int)sss->stats.reg_super,
                            (unsigned int) sss->stats.fwd,
                            ip_support,
-                           n2n_sw_version_full);
+                           time_buf);
 
     r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
               sender_sock, sender_sock_len);
@@ -2762,12 +2760,6 @@ int main( int argc, char * const argv[] )
         sss.sock = open_socket(sss.lport, 1 /*bind ANY*/ );
         if (sss.sock != -1) {
             ipv4_available = 1;
-            /* supernode uses a small SNDBUF (256KB) instead of edge's 2MB:
-             * the kernel auto-doubles the requested size, so this still leaves
-             * plenty of headroom for forwarding bursts to many peers without
-             * holding large per-socket memory pools. */
-            { int snd = 256 * 1024;
-              setsockopt(sss.sock, SOL_SOCKET, SO_SNDBUF, (const char*)&snd, sizeof(snd)); }
         } else {
             traceEvent( TRACE_WARNING, "IPv4 socket failed, continuing without IPv4" );
             sss.sock = -1;
@@ -2777,9 +2769,6 @@ int main( int argc, char * const argv[] )
     if (ipv6) {
         sss.sock6 = open_socket6(sss.lport, 1 /*bind ANY*/ );
         if (sss.sock6 != -1) {
-            /* supernode: see SNDBUF note in IPv4 socket block above. */
-            { int snd = 256 * 1024;
-              setsockopt(sss.sock6, SOL_SOCKET, SO_SNDBUF, (const char*)&snd, sizeof(snd)); }
             /* Socket bound OK, but only mark IPv6 available if the system
              * has at least one non-link-local, non-loopback global IPv6 address.
              * A server with only fe80:: addresses cannot accept external IPv6 connections. */
@@ -2868,12 +2857,6 @@ int main( int argc, char * const argv[] )
     }
 
     sss.mgmt_sock = open_socket(sss.mgmt_port, 0 /* bind LOOPBACK */ );
-    if ( -1 != sss.mgmt_sock )
-    {
-        /* supernode: see SNDBUF note in IPv4 socket block above. */
-        int snd = 256 * 1024;
-        setsockopt(sss.mgmt_sock, SOL_SOCKET, SO_SNDBUF, (const char*)&snd, sizeof(snd));
-    }
     if ( -1 == sss.mgmt_sock )
     {
         /* Resolve error string outside the traceEvent() macro — MSVC rejects
@@ -3015,20 +2998,7 @@ static int run_loop( n2n_sn_t * sss )
                 }
             }
 
-            /* WebSocket: process data from connected edges.
-             *
-             * KNOWN LIMITATION (fairness under many concurrent WS conns):
-             * ws_send uses a BLOCKING send bounded by 3s (SO_SNDTIMEO, see
-             * ws_send_all in ws.c). If one WS peer stops reading (its TCP
-             * window stays 0), forwarding to it can block this
-             * single-threaded main loop for up to 3s, briefly stalling the
-             * other 63 WS connections. This is acceptable for the common
-             * 1-edge-per-SN deployment (a stalled peer is purged after 60s
-             * by sn_ws_purge), but if a future deployment runs dozens of WS
-             * edges with poor downlinks, revisit: switch to a truly
-             * non-blocking send (per-conn TX queue + select writable event
-             * drive, no blocking send at all) so one slow peer cannot delay
-             * the others. */
+            /* WebSocket: process data from connected edges */
             {
                 int wi;
                 for (wi = 0; wi < N2N_SN_MAX_WS; wi++) {
@@ -3036,13 +3006,7 @@ static int run_loop( n2n_sn_t * sss )
                     if (wc->state != WS_OPEN || wc->fd < 0) continue;
                     if (!FD_ISSET(wc->fd, &socket_mask)) continue;
 
-                    /* Drain the WS connection like the UDP path does
-                     * (128-frame cap): ws_recv decodes ONE complete n2n
-                     * frame per call, so without a loop every select tick
-                     * (~10 ms) forwards just one frame per connection —
-                     * capping WS relay throughput at ~1 Mbps regardless of
-                     * link speed. */
-                    for (int _wi = 0; _wi < 128; _wi++) {
+                    {
                         uint8_t wbuf[N2N_SN_PKTBUF_SIZE];
                         ssize_t n = ws_recv(wc, wbuf, sizeof(wbuf));
                         if (n > 0) {
@@ -3054,11 +3018,8 @@ static int run_loop( n2n_sn_t * sss )
                         } else if (n < 0) {
                             traceEvent(TRACE_DEBUG, "WS conn[%d] closed by peer", wi);
                             sn_ws_drop_conn(sss, wi);
-                            break;
-                        } else {
-                            /* n == 0: no complete frame yet, wait for next select */
-                            break;
                         }
+                        /* n == 0: no complete frame yet, wait for next select */
                     }
                 }
             }
