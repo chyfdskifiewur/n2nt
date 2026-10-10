@@ -2284,15 +2284,14 @@ void set_peer_operational( n2n_edge_t * eee,
         scan->punch_start_time = 0;
         scan->punch_failed = 0;
 
-        if (memcmp(scan->mac_addr, eee->last_p2p_log_mac, N2N_MAC_SIZE) ||
-            memcmp(peer, &eee->last_p2p_log_addr, sizeof(n2n_sock_t))) {
-            /* New P2P connection or address changed — log it */
+        if (memcmp(scan->mac_addr, scan->last_p2p_log_mac, N2N_MAC_SIZE) ||
+            memcmp(peer, &scan->last_p2p_log_addr, sizeof(n2n_sock_t))) {
             char mac_buf[18];
             n2n_sock_str_t sockbuf;
             traceEvent( TRACE_NORMAL, "P2P direct with %s at %s",
                         PEER_ID(mac_buf, scan), sock_to_cstr( sockbuf, peer ) );
-            memcpy(eee->last_p2p_log_mac, scan->mac_addr, N2N_MAC_SIZE);
-            memcpy(&eee->last_p2p_log_addr, peer, sizeof(n2n_sock_t));
+            memcpy(scan->last_p2p_log_mac, scan->mac_addr, N2N_MAC_SIZE);
+            memcpy(&scan->last_p2p_log_addr, peer, sizeof(n2n_sock_t));
         }
 
         /* Send REGISTER back to confirm our new address to the peer */
