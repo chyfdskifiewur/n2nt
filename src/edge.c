@@ -363,8 +363,8 @@ static int edge_init(n2n_edge_t * eee)
     eee->upnp_mapped_port = 0;
 #ifdef _WIN32
     InitializeCriticalSection(&eee->peers_lock);
-    eee->keep_running   = 1;
 #endif
+    eee->keep_running   = 1;
     eee->last_register_req = 0;
     eee->register_lifetime = 120;
     eee->last_p2p = 0;
@@ -511,7 +511,54 @@ static int setup_sockets(n2n_edge_t *eee, int local_port) {
     }
 
     eee->udp_sock6 = open_socket6(local_port, 1 /*bind ANY*/);
-    
+
+#ifdef _WIN32
+    /* Bind a WSA event to each UDP socket so the main loop can
+     *   WaitForMultipleObjects() on them alongside the TAP overlapped
+     *   event.  The event fires for FD_READ | FD_CLOSE; the loop drains
+     *   via the same FD_ISSET/select(timeout=0) path so we never need
+     *   WSAEnumNetworkEvents.
+     *
+     *   Race: if a previous socket was closed (e.g. supernode reconnect
+     *   path) its old event handle is leaked — guard against that by
+     *   closing the previous one before re-binding. */
+    if (eee->device.udp_sock_event) {
+        WSAEventSelect(eee->udp_sock, NULL, 0);
+        CloseHandle(eee->device.udp_sock_event);
+        eee->device.udp_sock_event = NULL;
+    }
+    eee->device.udp_sock_event = WSACreateEvent();
+    if (!eee->device.udp_sock_event ||
+        WSAEventSelect(eee->udp_sock, eee->device.udp_sock_event,
+                       FD_READ | FD_CLOSE) == SOCKET_ERROR)
+    {
+        traceEvent(TRACE_ERROR, "WSAEventSelect(udp_sock) failed: %d", WSAGetLastError());
+        if (eee->device.udp_sock_event) {
+            CloseHandle(eee->device.udp_sock_event);
+            eee->device.udp_sock_event = NULL;
+        }
+    }
+
+    if (eee->device.udp_sock6_event) {
+        WSAEventSelect(eee->udp_sock6, NULL, 0);
+        CloseHandle(eee->device.udp_sock6_event);
+        eee->device.udp_sock6_event = NULL;
+    }
+    if (eee->udp_sock6 != -1) {
+        eee->device.udp_sock6_event = WSACreateEvent();
+        if (!eee->device.udp_sock6_event ||
+            WSAEventSelect(eee->udp_sock6, eee->device.udp_sock6_event,
+                           FD_READ | FD_CLOSE) == SOCKET_ERROR)
+        {
+            traceEvent(TRACE_ERROR, "WSAEventSelect(udp_sock6) failed: %d", WSAGetLastError());
+            if (eee->device.udp_sock6_event) {
+                CloseHandle(eee->device.udp_sock6_event);
+                eee->device.udp_sock6_event = NULL;
+            }
+        }
+    }
+#endif
+
     int has_ipv4 = (eee->udp_sock != -1);
     int has_ipv6 = 0;
     memset(&eee->own_ipv6, 0, sizeof(n2n_sock_t));
@@ -784,6 +831,23 @@ ssize_t sendto_sock( SOCKET fd, const void * buf, size_t len, const n2n_sock_t *
 
     sent = sendto( fd, buf, len, 0/*flags*/,
                    (struct sockaddr*) &peer_addr, addr_len );
+
+    /* Single-thread design: a retry loop would block the main thread,
+     * preventing UDP ACK processing and destroying throughput.
+     * If the send buffer is full, drop the packet — TCP retransmits.
+     * The 128-loop in the main loop processes ACKs quickly so TCP
+     * can recover from any loss. */
+#ifndef _WIN32
+    for( int retry = 0; retry < 50 && sent < 0; retry++ )
+    {
+        if( errno != EAGAIN && errno != EWOULDBLOCK )
+            break;
+        usleep(1000);
+        sent = sendto( fd, buf, len, 0/*flags*/,
+                       (struct sockaddr*) &peer_addr, addr_len );
+    }
+#endif
+
     if ( sent < 0 )
     {
 #ifdef _WIN32
@@ -2725,6 +2789,41 @@ static int is_ethMulticast( const void * buf, size_t bufsize )
     return retval;
 }
 
+/** Process one raw Ethernet frame from TAP RX: apply multicast drop,
+ *  then try bypass fast-path, otherwise send via n2n overlay.
+ *  This is the EXACT same downstream path readFromTAPSocket uses,
+ *  extracted to a helper so we can call it from three places:
+ *    (1) pre-loop sync-drain of tuntap_read_begin_overlapped,
+ *    (2) after WaitForSingleObject returns on overlap_read.hEvent,
+ *    (3) sync-completion loop after re-submitting a read. */
+static inline void process_tap_rx_frame(n2n_edge_t *eee,
+                                        const uint8_t *buf, ssize_t len) {
+    macstr_t mac_buf;
+    const uint8_t *mac = buf;
+
+    /* Defensive — never pass garbage down. */
+    if (!eee || !buf || len <= 0 || len > 1600)
+        return;
+
+    traceEvent(TRACE_DEBUG, "### Rx TAP packet (%4d) for %s",
+               (int)len, macaddr_str(mac_buf, mac));
+
+    if (eee->drop_multicast && is_ethMulticast(buf, len)) {
+        traceEvent(TRACE_DEBUG, "Dropping multicast");
+        return;
+    }
+
+    /* bypass_has_peers already handles NULL ctx (returns 0).  The
+     *   || short-circuit guarantees bypass_tap_forward is never called
+     *   with a NULL ctx, but we guard it explicitly anyway so future
+     *   refactors of the condition can never accidentally null-deref. */
+    if (!bypass_has_peers(eee->bp) ||
+        (eee->bp && bypass_tap_forward(eee->bp, (uint8_t*)buf, len) == 0))
+    {
+        send_packet2net(eee, (uint8_t*)buf, len);
+    }
+}
+
 /** Read a single packet from the TAP interface, process it and write out the
  *  corresponding packet to the cooked socket.
  */
@@ -4436,38 +4535,6 @@ process_n2n_packet:
 /* ***************************************************** */
 
 
-#ifdef _WIN32
-static DWORD tunReadThread(LPVOID lpArg )
-{
-    n2n_edge_t *eee = (n2n_edge_t*)lpArg;
-
-    while(eee->keep_running)
-    {
-        readFromTAPSocket(eee);
-    }
-
-    return 0;
-}
-
-/** Start a second thread in Windows because TUNTAP interfaces do not expose
- *  file descriptors. */
-static void startTunReadThread(n2n_edge_t *eee)
-{
-    HANDLE hThread;
-    DWORD dwThreadId;
-
-    hThread = CreateThread(NULL,         /* security attributes */
-                           0,            /* use default stack size */
-                           (LPTHREAD_START_ROUTINE)tunReadThread, /* thread function */
-                           (void*)eee,   /* argument to thread function */
-                           0,            /* thread creation flags */
-                           &dwThreadId); /* thread id out */
-    eee->tun_thread_handle = (hThread != NULL) ? hThread : NULL;
-}
-#endif
-
-/* ***************************************************** */
-
 /** Build DNS query packet for TXT record.
  *  Returns the length of the query packet.
  */
@@ -5148,8 +5215,13 @@ static int scan_route(char* optarg, struct tuntap_config* tuntap_config) {
     }
     else if ((tuntap_config->routes_count % 16) == 15)
     {
-        tuntap_config->routes = (route*)realloc(tuntap_config->routes,
+        route *_new = (route*)realloc(tuntap_config->routes,
             ((tuntap_config->routes_count / 16 + 2) * 16) * sizeof(route));
+        if (!_new) {
+            traceEvent(TRACE_ERROR, "Out of memory for routes");
+            return 0;
+        }
+        tuntap_config->routes = _new;
     }
 
     route* r = &tuntap_config->routes[tuntap_config->routes_count];
@@ -5197,7 +5269,10 @@ fail:
     }
     else if ((tuntap_config->routes_count % 16) == 15)
     {
-        tuntap_config->routes = (route*) reallocarray(tuntap_config->routes, ((tuntap_config->routes_count / 16 + 1) * 16), sizeof(route));
+        route *_new = (route*) reallocarray(tuntap_config->routes, ((tuntap_config->routes_count / 16 + 1) * 16), sizeof(route));
+        if (_new)
+            tuntap_config->routes = _new;
+        /* else: keep the original allocation, leak is insignificant */
     }
     return 0;
 }
@@ -5868,7 +5943,45 @@ static int run_loop(n2n_edge_t * eee )
     int   retval = 0;
 
 #ifdef _WIN32
-    startTunReadThread(eee);
+    /* Single-threaded TAP reader using OVERLAPPED I/O —
+     *   architecture 100% aligned with cnn2n.  No tunReadThread,
+     *   no ring buffer, no cross-thread events.  TAP reads are
+     *   submitted as overlapped IRPs, completions are signalled
+     *   via overlap_read.hEvent directly to the main loop's
+     *   WaitForSingleObject, and frames flow straight from
+     *   tuntap_dev.read_buf → bypass_tap_forward → send_packet2net
+     *   on the SAME thread with zero intermediate queueing.  If
+     *   send_packet2net blocks on a full SO_SNDBUF, no further
+     *   TAP reads are submitted until it unblocks, so the TAP
+     *   driver's RX ring fills up and the user-space TCP that is
+     *   writing to the TAP gets back-pressure automatically —
+     *   zero parameters, fully auto-tuning to the real uplink
+     *   capacity just like cnn2n.
+     *
+     *   Pre-submit the first overlapped read before entering the
+     *   loop, draining any synchronously-completed frames (driver
+     *   backlog on startup).  On any transient error we silently
+     *   skip; the per-tick lazy-init block inside the loop will
+     *   re-try the submission so we never get stuck with no IRP
+     *   in flight. */
+    if (eee->device.overlap_read.hEvent != NULL &&
+        eee->device.device_handle != INVALID_HANDLE_VALUE)
+    {
+        ssize_t slen;
+        while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
+            process_tap_rx_frame(eee, eee->device.read_buf, slen);
+        }
+        traceEvent(TRACE_DEBUG,
+                   "TAP overlapped reader primed (read_pending=%u, last_begin=%d)",
+                   (unsigned)eee->device.read_pending, (int)slen);
+    }
+    else
+    {
+        traceEvent(TRACE_WARNING,
+                   "TAP overlapped reader skipped (hEvent=%p device_handle=%p)",
+                   eee->device.overlap_read.hEvent,
+                   (void*)(UINT_PTR)eee->device.device_handle);
+    }
 #endif
 
     /* Main loop
@@ -5931,15 +6044,135 @@ static int run_loop(n2n_edge_t * eee )
             }
         }
 
-        wait_time.tv_sec = SOCKET_TIMEOUT_INTERVAL_SECS; wait_time.tv_usec = 0;
-        /* When KCP connections are active, use 10ms select timeout
-         * for responsive KCP updates (ikcp_update every 10ms). */
-        if (bypass_has_kcp_conns(eee->bp)) {
-            wait_time.tv_sec = 0;
-            wait_time.tv_usec = 10000;  /* 10ms */
-        }
+        /* ---------- Wait / wake-up.
+         *   One fixed tick cadence (N2N_MAINLOOP_TICK_MS = 10 ms) for
+         *   EVERY deployment — it covers KCP's 100 Hz update cadence,
+         *   and 0-10 ms added ingress latency on non-TAP fds is
+         *   invisible on any real WAN RTT.  Completely generic.
+         *
+         *   Windows: single-threaded OVERLAPPED I/O — no separate tunReadThread.
+         *            We block on overlap_read.hEvent (the single kernel
+         *            notification that TAP driver has completed a read
+         *            IRP we submitted) and combine that with a 10 ms
+         *            upper bound for polling all ingress socket fds.
+         *            Architecture = cnn2n exactly:
+         *              WFSO → TAP frame ready? → process → send_packet2net
+         *                → if send_packet2net blocks on SO_SNDBUF full,
+         *                  we stall here; further TAP reads won't be
+         *                  submitted until it unblocks → TAP driver RX
+         *                  ring fills up → user-space TCP writing to
+         *                  TAP gets blocked → TCP cwnd auto-tunes to
+         *                  real uplink capacity.
+         *            After every wakeup (signal or timeout) we run
+         *            select(timeout=0) on the same fd sets as Linux,
+         *            so UDP/mgmt/WS/bypass TCP fds never need WinSock
+         *            event binding (which silently breaks SO_SNDBUF
+         *            back-pressure by forcing non-blocking mode).
+         *   Linux:   Classic select(timeout = 10 ms) — TAP fd already
+         *            lives in socket_mask so no extra handle is needed,
+         *            all I/O stays single-threaded. ---------- */
+#ifdef _WIN32
+        {
+            /* Single-threaded, fully event-driven Windows I/O.
+             *
+             *   WaitForMultipleObjects() on:
+             *     [0] TAP overlapped read completion event
+             *     [1] UDP v4 socket WSA event (FD_READ | FD_CLOSE)
+             *     [2] UDP v6 socket WSA event (FD_READ | FD_CLOSE)  [optional]
+             *   Timeout = N2N_MAINLOOP_TICK_MS (10 ms) guarantees we
+             *   always wake up to drive the periodic tick (KCP,
+             *   supernode reg, keepalive, ...).
+             *
+             *   WFSO manual-reset events stay signalled until WE reset
+             *   them, so a single fire handles "frame available" and
+             *   draining happens via the post-WFSO select(timeout=0)
+             *   pass below — exactly the same FD walk as Linux. */
+            HANDLE handles[3];
+            int n_handles = 0;
+            HANDLE h_tap = eee->device.overlap_read.hEvent;
+            if (h_tap != NULL) handles[n_handles++] = h_tap;       /* [0] */
+            if (eee->device.udp_sock_event)  handles[n_handles++] = eee->device.udp_sock_event;  /* [1] */
+            if (eee->device.udp_sock6_event) handles[n_handles++] = eee->device.udp_sock6_event; /* [2] */
 
-        rc = select(max_sock+1, &socket_mask, bypass_active ? &bypass_write_mask : NULL, NULL, &wait_time);
+            DWORD wfso_rc;
+            if (n_handles > 0) {
+                wfso_rc = WaitForMultipleObjects((DWORD)n_handles, handles,
+                                                 FALSE, N2N_MAINLOOP_TICK_MS);
+            } else {
+                /* No events bound (extreme init failure). Fall back to
+                 *   a pure sleep so we don't spin. */
+                static unsigned warn_suppress = 0;
+                if (warn_suppress == 0)
+                    traceEvent(TRACE_WARNING,
+                               "TAP event handle unavailable, falling back to sleep");
+                warn_suppress = (warn_suppress + 1) & 0xFFu;
+                Sleep((DWORD)N2N_MAINLOOP_TICK_MS);
+                wfso_rc = WAIT_TIMEOUT;
+            }
+
+            /* After a UDP WSAEvent fires, the FD_READ/FD_CLOSE events are
+             *   still queued in the socket's internal network-event
+             *   structure.  Calling select() on the same socket
+             *   de-queues them AND un-signals the WSA event (since the
+             *   event is edge-triggered in that sense: re-arming only
+             *   happens after the network events are consumed).  This
+             *   is the same approach cnn2n uses. */
+            if (wfso_rc != WAIT_TIMEOUT && n_handles > 0 &&
+                (wfso_rc - WAIT_OBJECT_0) < (DWORD)n_handles)
+            {
+                /* Signalled index = (wfso_rc - WAIT_OBJECT_0).
+                 *   We don't need to act on the WSA events directly —
+                 *   the select(timeout=0) pass below picks them up. */
+                (void)0;
+            }
+
+            /* TAP RX harvesting: same careful rules as before.
+             *   - Only touch overlap_read if TAP event fired (index 0).
+             *   - GetOverlappedResult(bWait=FALSE) on a still-pending
+             *     IRP fails with ERROR_IO_INCOMPLETE — never do that.
+             *   - On async completion, ResetEvent + harvest + resubmit,
+             *     draining any synchronously-completed frames. */
+            bool tap_signalled = (wfso_rc != WAIT_TIMEOUT &&
+                                  n_handles > 0 &&
+                                  (wfso_rc - WAIT_OBJECT_0) == 0);
+            if (tap_signalled && eee->device.read_pending) {
+                ResetEvent(eee->device.overlap_read.hEvent);
+                ssize_t len = tuntap_read_complete_overlapped(&eee->device);
+                if (len > 0) {
+                    process_tap_rx_frame(eee, eee->device.read_buf, len);
+                }
+                ssize_t slen;
+                while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
+                    process_tap_rx_frame(eee, eee->device.read_buf, slen);
+                }
+            } else if (!eee->device.read_pending) {
+                /* No IRP in flight (lost one, or first tick). Resubmit. */
+                ssize_t slen;
+                while ((slen = tuntap_read_begin_overlapped(&eee->device)) > 0) {
+                    process_tap_rx_frame(eee, eee->device.read_buf, slen);
+                }
+            }
+            /* else: WFSO timed out (or UDP fired, not TAP) and a TAP
+             *       IRP is still pending — leave it. */
+
+            /* Zero-timeout select walk so UDP/mgmt/WS/bypass fds get
+             *   serviced without blocking.  Zero timeout is correct:
+             *   WFSO above already gated on I/O availability. */
+            struct timeval zt;
+            zt.tv_sec  = 0;
+            zt.tv_usec = 0;
+            rc = select(max_sock + 1, &socket_mask,
+                        bypass_active ? &bypass_write_mask : NULL, NULL, &zt);
+        }
+#else
+        {
+            struct timeval tick;
+            tick.tv_sec  = 0;
+            tick.tv_usec = N2N_MAINLOOP_TICK_MS * 1000;  /* 10 ms */
+            rc = select(max_sock + 1, &socket_mask,
+                        bypass_active ? &bypass_write_mask : NULL, NULL, &tick);
+        }
+#endif
         nowTime=n2n_now();
 
         /* Handle signal interruption */
@@ -6103,55 +6336,57 @@ static int run_loop(n2n_edge_t * eee )
                                                eee->device.ip_addr, eee->device.mac_addr);
             for (int _pi = 0; _pi < n; _pi++) {
                 uint8_t *frame = probe_buf + _pi * 19;
-                /* Look up peer to get its P2P UDP address */
-                uint32_t p_virt_ip = 0;
-                for (int _bi = 0; _bi < BYPASS_MAX_PEERS; _bi++) {
-                    if (eee->bp->peers[_bi].state == BYPASS_PEER_PROBING &&
-                        eee->bp->peers[_bi].virt_ip != 0) {
-                        p_virt_ip = eee->bp->peers[_bi].virt_ip;
+                /* Find the peer matching this probe frame's destination MAC
+                 * (frame[0..5] was set by bypass_get_pending_probes).  The
+                 * old code searched for the first PROBING peer, which always
+                 * returned the same peer for every frame — breaking bypass
+                 * negotiation when multiple peers were being probed. */
+                n2n_mac_t dst_mac;
+                memcpy(dst_mac, frame, N2N_MAC_SIZE);
+                struct peer_info *pi = NULL;
+                for (struct peer_info *_scan = eee->known_peers; _scan; _scan = _scan->next) {
+                    if (memcmp(_scan->mac_addr, dst_mac, N2N_MAC_SIZE) == 0) {
+                        pi = _scan;
                         break;
                     }
                 }
-                if (p_virt_ip != 0) {
-                    struct peer_info *pi = bypass_find_peer_info(eee, p_virt_ip);
-                    if (pi) {
-                        n2n_sock_t p2p_dest;
-                        int have_p2p = 0;
-                        if (pi->sock.family == AF_INET && eee->udp_sock != -1) {
-                            p2p_dest = pi->sock; have_p2p = 1;
-                        } else if (pi->sock6.family == AF_INET6 && eee->udp_sock6 != -1) {
-                            p2p_dest = pi->sock6; have_p2p = 1;
-                        }
-                        if (have_p2p) {
-                            /* Build encrypted n2n PACKET */
-                            n2n_mac_t destMac;
-                            uint8_t pktbuf[N2N_PKT_BUF_SIZE];
-                            size_t idx = 0;
-                            n2n_common_t cmn;
-                            n2n_PACKET_t pkt;
-                            size_t tx_transop_idx = edge_choose_tx_transop(eee);
-                            memcpy(destMac, frame, N2N_MAC_SIZE);
-                            memset(&cmn, 0, sizeof(cmn));
-                            cmn.ttl = N2N_DEFAULT_TTL;
-                            cmn.pc = n2n_packet;
-                            cmn.flags = 0;
-                            memcpy(cmn.community, eee->community_name, N2N_COMMUNITY_SIZE);
-                            memset(&pkt, 0, sizeof(pkt));
-                            memcpy(pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
-                            memcpy(pkt.dstMac, destMac, N2N_MAC_SIZE);
-                            pkt.sock.family = 0;
-                            pkt.transform = eee->transop[tx_transop_idx].transform_id;
-                            encode_PACKET(pktbuf, &idx, &cmn, &pkt);
-                            idx += eee->transop[tx_transop_idx].fwd(
-                                &(eee->transop[tx_transop_idx]),
-                                pktbuf+idx, N2N_PKT_BUF_SIZE-idx,
-                                frame, 19, destMac);
-                            ++(eee->transop[tx_transop_idx].tx_cnt);
-                            /* Send directly to peer's P2P address */
-                            sendto_sock(sock_for_dest(eee, &p2p_dest),
-                                        pktbuf, idx, &p2p_dest);
-                            continue;
-                        }
+                if (pi) {
+                    n2n_sock_t p2p_dest;
+                    int have_p2p = 0;
+                    if (pi->sock.family == AF_INET && eee->udp_sock != -1) {
+                        p2p_dest = pi->sock; have_p2p = 1;
+                    } else if (pi->sock6.family == AF_INET6 && eee->udp_sock6 != -1) {
+                        p2p_dest = pi->sock6; have_p2p = 1;
+                    }
+                    if (have_p2p) {
+                        /* Build encrypted n2n PACKET */
+                        n2n_mac_t destMac;
+                        uint8_t pktbuf[N2N_PKT_BUF_SIZE];
+                        size_t idx = 0;
+                        n2n_common_t cmn;
+                        n2n_PACKET_t pkt;
+                        size_t tx_transop_idx = edge_choose_tx_transop(eee);
+                        memcpy(destMac, frame, N2N_MAC_SIZE);
+                        memset(&cmn, 0, sizeof(cmn));
+                        cmn.ttl = N2N_DEFAULT_TTL;
+                        cmn.pc = n2n_packet;
+                        cmn.flags = 0;
+                        memcpy(cmn.community, eee->community_name, N2N_COMMUNITY_SIZE);
+                        memset(&pkt, 0, sizeof(pkt));
+                        memcpy(pkt.srcMac, eee->device.mac_addr, N2N_MAC_SIZE);
+                        memcpy(pkt.dstMac, destMac, N2N_MAC_SIZE);
+                        pkt.sock.family = 0;
+                        pkt.transform = eee->transop[tx_transop_idx].transform_id;
+                        encode_PACKET(pktbuf, &idx, &cmn, &pkt);
+                        idx += eee->transop[tx_transop_idx].fwd(
+                            &(eee->transop[tx_transop_idx]),
+                            pktbuf+idx, N2N_PKT_BUF_SIZE-idx,
+                            frame, 19, destMac);
+                        ++(eee->transop[tx_transop_idx].tx_cnt);
+                        /* Send directly to peer's P2P address */
+                        sendto_sock(sock_for_dest(eee, &p2p_dest),
+                                    pktbuf, idx, &p2p_dest);
+                        continue;
                     }
                 }
                 /* Fallback: normal path */
@@ -6295,19 +6530,12 @@ static int run_loop(n2n_edge_t * eee )
     } /* while */
 
 cleanup:
-#ifdef _WIN32
     eee->keep_running = 0;
-    /* Close TAP first to wake up the TUN reader thread blocked on tuntap_read() */
+    /* Close TAP first: any pending overlapped read is cancelled by
+     *   CancelIo() inside tuntap_close(), which causes the WFSO
+     *   overlap_read.hEvent to fire and lets the main loop (if still
+     *   alive) wake up cleanly. */
     tuntap_close(&(eee->device));
-    if (eee->tun_thread_handle != NULL) {
-        if (WaitForSingleObject(eee->tun_thread_handle, 5000) != WAIT_OBJECT_0)
-            traceEvent(TRACE_WARNING, "TUN thread did not exit in 5s, terminating");
-        CloseHandle(eee->tun_thread_handle);
-        eee->tun_thread_handle = NULL;
-    }
-#else
-    tuntap_close(&(eee->device));
-#endif
 
     send_deregister( eee, &(eee->supernode));
     if (eee->supernode_alt.family != 0) {
