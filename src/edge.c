@@ -5366,6 +5366,15 @@ process_n2n_packet:
             }
 
             if (known) {
+                /* Keep a live direct link off the punch handover: demoting it here
+                 * would flip the peer between known and pending and restart punching
+                 * forever, oscillating between IPv6 and IPv4 promotion. */
+                if (known->direct_seen != 0 &&
+                    (n2n_now() - known->direct_seen) < PUNCH_DIRECT_ALIVE_SECS) {
+                    PEERS_UNLOCK(eee);
+                    return 1;
+                }
+
                 struct peer_info *prev = NULL, *scan = eee->known_peers;
                 while (scan && memcmp(scan->mac_addr, pi.mac, N2N_MAC_SIZE) != 0) {
                     prev = scan; scan = scan->next;
