@@ -12,8 +12,61 @@
 #include "n2n_transforms.h"
 #include "n2n_wire.h"
 #include <fcntl.h>
+
+/* Relay-advert gate: announce only after a member's unicast has been relayed here this long (hole-punch traffic starts via SN) */
+#define SN_RELAY_ADVERT_ACTIVE_SECS  5
+
+/** An edge relayed here within this window is "communicating": its pair's address change gets a direct PUNCH */
+#define SN_FWD_PUNCH_ACTIVE_SECS    30
+
+/** maximum length of command line arguments */
+#define MAX_CMDLINE_BUFFER_LENGTH       4096
+
+/** maximum length of a line in the configuration file */
+#define MAX_CONFFILE_LINE_LENGTH        1024
+
+/* forward declarations - needed by run_loop before their definitions */
+struct n2n_sn;
+static int resolve_brother_addr(const char *text, n2n_sock_t *out);
+static void send_brother_reg(struct n2n_sn *sss, time_t now);
+static void send_brother_reg_to(struct n2n_sn *sss, const n2n_sock_t *dst, int is_reply);
+static size_t brother_list_format(struct n2n_sn *sss, time_t now, char *buf, size_t bufsz);
+
+/* Resolve our [-b] little-brother address (sn2) with caching.
+ * Returns 0 on success, -1 if -b is unconfigured or resolution failed. */
+static int resolve_my_brother_addr( struct n2n_sn *sss, n2n_sock_t *out, time_t now );
+
+/* Build an n2n_sock_t from a recvfrom() sockaddr (family 0 if unsupported). */
+static int sock_from_sender( n2n_sock_t *out, const struct sockaddr *sa )
+{
+    memset( out, 0, sizeof(n2n_sock_t) );
+    if ( sa->sa_family == AF_INET )
+    {
+        const struct sockaddr_in *a = (const struct sockaddr_in *)sa;
+        out->family = AF_INET;
+        out->port = ntohs( a->sin_port );
+        memcpy( out->addr.v4, &a->sin_addr, IPV4_SIZE );
+    }
+    else if ( sa->sa_family == AF_INET6 )
+    {
+        const struct sockaddr_in6 *a = (const struct sockaddr_in6 *)sa;
+        out->family = AF_INET6;
+        out->port = ntohs( a->sin6_port );
+        memcpy( out->addr.v6, &a->sin6_addr, IPV6_SIZE );
+    }
+    return out->family;
+}
+
+/* sn_get_device_mac: read the MAC of the first non-loopback, up NIC.
+ * On success returns 1 and fills out_mac. On failure returns 0 and leaves
+ * out_mac zeroed. Implementation depends on platform headers that are
+ * only available after the include block below, so the body is placed
+ * further down. */
+static int sn_get_device_mac(n2n_mac_t out_mac);
+
 #include <signal.h>
 #include <inttypes.h>
+#include <limits.h>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -23,9 +76,254 @@
 #include <sys/select.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netdb.h>
+#include <ifaddrs.h>
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__)
+#include <net/if_dl.h>  /* AF_LINK MAC lookup on macOS/BSD */
+#endif
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+/* <net/if.h> excluded: n2n.h already pulls <linux/if.h>; including both redefines IFF_* / struct ifreq */
 #define SOCKET_INVALID -1
 #define CLOSE_SOCKET(s) close(s)
 #endif
+
+/* Read a parameter file (one option per line, '#' comments, lines folded
+ * into a single space-separated command line) into linebuffer. */
+static int readConfFile(const char * filename, char * const linebuffer) {
+    FILE* fd;
+    char* buffer;
+
+    buffer = (char*) malloc(MAX_CONFFILE_LINE_LENGTH);
+    if (!buffer) return -1;
+
+    if (access(filename, R_OK)) {
+        if (errno == ENOENT)
+            traceEvent(TRACE_ERROR, "parameter file %s not found/unable to access", filename);
+        else
+            traceEvent(TRACE_ERROR, "cannot stat file %s, %s",filename, strerror(errno));
+        free(buffer);
+        return -1;
+    }
+
+    fd = fopen(filename, "rb");
+    if (!fd) {
+        traceEvent(TRACE_ERROR, "Unable to open parameter file '%s': %s", filename, strerror(errno));
+        free(buffer);
+        return -1;
+    }
+    while(fgets(buffer, MAX_CONFFILE_LINE_LENGTH,fd)) {
+        char* p;
+
+        p = strchr(buffer, '#');
+        if (p) *p ='\0';
+
+        p = strchr(buffer, '\n');
+        if (p) *p ='\0';
+
+        if (strlen(buffer) == 0) continue;
+
+        p = buffer;
+        while (*p == ' ') ++p;
+        if (p != buffer) {
+            size_t len = strlen(p);
+            if (len < MAX_CONFFILE_LINE_LENGTH) {
+                memmove(buffer, p, len + 1);
+            } else {
+                traceEvent(TRACE_ERROR, "line too long");
+                continue;
+            }
+        }
+
+        size_t buf_len = strlen(buffer);
+        while(buf_len > 0 && buffer[buf_len-1] == ' ') {
+            buffer[buf_len-1] = '\0';
+            buf_len--;
+        }
+
+        if (strchr(buffer, '@')) {
+            traceEvent(TRACE_ERROR, "@file in file nesting is not supported");
+            free(buffer);
+            fclose(fd);
+            return -1;
+        }
+        
+        size_t line_len = strlen(linebuffer);
+        if (line_len + buf_len + 2 <= MAX_CMDLINE_BUFFER_LENGTH) {
+            linebuffer[line_len] = ' ';
+            memcpy(linebuffer + line_len + 1, buffer, buf_len + 1);
+        } else {
+            traceEvent(TRACE_ERROR, "too many arguments");
+            free(buffer);
+            fclose(fd);
+            return -1;
+        }
+    }
+
+    free(buffer);
+    fclose(fd);
+
+    return 0;
+}
+
+/* Split the folded command line into an argv vector (space-separated). */
+static char ** buildargv(int * effectiveargc, char * const linebuffer) {
+    const int  INITIAL_MAXARGC = 16;	/* Number of args + NULL in initial argv */
+    int     maxargc;
+    int     argc=0;
+    char ** argv;
+    char *  buffer, * buff;
+
+    if (!linebuffer) {
+        return NULL;
+    }
+
+    *effectiveargc = 0;
+    buffer = (char *)calloc(1, strlen(linebuffer)+2);
+    if (!buffer) return NULL;
+
+    memcpy(buffer, linebuffer, strlen(linebuffer) + 1);
+
+    maxargc = INITIAL_MAXARGC;
+    argv = (char **)malloc(maxargc * sizeof(char*));
+    if (!argv) {
+        traceEvent(TRACE_ERROR, "Unable to allocate memory");
+        free(buffer);
+        return NULL;
+    }
+    buff = buffer;
+    while(buff) {
+        char * p = strchr(buff,' ');
+        if (p) {
+            *p='\0';
+            argv[argc] = strdup(buff);
+            if (!argv[argc]) {
+                traceEvent(TRACE_ERROR, "Unable to allocate memory for argv[%d]", argc);
+                for (int j = 0; j < argc; j++) free(argv[j]);
+                free(argv);
+                free(buffer);
+                return NULL;
+            }
+            argc++;
+            while(*++p == ' ');
+            buff=p;
+        } else {
+            argv[argc] = strdup(buff);
+            if (!argv[argc]) {
+                traceEvent(TRACE_ERROR, "Unable to allocate memory for argv[%d]", argc);
+                for (int j = 0; j < argc; j++) free(argv[j]);
+                free(argv);
+                free(buffer);
+                return NULL;
+            }
+            argc++;
+            break;
+        }
+        if (argc >= maxargc) {
+            maxargc *= 2;
+            char** new_argv = (char **)realloc(argv, maxargc * sizeof(char*));
+            if (new_argv == NULL) {
+                traceEvent(TRACE_ERROR, "Unable to re-allocate memory");
+                for (int i = 0; i < argc; i++) free(argv[i]);
+                free(argv);
+                free(buffer);
+                return NULL;
+            }
+            argv = new_argv;
+        }
+    }
+    free(buffer);
+    *effectiveargc = argc;
+    return argv;
+}
+
+/* sn_get_device_mac implementation: depends on platform headers above. */
+static int sn_get_device_mac(n2n_mac_t out_mac)
+{
+    memset(out_mac, 0, sizeof(n2n_mac_t));
+#ifndef _WIN32
+#if defined(__linux__)
+    /* Walk getifaddrs, pick the first interface with any address entry
+     * that is not the loopback interface. The kernel name "lo" (Linux)
+     * is treated as loopback regardless of sa_family — necessary for
+     * musl/uClibc where sa_family may be reported as AF_PACKET or
+     * AF_UNSPEC and IFF_* macros clash between libc <net/if.h> and
+     * kernel <linux/if.h>. */
+    struct ifaddrs *ifap = NULL;
+    if (getifaddrs(&ifap) != 0) return 0;
+    char picked_name[IFNAMSIZ + 1] = {0};
+    struct ifaddrs *ifa;
+    for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+        if (strcmp(ifa->ifa_name, "lo") == 0) continue;
+        snprintf(picked_name, sizeof(picked_name), "%s", ifa->ifa_name);
+        break;
+    }
+    freeifaddrs(ifap);
+    if (picked_name[0] == '\0') return 0;
+
+    int probe_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (probe_sock < 0) return 0;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", picked_name);
+    if (ioctl(probe_sock, SIOCGIFHWADDR, &ifr) == 0) {
+        memcpy(out_mac, ifr.ifr_hwaddr.sa_data, sizeof(n2n_mac_t));
+        close(probe_sock);
+        return 1;
+    }
+    close(probe_sock);
+    return 0;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__)
+    /* macOS/BSD: no SIOCGIFHWADDR; take the first AF_LINK entry carrying a
+     * 6-byte hardware address, skipping loopback (lo*). */
+    struct ifaddrs *ifap = NULL;
+    struct ifaddrs *ifa;
+    if (getifaddrs(&ifap) != 0) return 0;
+    int ok = 0;
+    for (ifa = ifap; ifa && !ok; ifa = ifa->ifa_next) {
+        struct sockaddr_dl *sdl;
+        if (!ifa->ifa_name || !ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_LINK) continue;
+        if (strncmp(ifa->ifa_name, "lo", 2) == 0) continue;
+        sdl = (struct sockaddr_dl *)ifa->ifa_addr;
+        if (sdl->sdl_alen != sizeof(n2n_mac_t)) continue;
+        memcpy(out_mac, LLADDR(sdl), sizeof(n2n_mac_t));
+        ok = 1;
+    }
+    freeifaddrs(ifap);
+    return ok;
+#else
+    return 0; /* other platforms: zero MAC; caller logs a warning */
+#endif
+#else
+    ULONG buflen = 15000;
+    IP_ADAPTER_ADDRESSES *addrs = (IP_ADAPTER_ADDRESSES *)malloc(buflen);
+    if (!addrs) return 0;
+    ULONG rc = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, addrs, &buflen);
+    if (rc == ERROR_BUFFER_OVERFLOW) {
+        free(addrs);
+        buflen = 15000;
+        addrs = (IP_ADAPTER_ADDRESSES *)malloc(buflen);
+        if (!addrs) return 0;
+        rc = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, addrs, &buflen);
+    }
+    if (rc != NO_ERROR) { free(addrs); return 0; }
+    IP_ADAPTER_ADDRESSES *a;
+    int ok = 0;
+    for (a = addrs; a && !ok; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp) continue;
+        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        if (a->PhysicalAddressLength == sizeof(n2n_mac_t)) {
+            memcpy(out_mac, a->PhysicalAddress, sizeof(n2n_mac_t));
+            ok = 1;
+        }
+    }
+    free(addrs);
+    return ok;
+#endif
+}
 
 #define N2N_SN_LPORT_DEFAULT SUPERNODE_PORT
 #define N2N_SN_MGMT_PORT     5646
@@ -50,7 +348,16 @@ struct mac_ip_entry {
 #define COMM_STATS_MINUTES   1440   /* 24h in 1-minute buckets */
 #define COMM_STATS_DAYS      30     /* 30-day rolling window */
 #define COMM_STATS_SECONDS   5      /* instant rate averaging window */
-#define RATE_LIMIT_FACTOR    1.05   /* token bucket overshoot factor */
+#define RATE_LIMIT_FACTOR_PCT 100  /* 100 = 1.0x, 120 = 1.2x (integer: no soft-float) */
+#define RATE_DEBT_SECONDS    10     /* overdraft allowance before queueing */
+#define SHAPER_SLOTS         8      /* queued packets per community (~16KB) */
+
+/* One packet parked in the shaper queue, waiting for tokens */
+struct shaper_slot {
+    uint16_t  len;
+    n2n_mac_t mac;      /* destination MAC, re-looked up at drain time */
+    uint8_t   buf[N2N_SN_PKTBUF_SIZE];
+};
 
 struct community_stats {
     n2n_community_t community_name;
@@ -80,16 +387,21 @@ struct community_stats {
     /* Rate limiting */
     uint64_t max_24h_bytes;     /* 0 = unlimited */
     uint64_t rate_limit_bps;    /* throttle speed after 24h limit; 0 = block */
-    uint64_t tokens;            /* token bucket (bytes) */
-    time_t   last_token_refill;
+    int64_t  tokens;            /* token bucket (bytes); negative = overdraft */
+    int64_t  last_token_refill_ms; /* monotonic ms clock for smooth refill */
+    int      bc_gate;           /* broadcast member cap while throttled
+                                 * (INT_MAX = everyone) */
+
+    /* Shaper queue: packets parked instead of dropped while throttled */
+    struct shaper_slot *q;      /* lazily allocated ring of SHAPER_SLOTS */
+    int      q_r;               /* read index */
+    int      q_n;               /* queued count */
 
     /* Per-community IP auto-assignment (10.64.0.2 .. 10.64.0.254) */
     uint32_t next_ip;           /* host byte order, 0 = not yet initialised */
     struct mac_ip_entry *mac_ip_map; /* MAC -> IP cache for this community */
 
-    /* Cache for compact broadcast optimization: all_compact == 1 means every edge in this
-     * community is compact_capable, so SN can skip broadcast conversion check.
-     * false means there's at least one legacy edge, need check or force conversion. */
+    /* all_compact: every edge here is compact_capable, so broadcast conversion checks can be skipped */
     int             all_compact;
 
     struct community_stats *next;
@@ -100,6 +412,8 @@ struct rate_limit_rule {
     n2n_community_t community_name; /* "*" matches all */
     uint64_t        max_24h_bytes;
     uint64_t        rate_limit_bps;
+    int             bc_gate;    /* broadcast member cap while throttled */
+    int             deny;       /* 1 = deny registration (black/white list) */
     struct rate_limit_rule *next;
 };
 
@@ -126,6 +440,7 @@ static struct community_stats * get_community_stats(
     s->next_ip     = 0x0a400002; /* 10.64.0.2 - per-community start */
     s->mac_ip_map  = NULL;
     s->all_compact = 1;          /* assume all new edges are compact until proven otherwise */
+    s->bc_gate     = INT_MAX;    /* default: broadcast to everyone */
     s->next = *head;
     *head = s;
     return s;
@@ -150,11 +465,10 @@ static void advance_30d_buckets(struct community_stats *s, time_t now)
     }
 }
 
-/* Advance expired 24-hour minute buckets: roll the sliding window forward to
- * now so last_24h_bytes decays even while a community is idle or throttled.
- * This is what prevents the rate limit from dead-locking a community that has
- * exhausted its 24h quota: without traffic there is no update_community_traffic
- * call, so only periodic advancement (purge/load) can shrink last_24h_bytes. */
+/* Advance expired 24-hour minute buckets: roll the sliding window forward so
+ * last_24h_bytes decays even while idle/throttled — without traffic there is no
+ * update_community_traffic call, so only periodic advancement can shrink an
+ * exhausted 24h quota. */
 static void advance_24h_buckets(struct community_stats *s, time_t now)
 {
     if (s->last_minute > now) {
@@ -200,11 +514,16 @@ static void update_community_traffic(struct community_stats *s, size_t bytes, ti
             }
         }
         s->last_second = now;
+    }
+    s->recent_seconds[s->recent_idx] += bytes;
+
+    /* Recompute on every call so the current second is always included
+     * (computing only on second-tick loses 1/5 of the window) */
+    {
         uint64_t total = 0;
         for (int k = 0; k < COMM_STATS_SECONDS; k++) total += s->recent_seconds[k];
         s->instant_Bps = total / COMM_STATS_SECONDS;
     }
-    s->recent_seconds[s->recent_idx] += bytes;
 
     /* 24h sliding window */
     advance_24h_buckets(s, now);
@@ -217,35 +536,67 @@ static void update_community_traffic(struct community_stats *s, size_t bytes, ti
     s->total_30d += bytes;
 }
 
-/* Check rate limit; returns 1 if packet should be allowed, 0 if blocked/throttled */
-static int check_rate_limit(struct community_stats *s, size_t bytes, time_t now)
+/* Monotonic milliseconds (token refill clock, sub-second precision) */
+static int64_t sn_monotonic_ms(void)
+{
+#ifdef _WIN32
+    return (int64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
+#endif
+}
+
+/* Token bucket cap: 1 second worth of tokens. Bursts up to this pass without
+ * queueing; larger caps only enlarge the instant passthrough after idle. */
+static uint64_t token_bucket_max(struct community_stats *s)
+{
+    uint64_t max_tokens = s->rate_limit_bps * RATE_LIMIT_FACTOR_PCT / 100;
+    uint64_t min_bucket = 4096; /* accommodate one typical MAX-sized n2n packet */
+    if (max_tokens < min_bucket) max_tokens = min_bucket;
+    return max_tokens;
+}
+
+/* Refill the token bucket from the monotonic ms clock so queued packets are
+ * released smoothly instead of in whole-second bursts. */
+static void token_refill(struct community_stats *s, uint64_t max_tokens)
+{
+    int64_t now = sn_monotonic_ms();
+    if (s->last_token_refill_ms == 0) {
+        s->last_token_refill_ms = now;
+        s->tokens = (int64_t)max_tokens; /* start full so a single packet can pass */
+        return;
+    }
+    int64_t elapsed = now - s->last_token_refill_ms;
+    if (elapsed <= 0) return;
+    s->last_token_refill_ms = now;
+    s->tokens += (int64_t)((uint64_t)elapsed * s->rate_limit_bps * RATE_LIMIT_FACTOR_PCT / 100000);
+    if (s->tokens > (int64_t)max_tokens) s->tokens = (int64_t)max_tokens;
+}
+
+/* Refill tokens and try to admit `bytes`; charges the bucket when admitted.
+ * Shared by the direct path (try_forward) and the shaper drain, keeping a
+ * single accounting path. Returns 1 if allowed, 0 if it must wait or block. */
+static int rate_admit(struct community_stats *s, size_t bytes)
 {
     if (s->max_24h_bytes == 0 && s->rate_limit_bps == 0)
         return 1; /* no limit */
 
-    uint64_t total_24h = s->last_24h_bytes;
-
-    if (s->max_24h_bytes > 0 && total_24h >= s->max_24h_bytes) {
+    if (s->max_24h_bytes > 0 && s->last_24h_bytes >= s->max_24h_bytes) {
         if (s->rate_limit_bps == 0)
             return 0; /* hard block */
-        /* Throttle via token bucket. The bucket must always be able to hold
-         * at least one full packet, otherwise a limit set below the packet
-         * size would dead-lock the community (no packet could ever pass). */
-        uint64_t max_tokens = (uint64_t)(s->rate_limit_bps * 5 * RATE_LIMIT_FACTOR);
-        uint64_t min_bucket = 4096; /* accommodate one typical MAX-sized n2n packet */
-        if (max_tokens < min_bucket) max_tokens = min_bucket;
-        if (s->last_token_refill == 0) {
-            s->last_token_refill = now;
-            s->tokens = max_tokens; /* start full so a single packet can pass */
-        }
-        time_t elapsed = now - s->last_token_refill;
-        if (elapsed > 0) {
-            s->last_token_refill = now;
-            s->tokens += (uint64_t)(elapsed * s->rate_limit_bps * RATE_LIMIT_FACTOR);
-            if (s->tokens > max_tokens) s->tokens = max_tokens;
-        }
-        if (s->tokens < bytes) return 0;
-        s->tokens -= bytes;
+        /* Token bucket with overdraft credit: short bursts borrow; when credit runs out,
+         * packets park in the shaper queue instead of dropping (TCP sees no loss) */
+        uint64_t max_tokens = token_bucket_max(s);
+        int64_t debt_max = (int64_t)(s->rate_limit_bps * RATE_DEBT_SECONDS);
+        if (debt_max < 16384) debt_max = 16384;
+        uint64_t charge = bytes;
+        if (charge > max_tokens) charge = max_tokens; /* cap single-packet charge */
+        token_refill(s, max_tokens);
+        if (s->tokens - (int64_t)charge < -debt_max)
+            return 0; /* credit exhausted */
+        s->tokens -= (int64_t)charge;
     }
     return 1;
 }
@@ -256,12 +607,14 @@ static void apply_rules_to_stats(struct community_stats *s,
 {
     s->max_24h_bytes  = 0;
     s->rate_limit_bps = 0;
+    s->bc_gate        = INT_MAX;
     struct rate_limit_rule *r = rules;
     while (r) {
         if (strcmp((char*)r->community_name, "*") == 0 ||
             memcmp(r->community_name, s->community_name, sizeof(n2n_community_t)) == 0) {
             s->max_24h_bytes  = r->max_24h_bytes;
             s->rate_limit_bps = r->rate_limit_bps;
+            s->bc_gate        = r->bc_gate;
             if (strcmp((char*)r->community_name, (char*)s->community_name) == 0)
                 break; /* specific rule wins over wildcard */
         }
@@ -282,6 +635,7 @@ static void free_community_stats(struct community_stats **head)
             free(e);
             e = en;
         }
+        free(s->q);
         free(s);
         s = next;
     }
@@ -338,7 +692,37 @@ static void free_rate_limit_rules(struct rate_limit_rule **head)
     *head = NULL;
 }
 
-/* Parse -L config file */
+/* Black/white list lookup: is this community denied registration?
+ * Rule precedence: exact name beats "*"; at the same level x (deny) beats
+ * y (allow). No matching rule => allow (blacklist default). Checked only
+ * at REGISTER_SUPER; online edges fall off at their next re-registration. */
+static int community_denied(const struct rate_limit_rule *rules,
+                            const n2n_community_t comm)
+{
+    int level = 0, denied = 0; /* level: 0 none, 1 wildcard, 2 exact */
+    const struct rate_limit_rule *r = rules;
+    while (r) {
+        int exact = (strncmp((char *)r->community_name, (char *)comm,
+                             sizeof(n2n_community_t)) == 0);
+        int wild  = !exact && (strcmp((char *)r->community_name, "*") == 0);
+        if (exact || wild) {
+            int lvl = exact ? 2 : 1;
+            if (lvl > level) { level = lvl; denied = 0; }
+            if (r->deny) denied = 1; /* x beats y at the same level */
+        }
+        r = r->next;
+    }
+    return denied;
+}
+
+/* Access action column token: "x" (deny) or "y" (allow) */
+static int is_access_action(const char *s)
+{
+    return s[1] == '\0' &&
+           (s[0] == 'x' || s[0] == 'X' || s[0] == 'y' || s[0] == 'Y');
+}
+
+/* Parse -c config file: rate limiting + community access list */
 static void parse_rate_limit_config(const char *datpath,
                                      int *enabled,
                                      struct rate_limit_rule **rules)
@@ -353,19 +737,31 @@ static void parse_rate_limit_config(const char *datpath,
         /* Create default config */
         fp = fopen(cfgpath, "w");
         if (fp) {
-            fprintf(fp, "# N2N Supernode traffic statistics and rate limiting\n");
+            fprintf(fp, "# N2N Supernode traffic statistics, rate limiting and community access list\n");
             fprintf(fp, "# enabled on|off\n");
             fprintf(fp, "#\n");
-            fprintf(fp, "# Rules: <community> <rate_limit_KB/s> <max_24h_GB>\n");
-            fprintf(fp, "#   community       : community name, or * for all\n");
-            fprintf(fp, "#   rate_limit_KB/s : speed after 24h limit exceeded (0=block)\n");
-            fprintf(fp, "#   max_24h_GB      : 24h traffic cap (0=unlimited)\n");
+            fprintf(fp, "# Rules: <community> <max_24h_GB> <rate_limit_KB/s> <broadcast_members> <Allow_and_block_lists>\n");
+            fprintf(fp, "#   community            : community name, or * for all\n");
+            fprintf(fp, "#   max_24h_GB           : 24h traffic cap in GB (0=unlimited)\n");
+            fprintf(fp, "#   rate_limit_KB/s      : speed in KB/s once the cap is reached (0=block all)\n");
+            fprintf(fp, "#   broadcast_members    : how many members receive broadcast while throttled\n");
+            fprintf(fp, "#                      0 : everyone; N : at most N members (default 64)\n");
+            fprintf(fp, "#   Allow_and_block_lists: x = deny registration, y = allow; optional, default y\n");
+            fprintf(fp, "#                          (may also replace broadcast_members as the last column)\n");
+            fprintf(fp, "# A community name alone means allow with no limits.\n");
+            fprintf(fp, "# Precedence: exact name beats *; x beats y on the same level.\n");
+            fprintf(fp, "# Blacklist (default allow): add x lines to deny. Whitelist: end with\n");
+            fprintf(fp, "# \"* 0 0 x\" so only y communities may register. Denial = silent drop.\n");
             fprintf(fp, "# Later rules override earlier ones; specific name beats *\n");
             fprintf(fp, "#\n");
             fprintf(fp, "# Examples:\n");
-            fprintf(fp, "#*          0    100    # global: block after 100GB/24h\n");
-            fprintf(fp, "#n2n       10     50    # n2n: throttle to 10KB/s after 50GB/24h\n");
-            fprintf(fp, "#vip        0      0    # vip: unlimited\n");
+            fprintf(fp, "#<community> <max_24h_GB> <rate_limit_KB/s> <broadcast_members> <Allow_and_block_lists>\n");
+            fprintf(fp, "#*            10            116                                                          # global: 116KB/s after 10GB/24h\n");
+            fprintf(fp, "#n2n          50            580               64                                         # n2n: 580KB/s after 50GB/24h, broadcast to max 64\n");
+            fprintf(fp, "#vip           0            0                                                            # vip: unlimited\n");
+            fprintf(fp, "#badnet        0            0                                     x                      # deny registration\n");
+            fprintf(fp, "#good                                                                                    # allow, no limits\n");
+            fprintf(fp, "#*             0            0                                     x                      # whitelist: deny all others\n");
             fprintf(fp, "\n");
             fprintf(fp, "enabled on\n");
             fclose(fp);
@@ -377,23 +773,47 @@ static void parse_rate_limit_config(const char *datpath,
     struct rate_limit_rule *tail = NULL;
     char line[256];
     while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        char kw[64], val[64];
-        if (sscanf(line, "%63s %63s", kw, val) == 2 &&
-            strcmp(kw, "enabled") == 0) {
-            *enabled = (strcmp(val, "on") == 0) ? 1 : 0;
+        char *tok[5];
+        int ntok = 0;
+        char *t = strtok(line, " \t\r\n");
+        while (t && ntok < 5) {         /* stop at '#' or after 5 columns */
+            if (t[0] == '#') break;
+            tok[ntok++] = t;
+            t = strtok(NULL, " \t\r\n");
+        }
+        if (ntok == 0) continue;
+        if (ntok >= 2 && strcmp(tok[0], "enabled") == 0) {
+            *enabled = (strcmp(tok[1], "on") == 0) ? 1 : 0;
             continue;
         }
-        double rate_kbps, max_gb;
-        if (sscanf(line, "%63s %lf %lf", kw, &rate_kbps, &max_gb) == 3) {
-            struct rate_limit_rule *r = (struct rate_limit_rule*)calloc(1, sizeof(*r));
-            if (!r) continue;
-            strncpy((char*)r->community_name, kw, sizeof(n2n_community_t) - 1);
-            r->rate_limit_bps = (uint64_t)(rate_kbps * 1024);
-            r->max_24h_bytes  = (uint64_t)(max_gb * 1024.0 * 1024.0 * 1024.0);
-            if (!tail) { *rules = r; tail = r; }
-            else { tail->next = r; tail = r; }
+        /* Trailing access action: x = deny, y = allow (default) */
+        const char *act = NULL;
+        if (ntok >= 2 && is_access_action(tok[ntok - 1])) { act = tok[ntok - 1]; ntok--; }
+        /* Integer-only parsing: atof and double->uint64 conversion are unreliable
+         * on this embedded/soft-float target and produced UINT64_MAX for any input. */
+        unsigned long max_gb = 0, rate_kbps = 0;
+        int bc = 64;
+        if (ntok == 4) {
+            bc = atoi(tok[3]);
+            max_gb = strtoul(tok[1], NULL, 10); rate_kbps = strtoul(tok[2], NULL, 10);
+        } else if (ntok == 3) {
+            max_gb = strtoul(tok[1], NULL, 10); rate_kbps = strtoul(tok[2], NULL, 10);
+        } else if (ntok >= 2) {
+            continue; /* unsupported column count, ignore like before */
         }
+        /* ntok == 1: community-only line = allow, no limits (compatible
+         * with official community.list) */
+        struct rate_limit_rule *r = (struct rate_limit_rule*)calloc(1, sizeof(*r));
+        if (!r) continue;
+        strncpy((char*)r->community_name, tok[0], sizeof(n2n_community_t) - 1);
+        r->max_24h_bytes  = (uint64_t)max_gb * 1024ULL * 1024ULL * 1024ULL;
+        r->rate_limit_bps = (uint64_t)rate_kbps * 1024ULL;
+        r->bc_gate = bc;
+        if (r->bc_gate <= 0)
+            r->bc_gate = INT_MAX; /* 0 = everyone */
+        r->deny = act ? (tolower((unsigned char)act[0]) == 'x') : 0;
+        if (!tail) { *rules = r; tail = r; }
+        else { tail->next = r; tail = r; }
     }
     fclose(fp);
 }
@@ -411,6 +831,19 @@ struct sn_stats
 
 typedef struct sn_stats sn_stats_t;
 
+/* Promoted-peer list: edges that proved their sn1 affiliation by sending an
+ * ask_backup/QUERY_ONLY probe whose desired_sn1_mac matches a brother-table
+ * entry. Recorded so their later real registration after the failover switch
+ * (which carries no sn1 hint and no sn2 token) is admitted when -E is set. */
+#define PROMOTED_LIST_MAX  32
+#define PROMOTED_TTL       180   /* refreshed by probes and registrations */
+
+struct promoted_peer {
+    n2n_mac_t       mac;
+    n2n_community_t community;
+    time_t          seen;    /* last probe/registration time (0 = free slot) */
+};
+
 struct n2n_sn
 {
     time_t              start_time;     /* Used to measure uptime. */
@@ -420,22 +853,62 @@ struct n2n_sn
     uint16_t            mgmt_port;      /* Managing UDP ports */
     SOCKET              sock;           /* Main socket for UDP traffic with edges. */
     SOCKET              sock6;
+    n2n_sock_t          my_ipv6;        /* first non-link-local IPv6 GUA on this host (used for brother_reg.own_ipv6) */
+    /* brothers[] - active brother SNs discovered via brother_reg.
+     * Indexed by MAC so multiple sn1 peers can register against this sn2;
+     * each slot holds its own v4/v6 socket + last-seen timestamp. */
+    n2n_brother_entry_t    brothers[MAX_BROTHER_SNS];
     SOCKET              mgmt_sock;      /* management socket. */
+    SOCKET              bounce_sock;    /* NAT bounce helper socket (random source port; replies "N2NB") */
+    SOCKET              alt_sock;       /* UDP port lport+1: NAT probes from a second destination port (dual-port check); -1 = unavailable */
     SOCKET              ws_listen_sock; /* TCP listen socket for WebSocket (same as lport). */
 #define N2N_SN_MAX_WS 64
     ws_conn_t           ws_conns[N2N_SN_MAX_WS]; /* WS connection table (edge connected via WS). */
     struct peer_info *  edges;          /* Link list of registered edges. */
+    struct sn_punch_pair * punch_pairs; /* hard-NAT punch pairs (sn-coordinated 2s rounds). */
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
     int                 ipv4_available; /* 0=unavailable, 1=available */
     int                 ipv6_available; /* 0=unavailable, 1=available */
+    int                 relay_advert_enabled; /* 1=advertise the community relay peer (default), 0=off */
     /* Traffic stats and rate limiting */
     int                    traffic_stats_enabled;
     char                   stats_config_path[256];
     struct community_stats *comm_stats;
     struct rate_limit_rule *rate_rules;
+    n2n_auth_t             peer_token;     /* token required from edge peers (-E) */
+    int                    peer_token_set;
+    n2n_auth_t             backup_token;   /* token required from brother SNs (-B) */
+    int                    backup_token_set;
+    struct promoted_peer   promoted[PROMOTED_LIST_MAX]; /* ask-backup-verified sn1 edges */
+    char                   backup_addr_text[256]; /* sn2 address (sn1 given via -b) */
+    n2n_sock_t             backup_resolved;     /* cached resolution of backup_addr_text */
+    int                    backup_resolved_valid; /* 1 once resolved successfully */
+    time_t                 backup_resolved_time;  /* when the cache was filled */
+    time_t                 last_brother_seen;
+    n2n_mac_t              device_mac;       /* local NIC MAC used as SN identity in brother_reg */
+    /* Deferred full-cone probes: #2/#3 staggered so a re-mapped edge re-arms its stranger window first */
+#define FC_PROBE_MAX 16
+#define FC_PROBE_SPREAD 2   /* seconds between the 3 sends */
+    struct { n2n_sock_t target; time_t due; uint8_t left; } fc_probes[FC_PROBE_MAX];
 };
 
 typedef struct n2n_sn n2n_sn_t;
+
+/* Fixed identity MAC used when a NIC MAC cannot be read. This is the single
+ * source of truth shared by both the edge-facing Advertise and the brother
+ * registration, so a SN is uniquely identified by one MAC value everywhere. */
+static const n2n_mac_t sn_fallback_mac = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+
+/* SN identity MAC: the detected NIC MAC, falling back to the fixed local
+ * identity when no NIC MAC could be read. brother_reg and the ACK
+ * self-advertisement both use this so every path reports the same unique
+ * SN identity. */
+static const uint8_t * sn_identity_mac( const n2n_sn_t * sss )
+{
+    return ( sss->device_mac[0] || sss->device_mac[1] || sss->device_mac[2] ||
+             sss->device_mac[3] || sss->device_mac[4] || sss->device_mac[5] )
+           ? sss->device_mac : sn_fallback_mac;
+}
 
 /* Save stats to text file (every 5 minutes) */
 static void save_community_stats(n2n_sn_t *sss, time_t now)
@@ -462,8 +935,8 @@ static void save_community_stats(n2n_sn_t *sss, time_t now)
                 s->min_idx, (int64_t)s->last_minute);
         for (int i = 0; i < COMM_STATS_DAYS; i++)
             fprintf(fp, "%" PRIu64 "%c", s->bytes_30d[i], i == COMM_STATS_DAYS-1 ? '\n' : ' ');
-        /* 24h 分钟桶：每行 240 个值，共 6 行。
-         * 必须持久化，否则重启后滑动窗口无法衰减，24h 限速会永久命中。 */
+        /* 24h minute buckets: must be persisted, else the sliding window
+         * cannot decay across restarts and the 24h rate limit would stick. */
         for (int i = 0, c = 0; i < COMM_STATS_MINUTES; i++) {
             fprintf(fp, "%" PRIu64 "%c", s->bytes_1440[i], c == 239 ? '\n' : ' ');
             if (++c == 240) c = 0;
@@ -520,7 +993,7 @@ static void load_community_stats(n2n_sn_t *sss)
             p++;
         }
 
-        /* 24h 分钟桶：每行 240 个值，共 6 行 */
+        /* 24h minute buckets: 6 rows x 240 values each */
         int got = 0;
         char mline[6144];
         while (got < COMM_STATS_MINUTES) {
@@ -563,14 +1036,14 @@ static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, t
             *pp = s->next;
             struct mac_ip_entry *e = s->mac_ip_map;
             while (e) { struct mac_ip_entry *en = e->next; free(e); e = en; }
+            free(s->q);
             free(s);
             continue;
         }
 
         /* Refresh rate limit rules and advance expired 24h/30d buckets so
-         * quotas decay while idle/throttled. Periodic refresh makes config
-         * changes take effect for communities that never go idle long enough
-         * to hit the lazy first-use path. */
+         * quotas decay while idle/throttled; also picks up config changes
+         * for communities that never hit the lazy first-use path. */
         apply_rules_to_stats(s, sss->rate_rules);
         advance_24h_buckets(s, now);
         advance_30d_buckets(s, now);
@@ -580,6 +1053,7 @@ static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, t
             *pp = s->next;
             struct mac_ip_entry *e = s->mac_ip_map;
             while (e) { struct mac_ip_entry *en = e->next; free(e); e = en; }
+            free(s->q);
             free(s);
             continue;
         }
@@ -597,6 +1071,53 @@ static int is_private_ipv4(const uint8_t addr[IPV4_SIZE])
     return 0;
 }
 
+/* Find a live promoted entry (mac + community, not expired).
+ * Expired slots are lazily cleared on the way. */
+static struct promoted_peer * find_promoted( n2n_sn_t *sss,
+                                             const n2n_mac_t mac,
+                                             const n2n_community_t community,
+                                             time_t now )
+{
+    for (int i = 0; i < PROMOTED_LIST_MAX; i++)
+    {
+        struct promoted_peer *p = &sss->promoted[i];
+        if (p->seen == 0) continue;
+        if (now - p->seen > PROMOTED_TTL) { p->seen = 0; continue; }
+        if (memcmp(p->mac, mac, N2N_MAC_SIZE) == 0 &&
+            memcmp(p->community, community, sizeof(n2n_community_t)) == 0)
+            return p;
+    }
+    return NULL;
+}
+
+/* Record or refresh a promoted entry (probe verified this edge belongs to sn1). */
+static void record_promoted( n2n_sn_t *sss,
+                             const n2n_mac_t mac,
+                             const n2n_community_t community,
+                             time_t now )
+{
+    struct promoted_peer *free_slot = NULL, *oldest = NULL;
+    time_t oldest_t = (time_t)(~(time_t)0);
+
+    for (int i = 0; i < PROMOTED_LIST_MAX; i++)
+    {
+        struct promoted_peer *p = &sss->promoted[i];
+        if (p->seen == 0) { if (!free_slot) free_slot = p; continue; }
+        if (memcmp(p->mac, mac, N2N_MAC_SIZE) == 0 &&
+            memcmp(p->community, community, sizeof(n2n_community_t)) == 0)
+        {
+            p->seen = now; /* refresh */
+            return;
+        }
+        if (p->seen < oldest_t) { oldest_t = p->seen; oldest = p; }
+    }
+    if (!free_slot) free_slot = oldest; /* replace oldest when full */
+    if (!free_slot) return;
+    memcpy(free_slot->mac, mac, N2N_MAC_SIZE);
+    memcpy(free_slot->community, community, sizeof(n2n_community_t));
+    free_slot->seen = now;
+}
+
 static int update_edge( n2n_sn_t * sss,
                         const n2n_mac_t edgeMac,
                         const n2n_community_t community,
@@ -607,6 +1128,7 @@ static int update_edge( n2n_sn_t * sss,
                         time_t now,
                         const char * version,
                         const char * os_name,
+                        uint8_t nat_type,
                         uint8_t request_ip,
                         uint32_t requested_ip );
 
@@ -638,6 +1160,8 @@ static int init_sn( n2n_sn_t * sss )
     sss->sock = -1;
     sss->sock6 = -1;
     sss->mgmt_sock = -1;
+    sss->bounce_sock = -1;
+    sss->alt_sock = -1;
     sss->ws_listen_sock = -1;
     {
         int wi;
@@ -645,12 +1169,25 @@ static int init_sn( n2n_sn_t * sss )
             ws_init(&sss->ws_conns[wi]);
     }
     sss->edges = NULL;
+    sss->relay_advert_enabled = 1; /* community relay advertisement ON by default */
     /* Initialize transforms - required to decode encrypted packets */
     transop_null_init(    &(sss->transop[N2N_TRANSOP_NULL_IDX]) );
     transop_twofish_init( &(sss->transop[N2N_TRANSOP_TF_IDX])  );
     transop_aes_init( &(sss->transop[N2N_TRANSOP_AESCBC_IDX])  );
     transop_cc20_init(   &(sss->transop[N2N_TRANSOP_CC20_IDX]) );
     transop_speck_init( &(sss->transop[N2N_TRANSOP_SPECK_IDX]) );
+
+    /* Capture local NIC MAC as the SN's brother_reg identity. Falls back
+     * to all-zero if no NIC can be read; brother_list_store already
+     * rejects entries with a zero MAC so the partner SN will ignore such
+     * registrations. */
+    if (!sn_get_device_mac(sss->device_mac)) {
+        traceEvent(TRACE_WARNING, "Could not detect a NIC MAC; brother_reg will carry a zero MAC.");
+    } else {
+        macstr_t mac_buf;
+        traceEvent(TRACE_NORMAL, "Detected NIC MAC %s",
+                   macaddr_str(mac_buf, sss->device_mac));
+    }
 
     return 0; /* OK */
 }
@@ -677,6 +1214,18 @@ static void deinit_sn( n2n_sn_t * sss )
     }
     sss->mgmt_sock = -1;
 
+    if ( sss->bounce_sock >= 0 )
+    {
+        closesocket(sss->bounce_sock);
+    }
+    sss->bounce_sock = -1;
+
+    if ( sss->alt_sock >= 0 )
+    {
+        closesocket(sss->alt_sock);
+    }
+    sss->alt_sock = -1;
+
     if ( sss->ws_listen_sock >= 0 )
     {
         closesocket(sss->ws_listen_sock);
@@ -693,6 +1242,127 @@ static void deinit_sn( n2n_sn_t * sss )
 #ifdef _WIN32
     WSACleanup();
 #endif
+}
+
+
+/* brother_list bookkeeping and the helpers that drive it. */
+
+/* Mgmt table header, shared by the brother and edges tables so the column
+ * positions (e.g. the trailing "os" column) stay in sync. */
+static const char mgmt_header[] =
+    "  id  mac                n2n_ip           wan_ip               <KB/s     GB/24h   GB/30d>  ver      os       nat\n";
+
+/* Emit spaces to bring the current row (whose first byte sits at line_start)
+ * up to column col. At least one space is always written, so two adjacent
+ * fields can never run into each other. */
+static size_t mgmt_pad_to(char *buf, size_t bufsz, size_t written,
+                          size_t line_start, int col)
+{
+    int pad = col - (int)(written - line_start);
+    if (pad < 1)
+        pad = 1;
+
+    return snprintf(buf + written, bufsz - written, "%*s", pad, "");
+}
+
+/* brother_list display helper: format brother SN status lines (for -Q / trace). */
+static size_t brother_list_format(n2n_sn_t *sss, time_t now, char *buf, size_t bufsz)
+{
+    /* Column offsets inside mgmt_header; sizeof() counts its trailing '\n'
+     * and '\0', hence the odd-looking numbers. */
+    const int col_ver = (int)sizeof(mgmt_header) - 23;
+    const int col_os  = (int)sizeof(mgmt_header) - 14;
+    const int col_age = (int)sizeof(mgmt_header) - 5;
+
+    size_t written = 0;
+    int shown = 0;
+    int counter = 0;
+
+    /* One line per brother, IPv4 and IPv6 side by side. Two passes so the
+     * big brothers that register with me come first and my little brother
+     * (the SN I register with) is listed last. */
+    for (int pass = 0; pass < 2; pass++)
+    {
+        int want_little = (pass == 1);
+
+        for (int j = 0; j < MAX_BROTHER_SNS; j++)
+        {
+            n2n_brother_entry_t *b = &sss->brothers[j];
+            n2n_mac_t zero = {0};
+
+            if (memcmp(b->mac, zero, sizeof(zero)) == 0)
+                continue;
+            if ( (b->role == N2N_BROTHER_ROLE_MY_LITTLE) != want_little )
+                continue;
+
+            int have_v4 = (b->sock.family != 0 && b->seen != 0);
+            int have_v6 = (b->sock6.family != 0 && b->seen6 != 0);
+            if (!have_v4 && !have_v6)
+                continue;
+
+            if (shown == 0)
+                written += snprintf(buf + written, bufsz - written, "[brother]\n");
+            counter++;
+
+            /* IPv4 and IPv6 share the port, so it is printed once at the end
+             * (on the IPv6 part when both families are present). */
+            char v4_part[64] = "-";
+            if (have_v4)
+            {
+                char a4[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, b->sock.addr.v4, a4, sizeof(a4));
+                if (have_v6)
+                    snprintf(v4_part, sizeof(v4_part), "%s", a4);
+                else
+                    snprintf(v4_part, sizeof(v4_part), "%s:%u", a4, b->sock.port);
+            }
+            char v6_part[64] = "-";
+            if (have_v6)
+            {
+                char a6[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET6, b->sock6.addr.v6, a6, sizeof(a6));
+                snprintf(v6_part, sizeof(v6_part), "[%s]:%u", a6, b->sock6.port);
+            }
+
+            /* Version and OS arrive in this brother's brother_reg; they stay
+             * empty for a brother that has not been upgraded yet. */
+            const char *ver = b->version[0] ? b->version : "-";
+            const char *os_name = b->os_name[0] ? b->os_name : "-";
+            /* A single-row table cannot be told apart by order alone, so the
+             * little brother carries the "-b" marker (my -b points at it,
+             * i.e. it is the one configured via -b). The big brother
+             * (which configured us as its -b) gets none. */
+            const char *marker = (b->role == N2N_BROTHER_ROLE_MY_LITTLE)
+                               ? "-b" : NULL;
+            /* have_v4 || have_v6 holds above, so a stamp is always set. */
+            time_t last = b->seen ? b->seen : b->seen6;
+
+            size_t line_start = written;
+            written += snprintf(buf + written, bufsz - written,
+                                "%4d  %02X:%02X:%02X:%02X:%02X:%02X  %s/%s",
+                                counter,
+                                b->mac[0], b->mac[1], b->mac[2],
+                                b->mac[3], b->mac[4], b->mac[5],
+                                v4_part, v6_part);
+            written += mgmt_pad_to(buf, bufsz, written, line_start, col_ver);
+            written += snprintf(buf + written, bufsz - written, "%-7.7s", ver);
+            written += mgmt_pad_to(buf, bufsz, written, line_start, col_os);
+            written += snprintf(buf + written, bufsz - written, "%-7.7s", os_name);
+            /* The little brother's "-b" takes the "nat" column, as it does on
+             * the edge side, and the heartbeat age follows in a fixed-width
+             * slot so it lines up on every row. The slot stays blank on rows
+             * without a marker. */
+            written += mgmt_pad_to(buf, bufsz, written, line_start, col_age);
+            written += snprintf(buf + written, bufsz - written, "%-7.5s",
+                                marker ? marker : "");
+            written += snprintf(buf + written, bufsz - written, "%ld",
+                                (long)(now - last));
+            written += snprintf(buf + written, bufsz - written, "\n");
+            shown++;
+        }
+    }
+
+    return written;
 }
 
 
@@ -719,12 +1389,14 @@ static int update_edge( n2n_sn_t * sss,
                         time_t now,
                         const char * version,
                         const char * os_name,
+                        uint8_t nat_type,
                         uint8_t request_ip,
                         uint32_t requested_ip )
 {
     macstr_t            mac_buf;
     n2n_sock_str_t      sockbuf;
     struct peer_info *  scan;
+    uint8_t             nat_changed = 0; /* reported NAT type differs from stored */
 
     traceEvent( TRACE_DEBUG, "update_edge for %s %s",
                 macaddr_str( mac_buf, edgeMac ),
@@ -862,11 +1534,10 @@ static int update_edge( n2n_sn_t * sss,
             /* sock6 remains 0 from calloc */
         }
 
-        /* Edge-reported global IPv6 (GUA). An IPv4-only supernode cannot
-         * observe our IPv6, so it uses this address to hand to peers for
-         * IPv6 hole-punching. A dual-stack supernode observes sock6 itself
-         * (more authoritative, it is the NAT egress), so only fall back to
-         * the reported address when no IPv6 was observed. */
+        /* Edge-reported global IPv6 (GUA): an IPv4-only supernode cannot observe
+         * our IPv6, so it uses this address for IPv6 hole-punching. A dual-stack
+         * supernode's own observation (NAT egress) is authoritative, so only
+         * fall back to the reported address when no IPv6 was observed. */
         if (scan->sock6.family != AF_INET6 && report_ipv6 && report_ipv6->family == AF_INET6)
             memcpy(&(scan->sock6), report_ipv6, sizeof(n2n_sock_t));
 
@@ -892,6 +1563,7 @@ static int update_edge( n2n_sn_t * sss,
         } else {
             strcpy(scan->os_name, "unknown");
         }
+        scan->nat_type = nat_type;
 
         /* insert this guy at the head of the edges list */
         scan->next = sss->edges;
@@ -921,11 +1593,9 @@ static int update_edge( n2n_sn_t * sss,
                 sock_to_cstr(addr_buf, &scan->sock6);
             else
                 strcpy(addr_buf, "-");
-            traceEvent( TRACE_NORMAL, "update_edge created   %s vip=%s ==> %s%s",
-                        macaddr_str( mac_buf, edgeMac ),
+            traceEvent( TRACE_NORMAL, "update_edge created %s ==> %s",
                         inet_ntoa(vip_addr),
-                        addr_buf,
-                        scan->num_sockets > 1 ? " (LAN)" : "" );
+                        addr_buf );
         }
 
         scan->last_seen = now;
@@ -934,6 +1604,25 @@ static int update_edge( n2n_sn_t * sss,
     else
     {
         /* Known */
+
+        /* Refresh identity/metadata even without an address change (else a NAT type
+         * learned after the first registration never lands on this edge). */
+        if (version) {
+            strncpy(scan->version, version, sizeof(scan->version) - 1);
+            scan->version[sizeof(scan->version) - 1] = '\0';
+        }
+        if (os_name) {
+            strncpy(scan->os_name, os_name, sizeof(scan->os_name) - 1);
+            scan->os_name[sizeof(scan->os_name) - 1] = '\0';
+        }
+        if (nat_type) {
+            if (nat_type != scan->nat_type ||
+                (now - scan->last_nat_push) >= 300) { /* re-push same value every 5 min: heals a lost PEER_INFO */
+                nat_changed = 1;
+                scan->last_nat_push = now;
+            }
+            scan->nat_type = nat_type;
+        }
 
         /* Update assigned IP if edge requests a different valid IP */
         if (request_ip && requested_ip != 0) {
@@ -979,10 +1668,9 @@ static int update_edge( n2n_sn_t * sss,
                     existing_family = AF_INET6;
             }
 
-            /* Alt-family registration: update address.
-             * Keep connect_family as primary registration's family.
-             * sn_send_to_peer dual-sends to both IPv4 and IPv6, so
-             * connect_family no longer needs switching. */
+            /* Alt-family registration: update address. Keep connect_family as
+             * the primary registration's family; the dual-send to both IPv4 and
+             * IPv6 makes switching unnecessary. */
             if (existing_family != 0 && sender_sock->family != existing_family) {
                 if (sender_sock->family == AF_INET6) {
                     int had_sock6 = (scan->sock6.family == AF_INET6);
@@ -1041,15 +1729,6 @@ static int update_edge( n2n_sn_t * sss,
                 scan->same_lan_as_sn = 1;
             }
 
-            if (version) {
-                strncpy(scan->version, version, sizeof(scan->version) - 1);
-                scan->version[sizeof(scan->version) - 1] = '\0';
-            }
-            if (os_name) {
-                strncpy(scan->os_name, os_name, sizeof(scan->os_name) - 1);
-                scan->os_name[sizeof(scan->os_name) - 1] = '\0';
-            }
-
             traceEvent( TRACE_INFO, "update_edge updated   %s ==> %s",
                         macaddr_str( mac_buf, edgeMac ),
                         sock_to_cstr( sockbuf, sender_sock ) );
@@ -1069,7 +1748,8 @@ static int update_edge( n2n_sn_t * sss,
             }
 
             scan->last_seen = now;
-            return 1;  /* address changed - treat as new for peer push */
+            return 3;  /* known edge whose address changed: the community must
+                          learn the new endpoint (mgmt "n" refresh, CGNAT remap) */
         }
         else
         {
@@ -1081,7 +1761,9 @@ static int update_edge( n2n_sn_t * sss,
     }
 
     scan->last_seen = now;
-    return 0;  /* unchanged, no push needed */
+    return nat_changed ? 2 : 0;  /* 2 = unchanged address but NAT type changed:
+                                    peers need a fresh PEER_INFO push;
+                                    3 = known edge, address changed (see above) */
 }
 
 
@@ -1157,26 +1839,18 @@ static ssize_t sn_send_to_peer(n2n_sn_t * sss,
                                const uint8_t * pktbuf,
                                size_t pktsize) {
     if (peer->ws && peer->ws->state == WS_OPEN) {
-        /* ws_send failure drops only this packet, does not mark CLOSED — connection
-         * liveness is determined by ws_recv, to avoid TCP buffer full (EAGAIN)
-         * incorrectly closing the connection and leaving peer->ws dangling. */
+        /* ws_send failure drops the packet only — never CLOSE: TCP-buffer-full (EAGAIN)
+         * must not kill the connection; liveness is ws_recv's job. */
         return ws_send(peer->ws, pktbuf, pktsize);
     }
-    /* UDP routing: dual-send to both IPv4 and IPv6 if available.
-     * UDP sendto always succeeds (packet accepted by kernel) even when the
-     * peer's NAT mapping is stale, so primary/fallback based on sendto return
-     * value never triggers. Send to both paths so the peer receives data on
-     * whichever path is actually reachable. */
-    {
-        ssize_t r = -1;
-        if (peer->sock.family != 0)
-            r = sendto_sock(sss, &peer->sock, pktbuf, pktsize);
-        if (peer->sock6.family != 0) {
-            ssize_t r6 = sendto_sock(sss, &peer->sock6, pktbuf, pktsize);
-            if (r6 == (ssize_t)pktsize) r = r6;
-        }
-        return r;
+    /* Prefer IPv4 for forwarding; do not send to both address families. */
+    if (peer->sock.family == AF_INET) {
+        return sendto_sock(sss, &peer->sock, pktbuf, pktsize);
     }
+    if (peer->sock6.family == AF_INET6) {
+        return sendto_sock(sss, &peer->sock6, pktbuf, pktsize);
+    }
+    return -1;
 }
 
 /* Purge timed out / closed WS connections. Close if idle for WS_KEEPALIVE_TIMEOUT seconds. */
@@ -1264,6 +1938,52 @@ static ssize_t sendto_sock(n2n_sn_t * sss,
     return sent;
 }
 
+/* ===== Compromise shaper: small FIFO queue instead of drops =====
+ * Throttled packets beyond token credit are parked (SHAPER_SLOTS x ~2KB) and
+ * released FIFO as the bucket refills; TCP sees no loss, at queueing latency. */
+static int shaper_enqueue(struct community_stats *s,
+                          const n2n_mac_t mac,
+                          const uint8_t *pktbuf, size_t pktsize)
+{
+    if (pktsize > N2N_SN_PKTBUF_SIZE) return 0;
+    if (!s->q) {
+        s->q = (struct shaper_slot*)calloc(SHAPER_SLOTS, sizeof(struct shaper_slot));
+        if (!s->q) return 0;
+    }
+    if (s->q_n >= SHAPER_SLOTS) return 0; /* queue full: tail drop */
+    struct shaper_slot *sl = &s->q[(s->q_r + s->q_n) % SHAPER_SLOTS];
+    memcpy(sl->mac, mac, sizeof(n2n_mac_t));
+    sl->len = (uint16_t)pktsize;
+    memcpy(sl->buf, pktbuf, pktsize);
+    s->q_n++;
+    return 1;
+}
+
+/* Release queued packets in FIFO order as the token bucket refills. */
+static void shaper_drain(n2n_sn_t *sss, struct community_stats *s)
+{
+    if (!s->q || s->q_n == 0) return;
+    time_t now = time(NULL);
+    while (s->q_n > 0) {
+        struct shaper_slot *sl = &s->q[s->q_r];
+        struct peer_info *peer = find_peer_by_mac(sss->edges, sl->mac);
+        if (!peer) {
+            /* destination vanished while queued: drop this slot */
+            s->q_r = (s->q_r + 1) % SHAPER_SLOTS;
+            s->q_n--;
+            continue;
+        }
+        if (!rate_admit(s, sl->len)) break; /* out of credit: wait for refill */
+        if (sn_send_to_peer(sss, peer, sl->buf, sl->len) == (ssize_t)sl->len) {
+            ++(sss->stats.fwd);
+            sss->stats.last_fwd = now;
+            update_community_traffic(s, sl->len, now);
+        }
+        s->q_r = (s->q_r + 1) % SHAPER_SLOTS;
+        s->q_n--;
+    }
+}
+
 
 /** Try to forward a message to a unicast MAC. If the MAC is unknown then
  *  broadcast to all edges in the destination community.
@@ -1299,8 +2019,15 @@ static int try_forward( n2n_sn_t * sss,
             /* Apply rules on first use (new entry has zeroed limits) */
             if (cs->rate_limit_bps == 0 && cs->max_24h_bytes == 0)
                 apply_rules_to_stats(cs, sss->rate_rules);
-            if (!check_rate_limit(cs, pktsize, now)) {
-                traceEvent(TRACE_DEBUG, "rate limit drop for community %s", cmn->community);
+            shaper_drain(sss, cs);
+            if (!rate_admit(cs, pktsize)) {
+                if (cs->rate_limit_bps > 0 &&
+                    shaper_enqueue(cs, scan->mac_addr, pktbuf, pktsize)) {
+                    traceEvent(TRACE_DEBUG, "shaper queued %lu for community %s",
+                               (unsigned long)pktsize, cmn->community);
+                } else {
+                    traceEvent(TRACE_DEBUG, "rate limit drop for community %s", cmn->community);
+                }
                 return 0;
             }
         }
@@ -1316,6 +2043,7 @@ static int try_forward( n2n_sn_t * sss,
     if ( data_sent_len == pktsize )
     {
         ++(sss->stats.fwd);
+        sss->stats.last_fwd = now;
         if (cs) update_community_traffic(cs, pktsize, now);
         traceEvent(TRACE_DEBUG, "unicast %lu to [%s] %s%s",
                    pktsize,
@@ -1364,6 +2092,7 @@ static int process_mgmt( n2n_sn_t * sss,
     size_t ressize = 0;
     ssize_t r;
     struct peer_info *list;
+    n2n_sock_str_t sockbuf;
 #define MAX_COMMUNITIES 256
     n2n_community_t communities[MAX_COMMUNITIES];
     int num_communities = 0;
@@ -1397,11 +2126,12 @@ static int process_mgmt( n2n_sn_t * sss,
     }
 
     /* Send header */
-    ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                      "  id  mac                n2n_ip           wan_ip               <KB/s     GB/24h   GB/30d>  ver      os\n");
+    ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s", mgmt_header);
 	if (ressize < N2N_SN_PKTBUF_SIZE)
         ressize += snprintf(resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize,
-                           "---v2.3----------------------------------------------------------------------------------------------------\n");
+                           "---v2.3----------------------------------------------------------------------------------------------------------------\n");
+    /* brother table sits between the two v2.3 separator lines */
+    ressize += brother_list_format(sss, time(NULL), resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize);
 
     r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
                sender_sock, sender_sock_len);
@@ -1432,6 +2162,25 @@ static int process_mgmt( n2n_sn_t * sss,
     /* Second pass: for each community, scan edges list directly - no malloc needed */
     uint32_t displayed_edges = 0;
     for (int i = 0; i < num_communities; i++) {
+        /* Mark communities that hold promoted edges (registered via a
+         * brother supernode's identity, not directly on this SN): the
+         * community name gets a "* " prepended ("*n2n"). */
+        int is_prom = 0;
+        for (int p = 0; p < PROMOTED_LIST_MAX && !is_prom; p++)
+            if (sss->promoted[p].seen != 0 &&
+                now - sss->promoted[p].seen <= PROMOTED_TTL &&
+                memcmp(sss->promoted[p].community, communities[i],
+                       sizeof(n2n_community_t)) == 0)
+                is_prom = 1;
+        char cname[N2N_COMMUNITY_SIZE + 3];
+        int cnamelen = 0;
+        while (cnamelen < N2N_COMMUNITY_SIZE && communities[i][cnamelen])
+            cnamelen++;
+        int off = 0;
+        if (is_prom) cname[off++] = '*';
+        memcpy(cname + off, communities[i], cnamelen);
+        off += cnamelen;
+        cname[off] = 0;
         /* Community name line with traffic stats on same line */
         if (sss->traffic_stats_enabled) {
             struct community_stats *cs = sss->comm_stats;
@@ -1452,23 +2201,40 @@ static int process_mgmt( n2n_sn_t * sss,
                 if (kbps > 0.0 || gb_30d >= 0.1) {
                     const char *arrow = (kbps >= 0.1) ? "--->" : "    ";
                     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                                       "%-57.16s  %s %-7.1f  %-7.1f  %-10.1f\n",
-                                       communities[i], arrow, kbps, gb_24h, gb_30d);
+                                       "%s%*s  %s %-7.1f  %-7.1f  %-10.1f\n",
+                                       cname, (int)(57 - off), "", arrow,
+                                       kbps, gb_24h, gb_30d);
                 } else {
-                    ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%.16s\n", communities[i]);
+                    ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", cname);
                 }
             } else {
-                ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%.16s\n", communities[i]);
+                ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", cname);
             }
         } else {
-            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%.16s\n", communities[i]);
+            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", cname);
         }
         r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
         if (r <= 0) return -1;
 
+        /* '*' sticks once advertised; only pre-scan used peers so a forced
+         * relay (-Z 3) stays hidden behind the actually-used one. */
+        int community_has_sticky = 0;
+        {
+            struct peer_info *scan = sss->edges;
+            while (scan) {
+                if (memcmp(scan->community_name, communities[i], sizeof(n2n_community_t)) == 0 &&
+                    scan->relay_adv_live != 0) {
+                    community_has_sticky = 1;
+                    break;
+                }
+                scan = scan->next;
+            }
+        }
+
         /* Output all edges belonging to this community directly from the original list */
         struct peer_info *edge = sss->edges;
         int id = 1;
+        int force_shown = 0; /* at most one forced relay gets '*' */
         while (edge) {
             if (memcmp(edge->community_name, communities[i], sizeof(n2n_community_t)) != 0) {
                 edge = edge->next;
@@ -1538,10 +2304,27 @@ static int process_mgmt( n2n_sn_t * sss,
                         }
                     }
                 }
+                /* ' *' marks the community relay: either actually used (sticky, once
+                 * set it never clears) or, when nothing has been used yet,
+                 * the member that forces relaying (-Z 3). Same 2-char width
+                 * as %2u to keep the column aligned. */
+                const char *seq = " *";
+                char seqnum[12]; /* "%2u" of an int is at most 10 digits + NUL */
+                int is_live_relay = (edge->relay_adv_live != 0) ||
+                                    (edge->relay_willing == 3 && !community_has_sticky && !force_shown);
+                if ( is_live_relay )
+                    force_shown = 1;
+                else
+                {
+                    snprintf(seqnum, sizeof(seqnum), "%2u", id);
+                    seq = seqnum;
+                }
+                id++;
                 ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                                   "  %2u  %-17s  %-15s  %-47s  %-7s  %s\n",
-                                   id++, macaddr_str(mac_buf, edge->mac_addr), virt_ip,
-                                   wan, version, os_name);
+                                   "  %2s  %-17s  %-15s  %-47s  %-7s  %-7s  %s\n",
+                                   seq, macaddr_str(mac_buf, edge->mac_addr), virt_ip,
+                                   wan, version, os_name,
+                                   N2N_NAT_NAME(edge->nat_type));
             }
 
             r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
@@ -1629,7 +2412,7 @@ static int process_mgmt( n2n_sn_t * sss,
 
     /* Send footer and statistics */
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                      "----------------------------------------------------------------------------------------------------v2.3---\n");
+                      "----------------------------------------------------------------------------------------------------------------v2.3---\n");
 
     time_t uptime = now - sss->start_time;
     int days = uptime / 86400;
@@ -1646,8 +2429,8 @@ static int process_mgmt( n2n_sn_t * sss,
                        num_edges,
                        (unsigned int)sss->stats.reg_super_nak,
                        (unsigned int)sss->stats.errors,
-                       (long unsigned int)(now - sss->stats.last_reg_super),
-                       (long unsigned int)(now - sss->stats.last_fwd));
+                       (long unsigned int)(sss->stats.last_reg_super ? now - sss->stats.last_reg_super : 0),
+                       (long unsigned int)(sss->stats.last_fwd ? now - sss->stats.last_fwd : 0));
 
     const char* ip_support;
     if (sss->ipv4_available && sss->ipv6_available) {
@@ -1669,6 +2452,9 @@ static int process_mgmt( n2n_sn_t * sss,
                            ip_support,
                            n2n_sw_version_full);
 
+    /* brother_list_format output is sent earlier, between the two v2.3
+     * separator lines. */
+
     r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
               sender_sock, sender_sock_len);
     if (r <= 0) return -1;
@@ -1685,37 +2471,29 @@ static int try_broadcast( n2n_sn_t * sss,
     struct peer_info *  scan;
     struct community_stats *cs = NULL;
     int bc_count = 0;
+    int bc_limit = INT_MAX; /* broadcast member cap while throttled */
     macstr_t            mac_buf;
     n2n_sock_str_t      sockbuf;
     time_t              now = time(NULL);
 
     traceEvent( TRACE_DEBUG, "try_broadcast" );
 
-    /* Rate limiting check for broadcast.
-     * Server-perspective accounting: a broadcast is sent once per member,
-     * so the actual egress bytes are pktsize * member_count. Check against
-     * the full amount up front so one broadcast cannot bypass the limit by
-     * only consuming a single packet's quota. */
+    /* Broadcast throttle (B1 gate): cap fan-out via bc_gate while over the
+     * 24h cap; accounting still counts what is actually sent. */
     if (sss->traffic_stats_enabled) {
         cs = get_community_stats(&sss->comm_stats,
                                                       cmn->community, now);
         if (cs) {
             if (cs->rate_limit_bps == 0 && cs->max_24h_bytes == 0)
                 apply_rules_to_stats(cs, sss->rate_rules);
-            /* Count members (excluding sender) for up-front limit check */
-            size_t member_count = 0;
-            struct peer_info *m = sss->edges;
-            while (m) {
-                if (memcmp(m->community_name, cmn->community, sizeof(n2n_community_t)) == 0
-                    && memcmp(srcMac, m->mac_addr, sizeof(n2n_mac_t)) != 0)
-                    member_count++;
-                m = m->next;
-            }
-            if (!check_rate_limit(cs, pktsize * (member_count ? member_count : 1), now)) {
-                traceEvent(TRACE_DEBUG, "rate limit drop broadcast for community %s "
-                           "(%u members)",
-                           cmn->community, (unsigned)member_count);
-                return 0;
+            if (cs->max_24h_bytes > 0 && cs->last_24h_bytes >= cs->max_24h_bytes) {
+                if (cs->rate_limit_bps == 0) {
+                    /* hard block: no broadcast at all */
+                    traceEvent(TRACE_DEBUG, "rate limit drop broadcast for community %s",
+                               cmn->community);
+                    return 0;
+                }
+                bc_limit = cs->bc_gate;
             }
         }
     }
@@ -1726,6 +2504,8 @@ static int try_broadcast( n2n_sn_t * sss,
         if( 0 == (memcmp(scan->community_name, cmn->community, sizeof(n2n_community_t)) )
             && (0 != memcmp(srcMac, scan->mac_addr, sizeof(n2n_mac_t)) ) )
         {
+            if (bc_count >= bc_limit)
+                break; /* gate reached: stop forwarding to further members */
             ssize_t data_sent_len;
             n2n_sock_t *primary = (scan->connect_family == AF_INET6 &&
                                    scan->sock6.family == AF_INET6)
@@ -1741,6 +2521,7 @@ static int try_broadcast( n2n_sn_t * sss,
             {
                 ++(sss->stats.broadcast);
                 ++bc_count;
+                sss->stats.last_fwd = now;
                 traceEvent(TRACE_DEBUG, "multicast %lu to %s %s%s",
                            pktsize,
                            sock_to_cstr( sockbuf, primary ),
@@ -1758,10 +2539,713 @@ static int try_broadcast( n2n_sn_t * sss,
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Full-cone probe (plan C): the edge's NAT whitelist starts empty, so a
+ * never-contacted source only gets through a full-cone NAT. The brother SN
+ * fires tiny "N2NF" datagrams at the brand-new mapping (never-contacted by
+ * construction); a bounce-helper probe (source port never used as
+ * destination) still rules out port-restricted NAT after contact. */
+
+/* Probe a forwarded edge mapping; only a live BIG brother is accepted
+ * (little brother / strangers / non-brothers are never probed). */
+static void handle_fc_probe_request( n2n_sn_t *sss,
+                                     const struct sockaddr *sender_sock,
+                                     const uint8_t *udp_buf,
+                                     time_t now )
+{
+    n2n_sock_str_t sockbuf;
+    n2n_sock_t sender_n2n;
+    n2n_sock_t target;
+    int from_brother = 0;
+    static const uint8_t msg[4] = { 'N', '2', 'N', 'F' };
+
+    if ( sss->last_brother_seen == 0 || now - sss->last_brother_seen > 180 )
+        return;
+
+    sock_from_sender( &sender_n2n, sender_sock );
+    if ( sender_n2n.family != AF_INET )
+        return;
+
+    {
+        uint8_t zero[6] = {0,0,0,0,0,0};
+        for ( int j = 0; j < MAX_BROTHER_SNS && !from_brother; j++ )
+        {
+            n2n_brother_entry_t *b = &sss->brothers[j];
+            if ( memcmp( b->mac, zero, 6 ) == 0 ) continue;
+            /* Only big brothers may ask me to probe their children.
+             * My little brother's edges are none of my business. */
+            if ( b->role == N2N_BROTHER_ROLE_MY_LITTLE ) continue;
+            if ( b->sock.family == AF_INET &&
+                 memcmp( b->sock.addr.v4, sender_n2n.addr.v4, IPV4_SIZE ) == 0 )
+                from_brother = 1;
+        }
+    }
+    if ( !from_brother ) return;
+
+    memset( &target, 0, sizeof(target) );
+    target.family = AF_INET;
+    memcpy( target.addr.v4, udp_buf + 10, IPV4_SIZE );
+    target.port = ( (uint16_t)udp_buf[14] << 8 ) | udp_buf[15];
+    if ( is_private_ipv4( target.addr.v4 ) )
+        return; /* probes only cross a NAT; never send to private addresses */
+
+    /* #1 now; #2/#3 staggered so a re-mapped edge's ACK (re-arming its
+     * stranger window) beats probe #1 — later probes land in the window. */
+    sendto_sock( sss, &target, msg, sizeof(msg) );
+
+    /* Bounce-helper probe: same IP, source port never used as destination.
+     * Before contact it proves full cone; after (port whitelisted), a
+     * delivery still proves the filter is not port-restricted. */
+    if ( sss->bounce_sock >= 0 )
+    {
+        struct sockaddr_in tgt;
+        memset( &tgt, 0, sizeof(tgt) );
+        tgt.sin_family = AF_INET;
+        tgt.sin_port   = htons( target.port );
+        memcpy( &(tgt.sin_addr), target.addr.v4, IPV4_SIZE );
+        sendto( sss->bounce_sock, msg, sizeof(msg), 0,
+                (const struct sockaddr *)&tgt, sizeof(tgt) );
+    }
+
+    for ( int i = 0; i < FC_PROBE_MAX; i++ )
+    {
+        if ( sss->fc_probes[i].left > 0 ) continue;
+        sss->fc_probes[i].target = target;
+        sss->fc_probes[i].due    = now + FC_PROBE_SPREAD;
+        sss->fc_probes[i].left   = 2;
+        break;
+    }
+
+    traceEvent( TRACE_INFO, "FC probe: N2NF x3 + helper -> %s",
+                sock_to_cstr( sockbuf, &target ) );
+}
+
+/* Fire the staggered N2NF probes (#2/#3). The main loop wakes every 100ms,
+ * far finer than FC_PROBE_SPREAD. */
+static void fc_probes_tick( n2n_sn_t * sss, time_t now )
+{
+    static const uint8_t msg[4] = { 'N', '2', 'N', 'F' };
+
+    for ( int i = 0; i < FC_PROBE_MAX; i++ )
+    {
+        if ( sss->fc_probes[i].left == 0 || now < sss->fc_probes[i].due )
+            continue;
+        sendto_sock( sss, &sss->fc_probes[i].target, msg, sizeof(msg) );
+        sss->fc_probes[i].left--;
+        sss->fc_probes[i].due = now + FC_PROBE_SPREAD;
+    }
+}
+
+/* Forward a brand-new edge mapping to our [-b] little brother (sn2) so IT
+ * can act as the never-contacted full-cone source. Big brothers and
+ * strangers are never asked. */
+static void send_fc_probe_request( n2n_sn_t *sss,
+                                   const n2n_mac_t edgeMac,
+                                   const n2n_sock_t *edge_sock,
+                                   time_t now )
+{
+    uint8_t pkt[16];
+    int sent = 0;
+
+    if ( edge_sock->family != AF_INET ) return; /* NAT test is IPv4-only */
+
+    memcpy( pkt, "N2NF", 4 );
+    memcpy( pkt + 4, edgeMac, N2N_MAC_SIZE );
+    memcpy( pkt + 10, edge_sock->addr.v4, IPV4_SIZE );
+    pkt[14] = ( edge_sock->port >> 8 ) & 0xFF;
+    pkt[15] = edge_sock->port & 0xFF;
+
+    /* Only entries flagged as my little brother (sn2) are asked. */
+    for ( int j = 0; j < MAX_BROTHER_SNS; j++ )
+    {
+        n2n_brother_entry_t *b = &sss->brothers[j];
+        time_t seen = b->seen > b->seen6 ? b->seen : b->seen6;
+        if ( b->role == N2N_BROTHER_ROLE_MY_LITTLE &&
+             b->sock.family == AF_INET && seen != 0 && now - seen <= 180 )
+        {
+            sendto_sock( sss, &b->sock, pkt, sizeof(pkt) );
+            sent = 1;
+        }
+    }
+    /* Fallback: brother table has no live little brother (or it registered
+     * only on IPv6) — use our [-b] address directly. */
+    if ( !sent && sss->backup_addr_text[0] != '\0' )
+    {
+        n2n_sock_t bs;
+        if ( resolve_my_brother_addr( sss, &bs, now ) == 0 &&
+             bs.family == AF_INET )
+        {
+            sendto_sock( sss, &bs, pkt, sizeof(pkt) );
+            sent = 1;
+        }
+    }
+    if ( sent )
+    {
+        macstr_t mac_buf;
+        traceEvent( TRACE_DEBUG, "FC probe request forwarded for %s",
+                    macaddr_str( mac_buf, edgeMac ) );
+    }
+}
+
+/* Build and send a PUNCH PEER_INFO describing edge `other` to edge `self`
+ * (at its recorded public address). Both the round-0 wake-up and the
+ * per-round handoff use this. */
+static void sn_send_punch_info( n2n_sn_t * sss, const n2n_community_t community,
+                                const struct peer_info * self,
+                                const struct peer_info * other );
+
+/* push_nat_to_community: broadcast the changed edge's PEER_INFO to every
+ * community member; communicating counterparts get a PUNCH instead. */
+static void push_nat_to_community( n2n_sn_t *sss,
+                                   struct peer_info *changed,
+                                   const n2n_community_t community,
+                                   int addr_changed )
+{
+    n2n_common_t    pi_cmn;
+    n2n_PEER_INFO_t pi;
+    uint8_t         pibuf[N2N_SN_PKTBUF_SIZE];
+    size_t          pix;
+    macstr_t        mac_buf;
+    struct peer_info *p;
+
+    if ( !changed ) return;
+
+    memset(&pi_cmn, 0, sizeof(pi_cmn));
+    memset(&pi, 0, sizeof(pi));
+    pi_cmn.ttl   = N2N_DEFAULT_TTL;
+    pi_cmn.pc    = n2n_peer_info;
+    pi_cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
+    memcpy(pi_cmn.community, community, sizeof(n2n_community_t));
+
+    memcpy(pi.mac, changed->mac_addr, N2N_MAC_SIZE);
+    /* Always put IPv4 in sockets[0] if available */
+    if (changed->sock.family == AF_INET)
+        pi.sockets[0] = changed->sock;
+    else if (changed->sock6.family == AF_INET6)
+        pi.sockets[0] = changed->sock6;
+    if (changed->num_sockets > 1 &&
+        changed->sockets[1].family != 0 &&
+        changed->sockets[1].port != 0)
+    {
+        pi.aflags = N2N_AFLAGS_LOCAL_SOCKET;
+        pi.sockets[1] = changed->sockets[1];
+    } else {
+        pi.aflags = 0;
+    }
+    /* Include IPv6 address if available */
+    if (changed->sock6.family == AF_INET6) {
+        pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+        pi.sock6 = changed->sock6;
+    } else {
+        memset(&pi.sock6, 0, sizeof(n2n_sock_t));
+    }
+    if (changed->same_lan_as_sn) {
+        pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
+    }
+    strncpy(pi.version, changed->version, sizeof(pi.version) - 1);
+    strncpy(pi.os_name, changed->os_name, sizeof(pi.os_name) - 1);
+    pi.assigned_ip = changed->assigned_ip;
+    pi.aflags |= N2N_NAT_AFLAGS(changed->nat_type);
+    pix = 0;
+    encode_PEER_INFO(pibuf, &pix, &pi_cmn, &pi);
+
+    time_t now = time(NULL);
+    /* First the communicating counterpart gets a PUNCH right away: its address
+     * just changed, so both sides must re-punch immediately. */
+    for ( p = sss->edges; p; p = p->next )
+    {
+        if ( p == changed ) continue;
+        if ( memcmp(p->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
+        /* A communicating counterpart (recent relayed unicast either way) gets a PUNCH instead of the plain broadcast. */
+        int communicating = ( addr_changed &&
+                              ((p->last_fwd_time != 0 &&
+                                (now - p->last_fwd_time) < SN_FWD_PUNCH_ACTIVE_SECS &&
+                                memcmp(p->last_fwd_mac, changed->mac_addr, N2N_MAC_SIZE) == 0) ||
+                               (changed->last_fwd_time != 0 &&
+                                (now - changed->last_fwd_time) < SN_FWD_PUNCH_ACTIVE_SECS &&
+                                memcmp(changed->last_fwd_mac, p->mac_addr, N2N_MAC_SIZE) == 0)) );
+        if ( communicating )
+            sn_send_punch_info( sss, community, p, changed );
+    }
+    /* Then the plain PEER_INFO (no PUNCH) to everyone else, so they just
+     * refresh their local info without starting a punch. */
+    for ( p = sss->edges; p; p = p->next )
+    {
+        if ( p == changed ) continue;
+        if ( memcmp(p->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
+        int communicating = ( addr_changed &&
+                              ((p->last_fwd_time != 0 &&
+                                (now - p->last_fwd_time) < SN_FWD_PUNCH_ACTIVE_SECS &&
+                                memcmp(p->last_fwd_mac, changed->mac_addr, N2N_MAC_SIZE) == 0) ||
+                               (changed->last_fwd_time != 0 &&
+                                (now - changed->last_fwd_time) < SN_FWD_PUNCH_ACTIVE_SECS &&
+                                memcmp(changed->last_fwd_mac, p->mac_addr, N2N_MAC_SIZE) == 0)) );
+        if ( communicating ) continue;
+        sn_send_to_peer( sss, p, pibuf, pix );
+    }
+    traceEvent(TRACE_DEBUG, "pushed NAT change of %s to community",
+               macaddr_str(mac_buf, changed->mac_addr));
+}
+
+/* ---- community relay helpers (mini-SN) -----------------------------------
+ *
+ * The relay is a community peer picked to forward traffic for members that
+ * cannot P2P directly. It must be a "good" peer: measured cone NAT (NAT1) and
+ * holding a usable public IPv4 socket, so the members can reach it without
+ * punching. Address rewriting / NAT2 relays are intentionally left as the
+ * "else -> back to SN" path.
+ * ------------------------------------------------------------------------ */
+
+/* A peer is relay-capable only if its extern addr is a public IPv4 and its
+ * NAT type is relay-eligible (N2N_NAT_RELAY_CAPABLE). Private addrs would
+ * make A/B unreachable. */
+static int is_relay_capable( const struct peer_info * peer )
+{
+    if (!peer) return 0;
+    if (!N2N_NAT_RELAY_CAPABLE(peer->nat_type)) return 0;
+    if (peer->sock.family != AF_INET) return 0;
+    return !is_private_ipv4(peer->sock.addr.v4);
+}
+
+/* Pick the community's relay among registered edges (excludes a given MAC so
+ * the relay never relays for itself). A -Z 3 force is used as-is, never
+ * NAT-filtered (failure falls back via the edge's 5s relay_proven); else
+ * willing (2) over default (1); refusing never picked; force-only with no
+ * forcing member => no relay. Newest first; NULL if none eligible. */
+static struct peer_info * find_community_relay( n2n_sn_t *sss,
+                                                const n2n_community_t community,
+                                                const n2n_mac_t exclude_mac,
+                                                int force_only )
+{
+    struct peer_info * scan;
+    struct peer_info * forcers[32];
+    int n = 0;
+
+    for ( scan = sss->edges; scan; scan = scan->next )
+    {
+        if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
+        if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
+        if ( scan->relay_willing == 3 )
+        {
+            if ( n < 32 ) forcers[n++] = scan; /* never state-checked */
+        }
+    }
+    if ( n > 0 )
+    {
+        /* Random single pick among the forcing members -- one chance. */
+        unsigned long seed = (unsigned long)time(NULL) ^ (unsigned long)&forcers[0];
+        seed = seed * 2654435761u;
+        seed += (unsigned long)&scan; /* vary with layout across calls */
+        return forcers[ seed % n ];
+    }
+
+    {
+        struct peer_info * best_willing = NULL;  /* willing==2 */
+        struct peer_info * best_default = NULL;  /* willing==1 */
+        for ( scan = sss->edges; scan; scan = scan->next )
+        {
+            if ( memcmp(scan->mac_addr, exclude_mac, N2N_MAC_SIZE) == 0 ) continue;
+            if ( memcmp(scan->community_name, community, sizeof(n2n_community_t)) != 0 ) continue;
+            if ( !is_relay_capable(scan) ) continue;
+            if ( scan->relay_willing == 0 ) continue;      /* refusing: never pick */
+            if ( force_only ) continue;                    /* globally off, nobody forces: no relay */
+            if ( scan->relay_willing == 2 ) { if (!best_willing) best_willing = scan; }
+            else if ( !best_default ) best_default = scan;
+        }
+        if ( best_willing ) return best_willing;
+        return best_default;
+    }
+}
+
+/* Send one PEER_INFO telling <dest> that <relay> is the community's relay
+ * peer. The RELAY flag makes the receiving edge register to it and fall back
+ * to it when direct punching fails. */
+static void advertise_relay_to( n2n_sn_t *sss,
+                                const n2n_common_t * cmn,
+                                struct peer_info * dest,
+                                struct peer_info * relay )
+{
+    n2n_common_t    pi_cmn;
+    n2n_PEER_INFO_t pi;
+    uint8_t         pibuf[N2N_SN_PKTBUF_SIZE];
+    size_t          pix = 0;
+
+    if ( !dest || !relay ) return;
+
+    memset(&pi_cmn, 0, sizeof(pi_cmn));
+    memset(&pi, 0, sizeof(pi));
+    pi_cmn.ttl   = N2N_DEFAULT_TTL;
+    pi_cmn.pc    = n2n_peer_info;
+    pi_cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
+    memcpy(pi_cmn.community, cmn->community, sizeof(n2n_community_t));
+
+    memcpy(pi.mac, relay->mac_addr, N2N_MAC_SIZE);
+    pi.aflags = N2N_AFLAGS_RELAY; /* this peer is the relay, not a punch target */
+    if (relay->sock.family == AF_INET)
+        pi.sockets[0] = relay->sock;
+    else if (relay->sock6.family == AF_INET6)
+        pi.sockets[0] = relay->sock6;
+    if (relay->sock6.family == AF_INET6) {
+        pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+        pi.sock6 = relay->sock6;
+    }
+    strncpy(pi.version, relay->version, sizeof(pi.version) - 1);
+    strncpy(pi.os_name, relay->os_name, sizeof(pi.os_name) - 1);
+    pi.aflags |= N2N_NAT_AFLAGS(relay->nat_type);
+
+    encode_PEER_INFO( pibuf, &pix, &pi_cmn, &pi );
+    sn_send_to_peer( sss, dest, pibuf, pix );
+}
+
+/* When the supernode actually relays unicast traffic between <req_mac> and
+ * <tgt_mac> ("communication attempt / failed direct"), advertise the community
+ * relay peer to both so they start registering to it and route through it.
+ * Throttled to ~once per 15s per requester so heavy flows don't flood PEER_INFO. */
+static void advertise_relay_on_pair( n2n_sn_t *sss,
+                                     const n2n_common_t * cmn,
+                                     const n2n_mac_t req_mac,
+                                     const n2n_mac_t tgt_mac )
+{
+    int force_only;
+    /* Whole-relay switch: with -Z 0 plain SN relay stays on UNLESS a member
+     * forces (-Z 3) — that member turns the group relay back on and is used
+     * as-is; if it cannot relay, the edge's 5s relay_proven fallback routes
+     * back through the SN. */
+    force_only = !sss->relay_advert_enabled;
+
+    struct peer_info * req = find_peer_by_mac( sss->edges, req_mac );
+    if ( !req ) return;
+
+    time_t now = time(NULL);
+
+    /* Sustained-traffic gate: the initial punch burst through this SN must
+     * not trigger the announcement — only after a member has been relayed
+     * here for SN_RELAY_ADVERT_ACTIVE_SECS is punching deemed failed. */
+    if ( req->sn_fwd_first == 0 )
+        req->sn_fwd_first = now;
+    if ( (now - req->sn_fwd_first) < SN_RELAY_ADVERT_ACTIVE_SECS )
+        return;
+
+    if ( (now - req->relay_adv_time) < 15 ) return; /* throttled */
+
+    /* The relay must be a proper third peer: neither the sender nor the target. */
+    struct peer_info * relay = find_community_relay( sss, cmn->community, req_mac, force_only );
+    if ( !relay || (memcmp(relay->mac_addr, tgt_mac, N2N_MAC_SIZE) == 0) )
+        return; /* no good peer (incl. globally-off with no forcing member) -> plain SN */
+    req->relay_adv_time = now;
+
+    struct peer_info * tgt = find_peer_by_mac( sss->edges, tgt_mac );
+    advertise_relay_to( sss, cmn, req, relay );
+    if ( tgt )
+    {
+        /* Same sustained-traffic gate on the target side. */
+        if ( tgt->sn_fwd_first == 0 )
+            tgt->sn_fwd_first = now;
+        if ( (now - tgt->sn_fwd_first) >= SN_RELAY_ADVERT_ACTIVE_SECS )
+            advertise_relay_to( sss, cmn, tgt, relay );
+    }
+    /* Notify the relay itself (PEER_INFO RELAY naming its own MAC) so it
+     * switches on forwarding without self-judging eligibility. Idempotent. */
+    relay->relay_adv_live = now; /* mark as "in use" for mgmt display */
+    advertise_relay_to( sss, cmn, relay, relay );
+}
+
+/* ---- punch pair coordination ----
+ * Every QUERY_PEER forms/touches a pair; 2s rounds re-register per side and
+ * the sn hands each the other's latest address (PUNCH) so they punch
+ * simultaneously. Live handoffs suppress QUERY replies; the pair drops once
+ * round querying stops. */
+
+/* sec: reply only when the pair is new or the last handoff is this old —
+ * within the 2s rounds the handoff already refreshes both edges. */
+#define PUNCH_QUERY_REFRESH_SECS 3
+
+static struct sn_punch_pair * sn_pair_find( n2n_sn_t * sss,
+                                            const n2n_community_t community,
+                                            const n2n_mac_t a,
+                                            const n2n_mac_t b )
+{
+    struct sn_punch_pair *p = sss->punch_pairs;
+    while ( p )
+    {
+        if ( memcmp(p->community, community, sizeof(n2n_community_t)) == 0 &&
+             memcmp(p->edge_a, a, N2N_MAC_SIZE) == 0 &&
+             memcmp(p->edge_b, b, N2N_MAC_SIZE) == 0 )
+            return p;
+        p = p->next;
+    }
+    return NULL;
+}
+
+/* Touch (or create) the pair for (a,b). Returns 1 when newly created; the
+ * round-0 join messages (requester reply + target wake-up) go out only then. */
+static int sn_pair_touch( n2n_sn_t * sss, const n2n_community_t community,
+                          const n2n_mac_t a, const n2n_mac_t b, time_t now )
+{
+    n2n_mac_t ea, eb;
+    if ( memcmp(a, b, N2N_MAC_SIZE) < 0 )
+    {
+        memcpy(ea, a, N2N_MAC_SIZE);
+        memcpy(eb, b, N2N_MAC_SIZE);
+    }
+    else
+    {
+        memcpy(ea, b, N2N_MAC_SIZE);
+        memcpy(eb, a, N2N_MAC_SIZE);
+    }
+    struct sn_punch_pair *p = sn_pair_find( sss, community, ea, eb );
+    if ( p )
+    {
+        p->last_activity = now;
+        return 0;
+    }
+    p = (struct sn_punch_pair*)calloc(1, sizeof(struct sn_punch_pair));
+    if ( !p )
+        return 0;
+    memcpy(p->community, community, sizeof(n2n_community_t));
+    memcpy(p->edge_a, ea, N2N_MAC_SIZE);
+    memcpy(p->edge_b, eb, N2N_MAC_SIZE);
+    p->last_activity = now;
+    p->next = sss->punch_pairs;
+    sss->punch_pairs = p;
+    /* Keep the table bounded: drop the least recently active pair when full. */
+    {
+        struct sn_punch_pair *scan = sss->punch_pairs;
+        struct sn_punch_pair *oldest = NULL, *oldest_prev = NULL, *prev = NULL;
+        int n = 0;
+        while ( scan )
+        {
+            n++;
+            if ( !oldest || scan->last_activity < oldest->last_activity )
+            {
+                oldest = scan;
+                oldest_prev = prev;
+            }
+            prev = scan;
+            scan = scan->next;
+        }
+        if ( n > PUNCH_PAIR_MAX && oldest && oldest != p )
+        {
+            if ( oldest_prev )
+                oldest_prev->next = oldest->next;
+            else
+                sss->punch_pairs = oldest->next;
+            free(oldest);
+        }
+    }
+    return 1;
+}
+
+/* Build and send a PUNCH PEER_INFO describing edge `other` to edge `self`
+ * (at its recorded public address). Both the round-0 wake-up and the
+ * per-round handoff use this. */
+static void sn_send_punch_info( n2n_sn_t * sss, const n2n_community_t community,
+                                const struct peer_info * self,
+                                const struct peer_info * other )
+{
+    n2n_common_t    cmn2;
+    n2n_PEER_INFO_t pi;
+    uint8_t         encbuf[N2N_SN_PKTBUF_SIZE];
+    size_t          encx = 0;
+    struct sockaddr_storage dst;
+    socklen_t dlen = sizeof(dst);
+    macstr_t        src_buf, dst_buf;
+
+    memset(&cmn2, 0, sizeof(cmn2));
+    cmn2.ttl   = N2N_DEFAULT_TTL;
+    cmn2.pc    = n2n_peer_info;
+    cmn2.flags = N2N_FLAGS_FROM_SUPERNODE;
+    memcpy( cmn2.community, community, sizeof(n2n_community_t) );
+
+    memset(&pi, 0, sizeof(pi));
+    memcpy( pi.mac, other->mac_addr, N2N_MAC_SIZE );
+    pi.aflags = N2N_AFLAGS_PUNCH_REQUEST;
+    if (other->num_sockets > 1 && other->sockets[1].family != 0 &&
+        other->sockets[1].port != 0)
+        pi.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
+    /* Always put IPv4 in sockets[0] if available, so both addresses are carried */
+    if (other->sock.family == AF_INET)
+        pi.sockets[0] = other->sock;
+    else if (other->sock6.family == AF_INET6)
+        pi.sockets[0] = other->sock6;
+    if (pi.aflags & N2N_AFLAGS_LOCAL_SOCKET)
+        pi.sockets[1] = other->sockets[1];
+    if (other->sock6.family == AF_INET6) {
+        pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+        pi.sock6 = other->sock6;
+    }
+    if (other->same_lan_as_sn)
+        pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
+    if (other->version[0] != '\0') {
+        strncpy(pi.version, other->version, sizeof(pi.version) - 1);
+        pi.version[sizeof(pi.version) - 1] = '\0';
+    }
+    if (other->os_name[0] != '\0') {
+        strncpy(pi.os_name, other->os_name, sizeof(pi.os_name) - 1);
+        pi.os_name[sizeof(pi.os_name) - 1] = '\0';
+    }
+    pi.assigned_ip = other->assigned_ip;
+    /* Carry the peer's NAT type so edge mgmt can display it */
+    pi.aflags |= N2N_NAT_AFLAGS(other->nat_type);
+
+    encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
+    if ( self->sockets[0].family != 0 &&
+         fill_sockaddr((struct sockaddr*)&dst, dlen, &self->sockets[0]) == 0 )
+    {
+        SOCKET send_sock = (self->sockets[0].family == AF_INET6) ? sss->sock6 : sss->sock;
+        socklen_t slen = (self->sockets[0].family == AF_INET6)
+                       ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
+        sendto( send_sock, encbuf, encx, 0, (struct sockaddr*)&dst, slen );
+        traceEvent(TRACE_DEBUG, "punch handoff %s -> %s",
+                   macaddr_str(src_buf, other->mac_addr),
+                   macaddr_str(dst_buf, self->mac_addr));
+    }
+}
+
+/* REGISTER_SUPER hook: when both pair edges re-registered since the last
+ * exchange, hand each the other's latest address (PUNCH) for the round.
+ * Only PUNCH_ROUND re-registrations drive the handoff — plain periodic ones
+ * are ignored, else the sn would push PUNCHes forever after punching stops. */
+static void sn_pair_on_register( n2n_sn_t * sss, const n2n_mac_t mac,
+                                 const n2n_community_t community, time_t now,
+                                 int punch_round )
+{
+    struct sn_punch_pair *p = sss->punch_pairs;
+    macstr_t mac_buf_a, mac_buf_b;
+    while ( p )
+    {
+        if ( memcmp(p->community, community, sizeof(n2n_community_t)) != 0 )
+        {
+            p = p->next;
+            continue;
+        }
+        int is_a = (memcmp(p->edge_a, mac, N2N_MAC_SIZE) == 0);
+        int is_b = (memcmp(p->edge_b, mac, N2N_MAC_SIZE) == 0);
+        if ( !is_a && !is_b )
+        {
+            p = p->next;
+            continue;
+        }
+        if ( !punch_round )
+            return;
+        if ( is_a )
+            p->a_reg = now;
+        else
+            p->b_reg = now;
+        /* Round-start sync: defers the near side's handoff so both punch together. */
+        if ( p->sync_send_ms != 0 && !p->sync_armed )
+        {
+            if ( is_a && p->sync_reg_a_ms == 0 )
+                p->sync_reg_a_ms = sn_monotonic_ms();
+            else if ( is_b && p->sync_reg_b_ms == 0 )
+                p->sync_reg_b_ms = sn_monotonic_ms();
+        }
+        if ( !p->sync_armed && p->sync_send_ms != 0 &&
+             p->sync_reg_a_ms != 0 && p->sync_reg_b_ms != 0 )
+        {
+            int64_t diff = (p->sync_reg_a_ms > p->sync_reg_b_ms)
+                         ? p->sync_reg_a_ms - p->sync_reg_b_ms
+                         : p->sync_reg_b_ms - p->sync_reg_a_ms;
+            /* Sub-10ms differences are tick quantization noise; >1s gaps mean
+             * hopelessly asymmetric routes, skip compensation. */
+            p->sync_delay_ms = ( diff >= PUNCH_SYNC_MIN_DIFF_MS &&
+                                 diff <  PUNCH_SYNC_MAX_DIFF_MS ) ? diff / 2 : 0;
+            p->sync_near_a   = (p->sync_reg_a_ms <= p->sync_reg_b_ms);
+            p->sync_armed    = 1;
+            traceEvent( TRACE_INFO, "punch sync: delay %lld ms, near side %s",
+                        (long long)p->sync_delay_ms,
+                        macaddr_str(mac_buf_a,
+                                    p->sync_near_a ? p->edge_a : p->edge_b) );
+        }
+        /* The later registrant triggers: both reg times newer than the last exchange = both sides ready. */
+        if ( (is_a ? p->b_reg : p->a_reg) > p->last_exchanged )
+        {
+            struct peer_info *ea = find_peer_by_mac( sss->edges, p->edge_a );
+            struct peer_info *eb = find_peer_by_mac( sss->edges, p->edge_b );
+            if ( ea && eb )
+            {
+                if ( p->sync_armed && p->sync_delay_ms > 0 )
+                {
+                    /* Far side immediately, near side after the measured half-difference. */
+                    struct peer_info *far_peer, *near_peer;
+                    if ( p->sync_near_a )
+                    {
+                        far_peer  = eb;
+                        near_peer = ea;
+                    }
+                    else
+                    {
+                        far_peer  = ea;
+                        near_peer = eb;
+                    }
+                    sn_send_punch_info( sss, community, far_peer, near_peer );
+                    memcpy( p->defer_self,  near_peer->mac_addr, N2N_MAC_SIZE );
+                    memcpy( p->defer_other, far_peer->mac_addr, N2N_MAC_SIZE );
+                    p->defer_due_ms = sn_monotonic_ms() + p->sync_delay_ms;
+                    traceEvent( TRACE_DEBUG, "punch sync: defer handoff to %s by %lld ms",
+                                macaddr_str(mac_buf_b, near_peer->mac_addr),
+                                (long long)p->sync_delay_ms );
+                }
+                else
+                {
+                    sn_send_punch_info( sss, community, ea, eb ); /* a <- b */
+                    sn_send_punch_info( sss, community, eb, ea ); /* b <- a */
+                }
+            }
+            /* First handoff: anchor the round-latency measurement. */
+            if ( p->last_exchanged == 0 )
+                p->sync_send_ms = sn_monotonic_ms();
+            p->last_exchanged = now;
+        }
+        return;
+    }
+}
+
+/* Fire pending deferred handoffs whose delay has elapsed: the near side of a
+ * sync pair gets its PUNCH this way, half a round-trip difference after the
+ * far side, so both edges start their round punches simultaneously. */
+static void sn_punch_defer_tick( n2n_sn_t * sss )
+{
+    int64_t now_ms = sn_monotonic_ms();
+    struct sn_punch_pair *p = sss->punch_pairs;
+    while ( p )
+    {
+        if ( p->defer_due_ms != 0 && now_ms >= p->defer_due_ms )
+        {
+            p->defer_due_ms = 0;
+            struct peer_info *self  = find_peer_by_mac( sss->edges, p->defer_self );
+            struct peer_info *other = find_peer_by_mac( sss->edges, p->defer_other );
+            if ( self && other )
+                sn_send_punch_info( sss, p->community, self, other );
+        }
+        p = p->next;
+    }
+}
+
+/* Drop pairs whose edges both stopped round-querying (PUNCH_PAIR_HOLD). */
+static void sn_pair_purge( n2n_sn_t * sss, time_t now )
+{
+    struct sn_punch_pair **pp = &sss->punch_pairs;
+    while ( *pp )
+    {
+        struct sn_punch_pair *p = *pp;
+        if ( (now - p->last_activity) > PUNCH_PAIR_HOLD )
+        {
+            *pp = p->next;
+            free(p);
+        }
+        else
+            pp = &p->next;
+    }
+}
+
 /** Examine a datagram and determine what to do with it.
  *
  */
 static int process_udp( n2n_sn_t * sss,
+                        SOCKET rx_sock,  /* socket the packet arrived on; replies
+                                          * wanting a matching source port (alt
+                                          * probes) honor it */
                         const struct sockaddr * sender_sock,
 												socklen_t sender_sock_len,
                         const uint8_t * udp_buf,
@@ -1780,6 +3264,13 @@ static int process_udp( n2n_sn_t * sss,
 
 
     traceEvent( TRACE_DEBUG, "process_udp(%lu)", udp_size );
+
+    /* Full-cone probe request from a brother SN: 16 raw bytes, not n2n. */
+    if ( udp_size == 16 && memcmp( udp_buf, "N2NF", 4 ) == 0 )
+    {
+        handle_fc_probe_request( sss, sender_sock, udp_buf, now );
+        return 0;
+    }
 
     /* Use decode_common() to determine the kind of packet then process it:
      *
@@ -1856,8 +3347,6 @@ static int process_udp( n2n_sn_t * sss,
         memcpy( cmn.community, sender_peer->community_name, N2N_COMMUNITY_SIZE );
         sender_peer->compact_capable = 1;
 
-        sss->stats.last_fwd = now;
-
         unicast = (0 == is_multi_broadcast( compact_dstMac ));
 
         traceEvent( TRACE_DEBUG, "Rx compact PACKET (%s) %s -> %s %s",
@@ -1932,16 +3421,9 @@ static int process_udp( n2n_sn_t * sss,
             encx = udp_size;
         }
 
-        /* Common section to forward the final product.
-         * Before forwarding, check if any receiver is legacy (doesn't support compact).
-         * If so, convert compact→legacy so old edges can still receive the packet.
-         * For unicast, we also keep dest around so the conversion block can use
-         * dest->transform_id as a fallback if sender_peer->transform_id is 0.
-         *
-         * Broadcast uses a community-level cache (all_compact) to avoid scanning
-         * all peers on every packet: once a legacy PACKET is seen in the community,
-         * all_compact is set to 0 and all subsequent broadcasts are converted
-         * conservatively. This eliminates O(N) scanning per broadcast packet. */
+        /* Forward the final product: if any receiver is legacy (no compact
+         * support) convert compact→legacy. Broadcast uses the community-level
+         * all_compact cache to avoid scanning every peer per packet. */
         {
             int all_receivers_compact = 0;
             struct peer_info *dest = NULL; /* used by unicast path + conversion fallback */
@@ -1960,9 +3442,8 @@ static int process_udp( n2n_sn_t * sss,
             }
             else
             {
-                /* Broadcast: use community-level cache instead of scanning all peers.
-                 * all_compact=1 means ALL peers are compact-capable → no conversion.
-                 * all_compact=0 means at least one legacy peer exists → convert conservatively. */
+                /* Broadcast: community-level cache — all_compact=1 means ALL
+                 * peers are compact-capable (no conversion), else convert. */
                 struct community_stats *cs = get_community_stats(&sss->comm_stats, cmn.community, now);
                 if ( cs && cs->all_compact )
                     all_receivers_compact = 1;
@@ -2028,6 +3509,11 @@ static int process_udp( n2n_sn_t * sss,
 
         if ( unicast )
         {
+            /* Relay: the supernode relaying the first member-to-member data
+             * frame is the signal to start registering to the relay peer
+             * (concurrent with the on-going punch). */
+            if ( sender_peer )
+                advertise_relay_on_pair( sss, &cmn, sender_peer->mac_addr, compact_dstMac );
             try_forward( sss, &cmn, compact_dstMac, rec_buf, encx );
         }
         else
@@ -2069,7 +3555,6 @@ static int process_udp( n2n_sn_t * sss,
         const uint8_t *                 rec_buf; /* either udp_buf or encbuf */
 
 
-        sss->stats.last_fwd=now;
         decode_PACKET( &pkt, &cmn, udp_buf, &rem, &idx );
 
         /* A legacy PACKET means at least one edge in this community is legacy.
@@ -2114,12 +3599,8 @@ static int process_udp( n2n_sn_t * sss,
             /* Copy the original payload unchanged */
             encode_buf( encbuf, &encx, (udp_buf + idx), (udp_size - idx ) );
 
-            /* Update sender's edge address in the edge table so the
-             * supernode can forward replies to the correct address.
-             * Without this, after a WiFi switch (NAT address change),
-             * the supernode would forward replies to the old address
-             * until the next REGISTER_SUPER (up to 30s + 3×12s retries).
-             * Only update if the family matches the existing registration. */
+            /* Update the sender's edge address from the PACKET transport source
+             * (family-matched) so replies reach the new NAT endpoint after a WiFi switch. */
             {
                 struct peer_info *sender_edge = find_peer_by_mac(sss->edges, pkt.srcMac);
                 if (sender_edge) {
@@ -2162,6 +3643,17 @@ static int process_udp( n2n_sn_t * sss,
         /* Common section to forward the final product. */
         if ( unicast )
         {
+            /* Relaying member data means direct failed; advertise the community relay peer. */
+            advertise_relay_on_pair( sss, &cmn, pkt.srcMac, pkt.dstMac );
+            /* Track the communicating pair so a later address change punches the counterpart directly. */
+            {
+                struct peer_info *fwd_src = find_peer_by_mac( sss->edges, pkt.srcMac );
+                if ( fwd_src )
+                {
+                    memcpy(fwd_src->last_fwd_mac, pkt.dstMac, N2N_MAC_SIZE);
+                    fwd_src->last_fwd_time = now;
+                }
+            }
             try_forward( sss, &cmn, pkt.dstMac, rec_buf, encx );
         }
         else
@@ -2180,7 +3672,6 @@ static int process_udp( n2n_sn_t * sss,
         int                             unicast; /* non-zero if unicast */
         const uint8_t *                 rec_buf; /* either udp_buf or encbuf */
 
-        sss->stats.last_fwd=now;
         decode_REGISTER( &reg, &cmn, udp_buf, &rem, &idx );
 
         /* Update version/os_name in peer record from REGISTER packet */
@@ -2198,6 +3689,11 @@ static int process_udp( n2n_sn_t * sss,
 
         if ( unicast )
         {
+        /* Relay: one member wants another -> tell both about the community
+         * relay peer so they can register to it and use it once direct
+         * punching fails. */
+        advertise_relay_on_pair( sss, &cmn, reg.srcMac, reg.dstMac );
+
         traceEvent( TRACE_DEBUG, "Rx REGISTER %s -> %s %s",
                     macaddr_str( mac_buf, reg.srcMac ),
                     macaddr_str( mac_buf2, reg.dstMac ),
@@ -2210,17 +3706,7 @@ static int process_udp( n2n_sn_t * sss,
             /* We are going to add socket even if it was not there before */
             cmn2.flags |= N2N_FLAGS_SOCKET | N2N_FLAGS_FROM_SUPERNODE;
 
-            if (sender_sock->sa_family == AF_INET) {
-                struct sockaddr_in* sock = (struct sockaddr_in*) sender_sock;
-                reg.sock.family = AF_INET;
-                reg.sock.port = ntohs(sock->sin_port);
-                memcpy( reg.sock.addr.v4, &(sock->sin_addr), IPV4_SIZE );
-            } else if (sender_sock->sa_family == AF_INET6) {
-                struct sockaddr_in6* sock = (struct sockaddr_in6*) sender_sock;
-                reg.sock.family = AF_INET6;
-                reg.sock.port = ntohs(sock->sin6_port);
-                memcpy( reg.sock.addr.v6, &(sock->sin6_addr), IPV6_SIZE );
-            }
+            sock_from_sender( &(reg.sock), sender_sock );
 
             rec_buf = encbuf;
 
@@ -2294,6 +3780,32 @@ static int process_udp( n2n_sn_t * sss,
         struct peer_info *target = find_peer_by_mac( sss->edges, query.targetMac );
         if ( target )
         {
+            /* Punch pair: the first QUERY forms the pair; while handoffs are
+             * live the direct reply is suppressed (double PUNCH traffic).
+             * A stale pair (punches stopped) gets its reply back, waking a
+             * fresh round. */
+            struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
+            int pair_new = sn_pair_touch( sss, cmn.community,
+                                          query.srcMac, query.targetMac, now );
+            if ( pair_new )
+            {
+                /* Fold in the round-0 re-registration that arrived before the pair existed. */
+                struct sn_punch_pair *pp = sn_pair_find( sss, cmn.community,
+                                                         query.srcMac, query.targetMac );
+                if ( pp )
+                {
+                    if ( memcmp( pp->edge_a, query.srcMac, N2N_MAC_SIZE ) == 0 )
+                        pp->a_reg = now;
+                    else
+                        pp->b_reg = now;
+                }
+            }
+            struct sn_punch_pair *qpair = sn_pair_find( sss, cmn.community,
+                                                        query.srcMac, query.targetMac );
+            int reply = pair_new || !qpair ||
+                        ( now - qpair->last_exchanged ) >= PUNCH_QUERY_REFRESH_SECS;
+            if ( reply )
+            {
             memset( &cmn2, 0, sizeof(cmn2) );
             cmn2.ttl   = N2N_DEFAULT_TTL;
             cmn2.pc    = n2n_peer_info;
@@ -2330,6 +3842,8 @@ static int process_udp( n2n_sn_t * sss,
                 pi.os_name[sizeof(pi.os_name) - 1] = '\0';
             }
             pi.assigned_ip = target->assigned_ip;
+            /* Carry the peer's NAT type so edge mgmt can display it */
+            pi.aflags |= N2N_NAT_AFLAGS(target->nat_type);
 
             encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
             {
@@ -2337,10 +3851,10 @@ static int process_udp( n2n_sn_t * sss,
                 socklen_t slen = (sender_sock->sa_family == AF_INET6) ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
                 sendto( send_sock, encbuf, encx, 0, sender_sock, slen );
             }
+            }
 
             /* Simultaneous open: also push A's address to B so B punches back */
-            struct peer_info *requester = find_peer_by_mac( sss->edges, query.srcMac );
-            if ( requester )
+            if ( requester && reply )
             {
                 n2n_PEER_INFO_t pi2;
                 n2n_common_t    cmn3;
@@ -2385,6 +3899,7 @@ static int process_udp( n2n_sn_t * sss,
                     pi2.os_name[sizeof(pi2.os_name) - 1] = '\0';
                 }
                 pi2.assigned_ip = requester->assigned_ip;
+                pi2.aflags |= N2N_NAT_AFLAGS(requester->nat_type);
 
                 encode_PEER_INFO( encbuf2, &encx2, &cmn3, &pi2 );
                 /* Send to B via appropriate socket */
@@ -2410,9 +3925,191 @@ static int process_udp( n2n_sn_t * sss,
 
         /* Edge requesting registration with us.  */
 
+        decode_REGISTER_SUPER( &reg, &cmn, udp_buf, &rem, &idx );
+
+        /* NAT bounce test: the edge asks us to reply from the helper socket
+         * (different source port) so it can tell restricted (IP-gated, any
+         * port allowed) from port-restricted NATs. Purely outbound, 4-byte
+         * magic, no state; the edge re-checks the sender IP. */
+        if ( (reg.aflags & N2N_AFLAGS_NAT_BOUNCE) &&
+             sender_sock->sa_family == AF_INET &&
+             sss->bounce_sock >= 0 )
+        {
+            static const uint8_t bmsg[4] = { 'N', '2', 'N', 'B' };
+            sendto( sss->bounce_sock, bmsg, sizeof(bmsg), 0,
+                    sender_sock, sender_sock_len );
+        }
+
+        /* Brother SN detection: sn1 -> sn2 periodic registration, carries sn1's current address. */
+        int is_brother_reg = (memcmp(cmn.community, "brother_reg", 11) == 0);
+        if (is_brother_reg)
+        {
+            /* Validate backup_token when configured; no -B accepts any
+             * brother SN (auto-pairing via -b alone). */
+            if (sss->backup_token_set &&
+                memcmp(reg.auth.token, sss->backup_token.token, sss->backup_token.toksize) != 0)
+            {
+                traceEvent(TRACE_WARNING, "Brother reg rejected: bad backup token");
+                return 0;
+            }
+
+            /* Find slot by MAC; if not found fill the first empty slot, else
+             * replace the slot whose seen is the oldest. */
+            uint8_t zero[6] = {0,0,0,0,0,0};
+            int slot = -1, oldest_slot = -1;
+            time_t oldest_seen = (time_t)(~(time_t)0);
+            for (int j = 0; j < MAX_BROTHER_SNS; j++) {
+                n2n_brother_entry_t *bb = &sss->brothers[j];
+                int mac_zero = (memcmp(bb->mac, zero, 6) == 0);
+                int mac_match = !mac_zero && (memcmp(bb->mac, reg.edgeMac, 6) == 0);
+                if (mac_match) { slot = j; break; }
+                if (mac_zero && slot < 0) slot = j;
+                time_t bb_seen = bb->seen > bb->seen6 ? bb->seen : bb->seen6;
+                if (bb_seen < oldest_seen) {
+                    oldest_seen = bb_seen;
+                    oldest_slot = j;
+                }
+            }
+            if (slot < 0) slot = (oldest_slot >= 0) ? oldest_slot : 0;
+
+            n2n_brother_entry_t *be = &sss->brothers[slot];
+            memcpy(be->mac, reg.edgeMac, sizeof(n2n_mac_t));
+            /* Version + OS carried by brother_reg. Both stay empty when the
+             * sender did not set N2N_AFLAGS_SN_INFO; mgmt then shows "-". */
+            snprintf(be->version, sizeof(be->version), "%.7s", reg.version);
+            snprintf(be->os_name, sizeof(be->os_name), "%.15s", reg.os_name);
+
+            /* Build n2n_sock_t from sender and assign to matching slot family. */
+            n2n_sock_t sender_n2n;
+            sock_from_sender( &sender_n2n, sender_sock );
+            if ( sender_n2n.family == AF_INET )
+            {
+                be->sock = sender_n2n;
+                be->seen = now;
+                /* adv_* = the registration's source ip:port — it left sn1's [-l]
+                 * service socket, so the source port IS its -l port. */
+                be->adv_sock = sender_n2n;
+                be->adv_sock6.family = 0;
+            }
+            else if ( sender_n2n.family == AF_INET6 )
+            {
+                be->sock6 = sender_n2n;
+                be->seen6 = now;
+                be->adv_sock.family = 0;
+                be->adv_sock6 = sender_n2n;
+            }
+            sss->last_brother_seen = now;
+
+            /* Direction decides the relationship (circular [-b] is withdrawn):
+             * whoever REGISTERS to me is my BIG brother; only answering my own
+             * registration (a BROTHER_REPLY from my [-b] target) makes them my
+             * LITTLE brother — not the address. */
+            {
+                int is_little = 0;
+                if ( reg.aflags & N2N_AFLAGS_BROTHER_REPLY )
+                {
+                    n2n_sock_t backup_addr;
+                    if ( resolve_my_brother_addr( sss, &backup_addr, now ) == 0 &&
+                         sender_n2n.family == backup_addr.family )
+                    {
+                        if ( sender_n2n.family == AF_INET &&
+                             memcmp( sender_n2n.addr.v4, backup_addr.addr.v4, IPV4_SIZE ) == 0 &&
+                             sender_n2n.port == backup_addr.port )
+                            is_little = 1;
+                        else if ( sender_n2n.family == AF_INET6 &&
+                                  memcmp( sender_n2n.addr.v6, backup_addr.addr.v6, IPV6_SIZE ) == 0 &&
+                                  sender_n2n.port == backup_addr.port )
+                            is_little = 1;
+                    }
+                }
+                be->role = is_little ? N2N_BROTHER_ROLE_MY_LITTLE
+                                     : N2N_BROTHER_ROLE_MY_BIG;
+                if ( is_little )
+                    traceEvent(TRACE_INFO, "Brother slot %d = my little brother (my -b): %s",
+                               slot, sock_to_cstr(sockbuf, &sender_n2n));
+            }
+
+            /* Refresh IPv6 from reg.own_ipv6: it is sn1's current IPv6 ingress (port = sn1's -l). */
+            if ((reg.aflags & N2N_AFLAGS_IPV6_SOCKET) &&
+                reg.own_ipv6.family == AF_INET6)
+            {
+                be->sock6 = reg.own_ipv6;
+                be->seen6 = now;
+            }
+            /* Reply to a big brother (it only sends brother_reg, so it has no entry of
+             * ours to see our address/version). Never answer a reply — that is what
+             * stops the two SNs ping-ponging when role checks miss. */
+            if ( be->role == N2N_BROTHER_ROLE_MY_BIG &&
+                 !(reg.aflags & N2N_AFLAGS_BROTHER_REPLY) &&
+                 sender_n2n.family != 0 )
+                send_brother_reg_to( sss, &sender_n2n, 1 );
+
+            traceEvent(TRACE_INFO, "Brother SN registered from %s",
+                       sock_to_cstr(sockbuf, &sender_n2n));
+            return 0; /* brother registration does not need an ACK */
+        }
+
+        /* Count only real edge registrations; brother heartbeats above
+         * return before this point so they never pollute last_reg/reg_sup. */
         sss->stats.last_reg_super=now;
         ++(sss->stats.reg_super);
-        decode_REGISTER_SUPER( &reg, &cmn, udp_buf, &rem, &idx );
+
+        /* Black/white list: silently drop registration for denied
+         * communities (no reply, so the SN stays hidden). brother_reg
+         * above is exempt from this check. */
+        if (community_denied(sss->rate_rules, cmn.community))
+            return 0;
+
+        /* Edge registration: validate peer_token (if configured). Brother-trusted
+         * source: edges arriving from a registered brother sn1 are admitted without
+         * token (they carry no sn2 token — only sn1's -T is configured). Ask-backup
+         * probes matching desired_sn1_mac are recorded in the promoted list and
+         * admitted likewise; the probe itself is not registered. */
+        if (sss->peer_token_set)
+        {
+            int brother_alive = (sss->last_brother_seen != 0) &&
+                                ((now - sss->last_brother_seen) <= 180);
+            int from_brother = 0;
+            if (brother_alive)
+            {
+                n2n_sock_t sender_n2n;
+                uint8_t zero[6] = {0,0,0,0,0,0};
+                sock_from_sender( &sender_n2n, sender_sock );
+                for (int j = 0; j < MAX_BROTHER_SNS && !from_brother; j++) {
+                    n2n_brother_entry_t *b = &sss->brothers[j];
+                    if (memcmp(b->mac, zero, 6) == 0) continue;
+                    if ((b->sock.family != 0 &&
+                         sock_equal(&sender_n2n, &b->sock) == 0) ||
+                        (b->sock6.family == AF_INET6 &&
+                         sock_equal(&sender_n2n, &b->sock6) == 0))
+                        from_brother = 1;
+                }
+            }
+
+            int sn1_hint_ok = 0;
+            {
+                uint8_t hint_zero[6] = {0,0,0,0,0,0};
+                if (memcmp(reg.desired_sn1_mac, hint_zero, 6) != 0)
+                    for (int j = 0; j < MAX_BROTHER_SNS && !sn1_hint_ok; j++)
+                        if (memcmp(sss->brothers[j].mac, reg.desired_sn1_mac,
+                                   N2N_MAC_SIZE) == 0)
+                            sn1_hint_ok = 1;
+            }
+            if (sn1_hint_ok)
+                record_promoted( sss, reg.edgeMac, cmn.community, now );
+
+            struct promoted_peer *pe =
+                find_promoted( sss, reg.edgeMac, cmn.community, now );
+
+            if (!from_brother && !pe &&
+                memcmp(reg.auth.token, sss->peer_token.token, sss->peer_token.toksize) != 0)
+            {
+                traceEvent(TRACE_WARNING, "Peer reg rejected: bad peer token");
+                return 0;
+            }
+            if (pe)
+                pe->seen = now; /* registration keeps the entry alive */
+        }
 
         cmn2.ttl = N2N_DEFAULT_TTL;
         cmn2.pc = n2n_register_super_ack;
@@ -2423,25 +4120,107 @@ static int process_udp( n2n_sn_t * sss,
         memcpy( ack.edgeMac, reg.edgeMac, sizeof(n2n_mac_t) );
         ack.lifetime = reg_lifetime( sss );
 
-        if (sender_sock->sa_family == AF_INET) {
-            struct sockaddr_in* sock = (struct sockaddr_in*) sender_sock;
-            ack.sock.family = AF_INET;
-            ack.sock.port = ntohs(sock->sin_port);
-            memcpy( ack.sock.addr.v4, &(sock->sin_addr), IPV4_SIZE );
-        } else if (sender_sock->sa_family == AF_INET6) {
-            struct sockaddr_in6* sock = (struct sockaddr_in6*) sender_sock;
-            ack.sock.family = AF_INET6;
-            ack.sock.port = ntohs(sock->sin6_port);
-            memcpy( ack.sock.addr.v6, &(sock->sin6_addr), IPV6_SIZE );
+        sock_from_sender( &(ack.sock), sender_sock );
+
+        /* Advertise sn2 to it inside the ACK when we know a configured -b string
+         * or have a live brother within 180s. The edge uses sn_bak_str (the
+         * verbatim DNS-style string from sn1's -b argument) so it stays stable
+         * across DNS changes; sn_bak / sn_bak_v6 are kept zero and ignored on
+         * the edge. Do NOT touch num_sn here: sn_bak_str is encoded
+         * independently (wire.c encode_REGISTER_SUPER_ACK), so the domain
+         * string travels without forcing a zero sn_bak onto the wire; num_sn
+         * is set below only when the ask_backup lookup matched a live brother. */
+        if (sss->backup_addr_text[0] != 0)
+        {
+            size_t slen = strlen(sss->backup_addr_text);
+            if (slen >= N2N_SOCKBUF_SIZE) slen = N2N_SOCKBUF_SIZE - 1;
+            ack.sn_bak_str_len = (uint16_t)slen;
+            memcpy(ack.sn_bak_str, sss->backup_addr_text, slen);
+            ack.sn_bak_str[slen] = '\0';
         }
 
-        ack.num_sn=0; /* No backup */
-        memset( &(ack.sn_bak), 0, sizeof(n2n_sock_t) );
+        /* ask_backup lookup: if the edge supplied desired_sn1_sock and we have
+         * a brother SN whose IP matches (port-agnostic — the point of this
+         * lookup is sn1 changed its port), return that brother's current
+         * resolved IP and MAC so the edge can reconnect to sn1 and track its
+         * identity. */
+        uint8_t ask_zero[6] = {0,0,0,0,0,0};
+
+        /* Not an ask_backup probe: a normal edge is registering with us.
+         * Advertise our own SN identity (MAC + global IPv6) — the same
+         * identity brother_reg carries — so a newly started edge learns
+         * sn1's MAC/IPv6 from its first ACK. Hint presence is tested by
+         * port: a zero-encoded sock decodes as AF_INET port 0. */
+        if (reg.desired_sn1_sock.port == 0 &&
+            memcmp(reg.desired_sn1_mac, ask_zero, 6) == 0)
+        {
+            const uint8_t *id_mac = sn_identity_mac( sss );
+            memcpy(ack.sn1_mac, id_mac, N2N_MAC_SIZE);
+            /* Report our own global IPv6 so the edge can show a dual-stack
+             * address for this SN (stays family 0 when we have none). */
+            if (sss->my_ipv6.family == AF_INET6)
+                ack.sn_bak_v6 = sss->my_ipv6;
+        }
+
+        /* Match by sn1 MAC first (exact identity, immune to shared/shifted
+         * IP); fall back to IP when the edge has no sn1 MAC yet. */
+        int want_mac = (memcmp(reg.desired_sn1_mac, ask_zero, 6) != 0);
+        /* Hint presence is detected by port (a real sn1 sock always has a
+         * port); a zero-encoded sock decodes as AF_INET port 0, so a family check would fire every time. */
+        if ((reg.desired_sn1_sock.port != 0 || want_mac) &&
+            sss->last_brother_seen != 0 &&
+            (now - sss->last_brother_seen <= 180))
+        {
+            n2n_sock_t *ds = &reg.desired_sn1_sock;
+            for (int j = 0; j < MAX_BROTHER_SNS; j++) {
+                n2n_brother_entry_t *bb = &sss->brothers[j];
+                if (memcmp(bb->mac, ask_zero, 6) == 0) continue;
+
+                int match = 0;
+                if (want_mac) {
+                    if (memcmp(bb->mac, reg.desired_sn1_mac, N2N_MAC_SIZE) == 0)
+                        match = 1;
+                } else {
+                    if (ds->family == AF_INET && bb->sock.family == AF_INET &&
+                        memcmp(ds->addr.v4, bb->sock.addr.v4, IPV4_SIZE) == 0)
+                        match = 1;
+                    else if (ds->family == AF_INET6 && bb->sock6.family == AF_INET6 &&
+                        memcmp(ds->addr.v6, bb->sock6.addr.v6, IPV6_SIZE) == 0)
+                        match = 1;
+                }
+                if (!match) continue;
+
+                if (bb->adv_sock.family != 0)
+                {
+                    ack.sn_bak = bb->adv_sock;
+                    /* num_sn gates the on-wire encoding of sn_bak: without it the
+                     * matched address is never sent and the edge sees an empty answer. */
+                    ack.num_sn = 1;
+                }
+                else if (bb->sock.family != 0)
+                {
+                    /* No [-b] port to rebuild the advertised addr: fall back to the raw source socket. */
+                    ack.sn_bak = bb->sock;
+                    ack.num_sn = 1;
+                }
+                if (bb->adv_sock6.family == AF_INET6) ack.sn_bak_v6 = bb->adv_sock6;
+                else if (bb->sock6.family == AF_INET6) ack.sn_bak_v6 = bb->sock6;
+                memcpy(ack.sn1_mac, bb->mac, N2N_MAC_SIZE);
+                traceEvent(TRACE_INFO, "ask_backup: sn1 %s MAC %s",
+                           sock_to_cstr(sockbuf, &ack.sn_bak),
+                           macaddr_str(mac_buf, bb->mac));
+                break;
+            }
+        }
 
         /* Fill sn_caps so edge knows this supernode's IP stack capabilities */
         ack.sn_caps = 0;
         if (sss->ipv4_available) ack.sn_caps |= N2N_SN_CAPS_IPV4;
         if (sss->ipv6_available) ack.sn_caps |= N2N_SN_CAPS_IPV6;
+
+        /* sn1's identity reaches the edge from genuine sn1 sources only (its own
+         * ACK while on sn1, or sn_bak-carrying replies), so a failover target's
+         * identity never overwrites sn1's. */
 
         traceEvent( TRACE_DEBUG, "Rx REGISTER_SUPER for %s %s",
                     macaddr_str( mac_buf, reg.edgeMac ),
@@ -2450,12 +4229,23 @@ static int process_udp( n2n_sn_t * sss,
         uint32_t use_requested_ip = reg.dev_addr.net_addr;
         uint8_t use_request_ip = 1; /* always assign IP (auto-assign if net_addr==0) */
 
+        /* QUERY_ONLY: one-shot probe for sn1's address — answer the ACK
+         * (incl. sn1 lookup) but do NOT register/persist the edge (it never
+         * shows up / clogs the table). Registrations carrying an sn1 hint
+         * (ask_backup probe) count as queries too until the edge really
+         * registers after the failover switch. */
+        int query_only = (reg.aflags & N2N_AFLAGS_QUERY_ONLY) ? 1 : 0;
+        if (!query_only &&
+            (reg.desired_sn1_sock.port != 0 ||
+             memcmp(reg.desired_sn1_mac, ask_zero, 6) != 0))
+            query_only = 1;
+
         const n2n_sock_t *local_sock_ptr = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? &reg.local_sock : NULL;
         uint8_t local_sock_ena = (reg.aflags & N2N_AFLAGS_LOCAL_SOCKET) ? 1 : 0;
         uint8_t force_peer_info = (reg.aflags & N2N_AFLAGS_FORCE_PEER_INFO) ? 1 : 0;
 
         /* Check IP conflict: different MAC, same IP in same community */
-        if (use_request_ip && use_requested_ip != 0) {
+        if (!query_only && use_request_ip && use_requested_ip != 0) {
             struct peer_info *ck = sss->edges;
             while (ck) {
                 if (ck->assigned_ip == use_requested_ip &&
@@ -2491,14 +4281,53 @@ static int process_udp( n2n_sn_t * sss,
             }
         }
 
-        int is_new_edge = update_edge( sss, reg.edgeMac, cmn.community, &(ack.sock),
+        int is_new_edge = query_only ? 0 : update_edge( sss, reg.edgeMac, cmn.community, &(ack.sock),
                      local_sock_ptr, local_sock_ena,
                      ((reg.aflags & N2N_AFLAGS_IPV6_SOCKET) && reg.own_ipv6.family == AF_INET6)
                          ? &reg.own_ipv6 : NULL,
-                     now, NULL, NULL, use_request_ip, use_requested_ip );
+                     now, NULL, NULL,
+                     N2N_NAT_FROM_AFLAGS(reg.aflags),
+                     use_request_ip, use_requested_ip );
+
+        /* Refresh the punch-pair reg time; both sides re-registered => exchange PUNCH (see sn_pair_on_register). */
+        if ( !query_only )
+            sn_pair_on_register( sss, reg.edgeMac, cmn.community, now,
+                                 (reg.aflags & N2N_AFLAGS_PUNCH_ROUND) != 0 );
+
+        /* NAT type/address changed with a stable registration: push the fresh
+         * PEER_INFO to the community, else peers keep pointing at the abandoned endpoint. */
+        if ( is_new_edge == 2 || is_new_edge == 3 )
+            push_nat_to_community( sss,
+                                   find_peer_by_mac(sss->edges, reg.edgeMac),
+                                   cmn.community, is_new_edge == 3 );
+
+        /* New edge (==1) or recreated mapping (==3) gets one full-cone probe
+         * chance; ==2 (NAT type change, same address) does NOT re-probe:
+         * the mapping never changed, an out-of-window probe buys nothing. */
+        if ( is_new_edge == 1 || is_new_edge == 3 || (reg.aflags & N2N_AFLAGS_NAT_REPROBE) )
+            send_fc_probe_request( sss, reg.edgeMac, &(ack.sock), now );
+
+        /* Remember the edge's relay stance so find_community_relay can prefer
+         * willing/force / skip refusing candidates. Default (neither bit)=1;
+         * force (3) is the relay even if relay is globally off. */
+        if (!query_only)
+        {
+            struct peer_info *w_edge = find_peer_by_mac( sss->edges, reg.edgeMac );
+            if ( w_edge )
+            {
+                if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_FORCE )
+                    w_edge->relay_willing = 3;
+                else if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_NO )
+                    w_edge->relay_willing = 0;
+                else if ( reg.aflags & N2N_AFLAGS_RELAY_WILLING_YES )
+                    w_edge->relay_willing = 2;
+                else
+                    w_edge->relay_willing = 1;
+            }
+        }
 
         /* Set assigned IP in ACK */
-        if (use_request_ip) {
+        if (!query_only && use_request_ip) {
             struct peer_info *edge_peer = find_peer_by_mac(sss->edges, reg.edgeMac);
             if (edge_peer && edge_peer->assigned_ip) {
                 ack.dev_addr.net_addr = htonl(edge_peer->assigned_ip);
@@ -2507,7 +4336,7 @@ static int process_udp( n2n_sn_t * sss,
         }
 
         /* If this REGISTER_SUPER arrived via WS, mark the edge as WS-connected (forwarding uses ws_send) */
-        if (ws_sender) {
+        if (!query_only && ws_sender) {
             struct peer_info *edge_peer = find_peer_by_mac(sss->edges, reg.edgeMac);
             if (edge_peer) edge_peer->ws = ws_sender;
         }
@@ -2515,18 +4344,24 @@ static int process_udp( n2n_sn_t * sss,
         /* Fill sn_version so edge can display supernode version */
         strncpy(ack.sn_version, n2n_sw_version_full, sizeof(ack.sn_version) - 1);
 
+        /* WS: the sender address is the TCP peer, not its UDP NAT mapping —
+         * echoing it would record a bogus public address (different TCP ports
+         * read as symmetric). Report nothing (family 0). */
+        if (ws_sender)
+            memset(&ack.sock, 0, sizeof(n2n_sock_t));
+
         encode_REGISTER_SUPER_ACK( ackbuf, &encx, &cmn2, &ack );
 
 
-        /* Reply ACK: WS via ws_send, UDP via sendto */
+        /* Reply ACK: WS via ws_send; alt-port probes from the same alt socket (the
+         * edge's NAT whitelist admits that source port); else via the matching socket. */
         if (ws_sender) {
             ws_send(ws_sender, ackbuf, encx);
+        } else if ( rx_sock == sss->alt_sock ) {
+            sendto( sss->alt_sock, ackbuf, encx, 0,
+                    (struct sockaddr *)sender_sock, sender_sock_len );
         } else {
-            SOCKET send_sock = (sender_sock->sa_family == AF_INET6) ? sss->sock6 : sss->sock;
-            socklen_t sock_len = (sender_sock->sa_family == AF_INET6) ?
-                                 sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
-            sendto( send_sock, ackbuf, encx, 0,
-                    (struct sockaddr *)sender_sock, sock_len );
+            sendto_sock( sss, &ack.sock, ackbuf, encx );
         }
 
         traceEvent( TRACE_DEBUG, "Tx REGISTER_SUPER_ACK for %s %s%s",
@@ -2582,6 +4417,7 @@ static int process_udp( n2n_sn_t * sss,
                     strncpy(pi.version, p->version, sizeof(pi.version) - 1);
                     strncpy(pi.os_name, p->os_name, sizeof(pi.os_name) - 1);
                     pi.assigned_ip = p->assigned_ip;
+                    pi.aflags |= N2N_NAT_AFLAGS(p->nat_type);
                     pix = 0;
                     encode_PEER_INFO(pibuf, &pix, &pi_cmn, &pi);
                     if (ws_sender) {
@@ -2613,19 +4449,27 @@ static void help(int argc, char * const argv[])
     printf("\n");
 
     printf("Usage: supernode -l <lport>\n");
+    printf("or: supernode [config_file] <options>\n");
     printf("\n");
 
+    fprintf( stderr, "[config_file]\tParameter file, one option per line ('#' comments).\n" );
     fprintf( stderr, "-l <lport>\tSet UDP main listen port to <lport>.\n" );
-    fprintf( stderr, "-L <file> \tTraffic statistics file (config auto-derived as .cfg).\n" );
+    fprintf( stderr, "          \tAlso opens second port <lport+1> for the NAT check.\n" );
     fprintf( stderr, "-4|-6     \tIP mode: -4 (IPv4 only), -6 (IPv6 only), both/none (dual-stack).\n" );
+    fprintf( stderr, "-b <host:port>\tBrother supernode address.\n" );
+    fprintf( stderr, "-B <token>\tToken required from brother SNs (no -B = accept any brother).\n" );
+    fprintf( stderr, "-c <file> \tCommunity access list, traffic stats and limiting (config auto-derived as .cfg)\n" );
+    fprintf( stderr, "          \tConfigure traffic stats file: -c abc.dat, modify abc.cfg after startup.\n" );
+    fprintf( stderr, "-E <token>\tToken required from edges.\n" );
+#if defined(N2N_HAVE_DAEMON)
+    fprintf( stderr, "-f        \tRun in foreground.\n" );
+#endif /* #if defined(N2N_HAVE_DAEMON) */
     fprintf( stderr, "-Q <port> \tQuery management port (for standalone use). (default: %d).\n", N2N_SN_MGMT_PORT );
 #ifndef _WIN32
     fprintf( stderr, "-t <port>\tSet management UDP port to <port> (default: 5646).\n" );
 #endif
-#if defined(N2N_HAVE_DAEMON)
-    fprintf( stderr, "-f        \tRun in foreground.\n" );
-#endif /* #if defined(N2N_HAVE_DAEMON) */
     fprintf( stderr, "-v        \tIncrease verbosity. Can be used multiple times.\n" );
+    fprintf( stderr, "-Z <mode> \tRelay support: 0 = disable, 1 = enable (default).\n" );
     fprintf( stderr, "-h        \tThis help message.\n" );
     fprintf( stderr, "\n" );
 }
@@ -2641,6 +4485,7 @@ static const struct option long_options[] = {
   { "verbose",         no_argument,       NULL, 'v' },
   { "ipv4",            no_argument,       NULL, '4' },
   { "ipv6",            no_argument,       NULL, '6' },
+  { "relay",           required_argument, NULL, 'Z' },  /* 0=disable community relay advertisement, else support */
   { NULL,              0,                 NULL,  0  }
 };
 
@@ -2694,12 +4539,51 @@ int main( int argc, char * const argv[] )
         }
     }
 
+/* Check if first argument is a config file (not starting with '-') */
+if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
+    char linebuffer[MAX_CMDLINE_BUFFER_LENGTH] = {0};
+    if (readConfFile(argv[1], linebuffer) < 0) {
+        traceEvent(TRACE_ERROR, "Failed to read config file: %s", argv[1]);
+        exit(1);
+    }
+
+    /* Build new argv from config file and remaining arguments */
+    char **config_argv;
+    int config_argc;
+
+    /* Parse config file into argv */
+    config_argv = buildargv(&config_argc, linebuffer);
+    if (!config_argv) {
+        traceEvent(TRACE_ERROR, "Failed to parse config file");
+        exit(1);
+    }
+
+    /* Create new argv array with program name and remaining args */
+    char **new_argv = malloc((config_argc + argc - 1) * sizeof(char*));
+    new_argv[0] = argv[0];
+
+    /* Copy config file arguments */
+    for (int i = 0; i < config_argc; i++) {
+        new_argv[i + 1] = config_argv[i];
+    }
+
+    /* Copy remaining command line arguments */
+    for (int i = 2; i < argc; i++) {
+        new_argv[config_argc + i - 1] = argv[i];
+    }
+
+    /* Update argc and argv for getopt_long */
+    argc = config_argc + argc - 1;
+    argv = new_argv;
+    optind = 1; /* Reset getopt */
+}
+
     init_sn( &sss );
 
     {
         int opt;
 
-        while((opt = getopt_long(argc, argv, "ft:l:L:46vh", long_options, NULL)) != -1)
+        while((opt = getopt_long(argc, argv, "ft:l:c:46vhE:B:b:Z:", long_options, NULL)) != -1)
         {
             switch (opt)
             {
@@ -2707,7 +4591,7 @@ int main( int argc, char * const argv[] )
                 sss.lport = atoi(optarg);
 																lport_specified = 1;
                 break;
-            case 'L': /* traffic stats and rate limiting config */
+            case 'c': /* traffic stats, rate limiting and community access list config */
                 strncpy(sss.stats_config_path, optarg, sizeof(sss.stats_config_path) - 1);
                 parse_rate_limit_config(sss.stats_config_path,
                                         &sss.traffic_stats_enabled,
@@ -2727,6 +4611,26 @@ int main( int argc, char * const argv[] )
 						}
 #endif
                 break;
+            case 'E': /* peer-token (token required from edge peers) */
+                sss.peer_token.scheme = 0; /* scheme=0: plaintext memcmp */
+                sss.peer_token.toksize = (uint16_t)strlen(optarg);
+                if (sss.peer_token.toksize > N2N_AUTH_TOKEN_SIZE)
+                    sss.peer_token.toksize = N2N_AUTH_TOKEN_SIZE;
+                memcpy(sss.peer_token.token, optarg, sss.peer_token.toksize);
+                sss.peer_token_set = 1;
+                break;
+            case 'B': /* backup-token (token required from brother SNs) */
+                sss.backup_token.scheme = 0;
+                sss.backup_token.toksize = (uint16_t)strlen(optarg);
+                if (sss.backup_token.toksize > N2N_AUTH_TOKEN_SIZE)
+                    sss.backup_token.toksize = N2N_AUTH_TOKEN_SIZE;
+                memcpy(sss.backup_token.token, optarg, sss.backup_token.toksize);
+                sss.backup_token_set = 1;
+                break;
+            case 'b': /* peer (brother) supernode address (sn1 -> sn2 brother_reg) */
+                strncpy(sss.backup_addr_text, optarg, sizeof(sss.backup_addr_text)-1);
+                sss.backup_addr_text[sizeof(sss.backup_addr_text)-1] = '\0';
+                break;
             case 'f': /* foreground */
                 sss.daemon = 0;
                 break;
@@ -2741,6 +4645,11 @@ int main( int argc, char * const argv[] )
                 exit(0);
             case 'v': /* verbose */
                 ++traceLevel;
+                break;
+            case 'Z': /* 0=disable community relay advertisement, 1=support (default) */
+                sss.relay_advert_enabled = ( (!optarg) || atoi(optarg) != 0 ) ? 1 : 0;
+                if ( !sss.relay_advert_enabled )
+                    traceEvent(TRACE_NORMAL, "Community relay advertisement disabled (-Z 0)" );
                 break;
             }
         }
@@ -2761,12 +4670,25 @@ int main( int argc, char * const argv[] )
         sss.sock = open_socket(sss.lport, 1 /*bind ANY*/ );
         if (sss.sock != -1) {
             ipv4_available = 1;
-            /* supernode uses a small SNDBUF (256KB) instead of edge's 2MB:
-             * the kernel auto-doubles the requested size, so this still leaves
-             * plenty of headroom for forwarding bursts to many peers without
-             * holding large per-socket memory pools. */
+            /* Small SNDBUF (256KB): the kernel auto-doubles it, leaving
+             * headroom for forwarding bursts without big per-socket pools. */
             { int snd = 256 * 1024;
               setsockopt(sss.sock, SOL_SOCKET, SO_SNDBUF, (const char*)&snd, sizeof(snd)); }
+            /* NAT bounce-test helper: random source port, no inbound needed
+             * (replies ride the conntrack entry). */
+            sss.bounce_sock = open_socket(0 /* any port */, 1 /*bind ANY*/ );
+            if (sss.bounce_sock == -1) {
+                traceEvent( TRACE_WARNING, "NAT bounce socket failed; bounce tests disabled" );
+            }
+            /* Alt UDP port (lport+1): twin probe distinguishes per-IP reuse
+             * from symmetric mapping. Bind failure only disables that. */
+            sss.alt_sock = open_socket((uint16_t)(sss.lport + 1), 1 /*bind ANY*/ );
+            if (sss.alt_sock == -1)
+                traceEvent( TRACE_WARNING, "alt port %u bind failed; dual-port NAT check off",
+                            (unsigned)(sss.lport + 1) );
+            else
+                traceEvent( TRACE_NORMAL, "alt UDP port %u open (dual-port NAT check)",
+                            (unsigned)(sss.lport + 1) );
         } else {
             traceEvent( TRACE_WARNING, "IPv4 socket failed, continuing without IPv4" );
             sss.sock = -1;
@@ -2792,6 +4714,9 @@ int main( int argc, char * const argv[] )
                     if (!IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr) &&
                         !IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr)) {
                         ipv6_available = 1;
+                        sss.my_ipv6.family = AF_INET6;
+                        sss.my_ipv6.port = sss.lport;
+                        memcpy(sss.my_ipv6.addr.v6, &s6->sin6_addr, IPV6_SIZE);
                         break;
                     }
                 }
@@ -2811,6 +4736,9 @@ int main( int argc, char * const argv[] )
                             !IN6_IS_ADDR_LOOPBACK(&s6->sin6_addr) &&
                             !IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr)) {
                             ipv6_available = 1;
+                            sss.my_ipv6.family = AF_INET6;
+                            sss.my_ipv6.port = sss.lport;
+                            memcpy(sss.my_ipv6.addr.v6, &s6->sin6_addr, IPV6_SIZE);
                             break;
                         }
                     }
@@ -2935,6 +4863,11 @@ static int run_loop( n2n_sn_t * sss )
             max_sock = max(max_sock, sss->sock6);
         }
 
+        if (sss->alt_sock != -1) {
+            FD_SET(sss->alt_sock, &socket_mask);
+            max_sock = max(max_sock, sss->alt_sock);
+        }
+
         if (sss->mgmt_sock != -1) {
             FD_SET(sss->mgmt_sock, &socket_mask);
             max_sock = max(max_sock, sss->mgmt_sock);
@@ -2956,12 +4889,19 @@ static int run_loop( n2n_sn_t * sss )
             }
         }
 
-        wait_time.tv_sec = 10; /* 10-second timeout */
-        wait_time.tv_usec = 0;
+        wait_time.tv_sec = 0;   /* wake at least every 100ms to drain shaper queues */
+        wait_time.tv_usec = 100 * 1000;
 
         rc = select(max_sock+1, &socket_mask, NULL, NULL, &wait_time);
 
         now = time(NULL);
+
+        /* Shaper: release queued packets as tokens refill (all communities) */
+        if (sss->traffic_stats_enabled) {
+            struct community_stats *s;
+            for (s = sss->comm_stats; s; s = s->next)
+                shaper_drain(sss, s);
+        }
 
         if(rc > 0)
         {
@@ -2973,8 +4913,8 @@ static int run_loop( n2n_sn_t * sss )
                                (struct sockaddr *)&udp_sender_sock, &udp_sender_len);
 
                 if (bread > 0) {
-                    process_udp( sss, (struct sockaddr*) &udp_sender_sock, udp_sender_len,
-                                pktbuf, bread, now, NULL );
+                    process_udp( sss, sss->sock, (struct sockaddr*) &udp_sender_sock,
+                                udp_sender_len, pktbuf, bread, now, NULL );
                 }
             }
 
@@ -2986,8 +4926,21 @@ static int run_loop( n2n_sn_t * sss )
                                (struct sockaddr *)&udp6_sender_sock, &udp6_sender_len);
 
                 if (bread > 0) {
-                    process_udp( sss, (struct sockaddr*) &udp6_sender_sock, udp6_sender_len,
-                                pktbuf, bread, now, NULL );
+                    process_udp( sss, sss->sock6, (struct sockaddr*) &udp6_sender_sock,
+                                udp6_sender_len, pktbuf, bread, now, NULL );
+                }
+            }
+
+            if (sss->alt_sock != -1 && FD_ISSET(sss->alt_sock, &socket_mask)) {
+                struct sockaddr_storage udpalt_sender_sock;
+                socklen_t udpalt_sender_len = sizeof(udpalt_sender_sock);
+
+                bread = recvfrom(sss->alt_sock, pktbuf, N2N_SN_PKTBUF_SIZE, 0,
+                               (struct sockaddr *)&udpalt_sender_sock, &udpalt_sender_len);
+
+                if (bread > 0) {
+                    process_udp( sss, sss->alt_sock, (struct sockaddr*) &udpalt_sender_sock,
+                                 udpalt_sender_len, pktbuf, bread, now, NULL );
                 }
             }
 
@@ -3014,7 +4967,8 @@ static int run_loop( n2n_sn_t * sss )
                 }
             }
 
-            /* WebSocket: process data from connected edges */
+            /* KNOWN LIMITATION: ws_send BLOCKS up to 3s when a WS peer stalls, stalling the loop;
+             * OK for 1-edge-per-SN; revisit with a non-blocking TX queue for many slow edges */
             {
                 int wi;
                 for (wi = 0; wi < N2N_SN_MAX_WS; wi++) {
@@ -3022,20 +4976,25 @@ static int run_loop( n2n_sn_t * sss )
                     if (wc->state != WS_OPEN || wc->fd < 0) continue;
                     if (!FD_ISSET(wc->fd, &socket_mask)) continue;
 
-                    {
+                    /* Drain like UDP (128-frame cap): ws_recv decodes one
+                     * frame per call, a loop keeps throughput high. */
+                    for (int _wi = 0; _wi < 128; _wi++) {
                         uint8_t wbuf[N2N_SN_PKTBUF_SIZE];
                         ssize_t n = ws_recv(wc, wbuf, sizeof(wbuf));
                         if (n > 0) {
                             wc->last_seen = now;
-                            process_udp(sss,
+                            process_udp(sss, -1,
                                         (struct sockaddr*)&wc->peer,
                                         (socklen_t)sizeof(wc->peer),
                                         wbuf, (size_t)n, now, wc);
                         } else if (n < 0) {
                             traceEvent(TRACE_DEBUG, "WS conn[%d] closed by peer", wi);
                             sn_ws_drop_conn(sss, wi);
+                            break;
+                        } else {
+                            /* n == 0: no complete frame yet, wait for next select */
+                            break;
                         }
-                        /* n == 0: no complete frame yet, wait for next select */
                     }
                 }
             }
@@ -3061,16 +5020,235 @@ static int run_loop( n2n_sn_t * sss )
         }
 
         purge_expired_registrations( &(sss->edges) );
+        sn_pair_purge( sss, now );
+        sn_punch_defer_tick( sss );
         sn_ws_purge(sss, now);
         if (sss->traffic_stats_enabled) {
             static time_t last_stats_purge = 0;
             purge_expired_community_stats(sss, &last_stats_purge, now);
             save_community_stats(sss, now);
         }
+
+        /* Re-read the rate limit and access config every 5 minutes so edits
+         * apply without a restart. Kept outside the traffic_stats_enabled
+         * gate so "enabled on|off" can be toggled from the file itself. */
+        if (sss->stats_config_path[0])
+        {
+            static time_t last_cfg_reload = 0;
+            if (last_cfg_reload == 0)
+                last_cfg_reload = now;
+            else if (now - last_cfg_reload >= 300)
+            {
+                last_cfg_reload = now;
+                parse_rate_limit_config(sss->stats_config_path,
+                                        &sss->traffic_stats_enabled,
+                                        &sss->rate_rules);
+                /* Re-apply rules to all known communities so changed,
+                 * added and removed limits take effect immediately. */
+                for (struct community_stats *s = sss->comm_stats; s; s = s->next)
+                    apply_rules_to_stats(s, sss->rate_rules);
+                traceEvent(TRACE_DEBUG, "Rate limit config reloaded");
+            }
+        }
+
+        /* Deferred full-cone N2NF probes (#2/#3, staggered). */
+        fc_probes_tick( sss, now );
+
+        /* sn1 -> sn2 brother_reg, every 31s. */
+        if (sss->backup_addr_text[0])
+        {
+            static time_t last_brother_reg = 0;
+            if (now - last_brother_reg >= 31)
+            {
+                last_brother_reg = now;
+                send_brother_reg(sss, now);
+            }
+        }
+
+        /* Keep brother entries while sn1 peers may still need them: the
+         * promoted list's newest "seen" is the liveness signal; drop when
+         * idle for an hour (stale entries stay harmless via brother_alive). */
+        {
+            static time_t last_brother_purge = 0;
+            if (now - last_brother_purge >= 30)
+            {
+                last_brother_purge = now;
+                time_t last_promoted = 0;
+                for (int i = 0; i < PROMOTED_LIST_MAX; i++)
+                    if (sss->promoted[i].seen > last_promoted)
+                        last_promoted = sss->promoted[i].seen;
+                int peers_idle = (last_promoted == 0) ||
+                                 ((now - last_promoted) > 3600);
+                uint8_t zero[6] = {0,0,0,0,0,0};
+                for (int j = 0; j < MAX_BROTHER_SNS; j++) {
+                    n2n_brother_entry_t *bb = &sss->brothers[j];
+                    if (memcmp(bb->mac, zero, 6) == 0) continue;
+                    time_t last = bb->seen > bb->seen6 ? bb->seen : bb->seen6;
+                    if (peers_idle && last != 0 && (now - last) > 3600) {
+                        traceEvent(TRACE_NORMAL, "Brother purge: %02X:%02X:%02X:%02X:%02X:%02X idle %lus",
+                                   bb->mac[0], bb->mac[1], bb->mac[2],
+                                   bb->mac[3], bb->mac[4], bb->mac[5],
+                                   (unsigned long)(now - last));
+                        memset(bb, 0, sizeof(n2n_brother_entry_t));
+                    }
+                }
+            }
+        }
     }
 
     deinit_sn( sss );
     free_community_stats( &sss->comm_stats );
     free_rate_limit_rules( &sss->rate_rules );
+    return 0;
+}
+
+/* send_brother_reg: sn1 -> sn2 brother registration, sent every 60s.
+ * Uses the local NIC MAC as the SN identifier (matches what edge sees when
+ * the SN forwards traffic) and the community string "brother_reg" (11
+ * bytes, no trailing NUL) so sn2 can detect that the packet is a brother
+ * update rather than a normal edge register. */
+static void send_brother_reg(n2n_sn_t *sss, time_t now)
+{
+    n2n_sock_t backup_sock;
+
+    if (sss->backup_addr_text[0] == '\0') return;
+
+    /* Resolve and cache the sn2 address (shared cache used by the
+     * brother_reg direction check in the packet handler). */
+    if ( resolve_my_brother_addr( sss, &backup_sock, now ) != 0 )
+        return;
+
+    send_brother_reg_to( sss, &backup_sock, 0 );
+}
+
+/* Send one brother_reg to dst. Also used as the reply to a big brother:
+ * a big brother only ever sends, so without a reply it would never learn
+ * our address, version or OS. */
+static void send_brother_reg_to(n2n_sn_t *sss, const n2n_sock_t *dst, int is_reply)
+{
+    n2n_common_t            cmn;
+    n2n_REGISTER_SUPER_t    reg;
+    uint8_t                 pktbuf[N2N_SN_PKTBUF_SIZE];
+    size_t                  idx = 0;
+    n2n_sock_str_t          sockbuf;
+
+    /* Prefer the live NIC MAC. Skip registration entirely if neither NIC
+     * MAC nor fallback is available so the partner SN never sees a
+     * zero-MAC entry. */
+    const uint8_t *id_mac = sn_identity_mac( sss );
+
+    memset(&cmn, 0, sizeof(cmn));
+    memset(&reg, 0, sizeof(reg));
+    cmn.ttl = N2N_DEFAULT_TTL;
+    cmn.pc = n2n_register_super;
+    cmn.flags = N2N_FLAGS_SOCKET;
+    memcpy(cmn.community, "brother_reg", 11); /* brother-only community tag */
+
+    /* Cookie = id_mac; edgeMac = id_mac. */
+    memcpy(reg.cookie, id_mac, N2N_COOKIE_SIZE);
+    memcpy(reg.edgeMac, id_mac, sizeof(reg.edgeMac));
+    /* Carry our IPv6 GUA (if any) so a v4-only sn2 still learns how to reach us on IPv6. */
+    if (sss->my_ipv6.family == AF_INET6) {
+        reg.aflags |= N2N_AFLAGS_IPV6_SOCKET;
+        reg.own_ipv6 = sss->my_ipv6;
+    }
+    /* Carry backup_token when configured. */
+    if (sss->backup_token_set) {
+        memcpy(reg.auth.token, sss->backup_token.token, sss->backup_token.toksize);
+        reg.auth.toksize = sss->backup_token.toksize;
+    }
+    /* Carry our version and OS so the partner SN can show both. Marked by
+     * N2N_AFLAGS_SN_INFO; the decoder is length-guarded, and edges never
+     * set the flag so their packets stay byte-identical. */
+    reg.aflags |= N2N_AFLAGS_SN_INFO;
+    if ( is_reply )
+        reg.aflags |= N2N_AFLAGS_BROTHER_REPLY;
+    snprintf(reg.version, sizeof(reg.version), "%.7s", n2n_sw_version_full);
+    snprintf(reg.os_name, sizeof(reg.os_name), "%.15s", n2n_sw_osName);
+
+    encode_REGISTER_SUPER(pktbuf, &idx, &cmn, &reg);
+
+    sendto_sock( sss, dst, pktbuf, idx );
+
+    traceEvent(TRACE_DEBUG, "Sent brother_reg to %s as %02x:%02x:%02x:%02x:%02x:%02x",
+               sock_to_cstr(sockbuf, dst),
+               id_mac[0], id_mac[1], id_mac[2], id_mac[3], id_mac[4], id_mac[5]);
+}
+
+/* resolve_brother_addr: parse "host:port" into an n2n_sock_t.
+ * getaddrinfo handles IPv4/IPv6 literals and DNS names; prefer IPv4. */
+static int resolve_brother_addr(const char *text, n2n_sock_t *out)
+{
+    char host[256];
+    const char *colon;
+    uint16_t port;
+    struct addrinfo hints, *res = NULL, *p = NULL;
+
+    if (!text || !out) return -1;
+    colon = strrchr(text, ':');
+    if (!colon) return -1;
+    size_t hlen = colon - text;
+    if (hlen >= sizeof(host)) return -1;
+    memcpy(host, text, hlen);
+    host[hlen] = '\0';
+    port = (uint16_t)atoi(colon + 1);
+    if (port == 0) return -1;
+
+    /* Strip optional IPv6 brackets. */
+    if (host[0] == '[' && host[hlen-1] == ']')
+    {
+        host[hlen-1] = '\0';
+        memmove(host, host + 1, hlen - 1);
+    }
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
+
+    for (p = res; p; p = p->ai_next) if (p->ai_family == AF_INET) break;
+    if (!p) for (p = res; p; p = p->ai_next) if (p->ai_family == AF_INET6) break;
+    if (!p) { freeaddrinfo(res); return -1; }
+
+    if (p->ai_family == AF_INET)
+    {
+        out->family = AF_INET;
+        memcpy(out->addr.v4, &((struct sockaddr_in*)p->ai_addr)->sin_addr, IPV4_SIZE);
+    }
+    else
+    {
+        out->family = AF_INET6;
+        memcpy(out->addr.v6, &((struct sockaddr_in6*)p->ai_addr)->sin6_addr, IPV6_SIZE);
+    }
+    out->port = port;
+    freeaddrinfo(res);
+    return 0;
+}
+
+/* resolve_my_brother_addr: resolve our [-b] little-brother (sn2) address
+ * with a 300-second cache so the brother_reg handler can compare a sender's
+ * IP against the resolved sn2 address without calling getaddrinfo() every
+ * heartbeat. Returns 0 on success, -1 if -b is unconfigured or resolution
+ * failed. */
+static int resolve_my_brother_addr( n2n_sn_t *sss, n2n_sock_t *out, time_t now )
+{
+    if ( sss->backup_addr_text[0] == '\0' )
+        return -1;
+
+    if ( !sss->backup_resolved_valid || (now - sss->backup_resolved_time > 300) )
+    {
+        memset( &sss->backup_resolved, 0, sizeof(sss->backup_resolved) );
+        if ( resolve_brother_addr( sss->backup_addr_text, &sss->backup_resolved ) == 0 )
+        {
+            sss->backup_resolved_valid = 1;
+            sss->backup_resolved_time  = now;
+        }
+        else
+        {
+            sss->backup_resolved_valid = 0;
+        }
+    }
+    if ( !sss->backup_resolved_valid ) return -1;
+    *out = sss->backup_resolved;
     return 0;
 }

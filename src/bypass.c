@@ -155,15 +155,24 @@ static int bypass_kcp_drain(bypass_context_t *ctx, struct bypass_conn *c)
                 }
                 break;
             }
-        } else if (sent < 0 && (BYPASS_ERRNO() == BYPASS_EAGAIN || BYPASS_ERRNO() == BYPASS_EWOULDBLOCK)) {
+        } else if (sent == 0) {
+            /* send() returned 0 (rare on TCP, but possible).  Data was
+             * already removed from KCP; cache it for retry to avoid loss. */
             if (c->tx_buf_len + (size_t)ret <= BYPASS_TX_BUF_SIZE) {
                 memcpy(c->tx_buf + c->tx_buf_len, c->agg_buf, (size_t)ret);
                 c->tx_buf_len += (size_t)ret;
             }
             break;
-        }
-        if (sent <= 0 && (sent == 0 || (BYPASS_ERRNO() != BYPASS_EAGAIN && BYPASS_ERRNO() != BYPASS_EWOULDBLOCK)))
+        } else if (BYPASS_ERRNO() == BYPASS_EAGAIN || BYPASS_ERRNO() == BYPASS_EWOULDBLOCK) {
+            if (c->tx_buf_len + (size_t)ret <= BYPASS_TX_BUF_SIZE) {
+                memcpy(c->tx_buf + c->tx_buf_len, c->agg_buf, (size_t)ret);
+                c->tx_buf_len += (size_t)ret;
+            }
             break;
+        } else {
+            /* Permanent error — drop silently */
+            break;
+        }
     }
     /* Tell KCP to send window update if we drained data */
     if (drained && c->kcp)
@@ -322,6 +331,8 @@ static int bypass_sendto_nb(bypass_context_t *ctx, const uint8_t *buf, size_t le
     SOCKET sock = (dst->family == AF_INET6 && eee->udp_sock6 != -1)
                   ? eee->udp_sock6 : eee->udp_sock;
     if (sock == -1) return -1;
+
+    if (dst->family != AF_INET && dst->family != AF_INET6) return -1;
 
     struct sockaddr_in6 peer_addr;
     fill_sockaddr((struct sockaddr *)&peer_addr, sizeof(peer_addr), dst);
@@ -981,27 +992,24 @@ void bypass_handle_recv(bypass_context_t *ctx, const uint8_t *buf,
 
     if (flags & BYPASS_FLAG_RAW) {
         /* Raw IP frame (ICMP etc.) - decode and write to TAP.
-         * Use fixed small buffers (ICMP is always < MTU size). */
-        uint8_t dec[2048];
+         * Single buffer: eth header + decrypted IP payload. */
         uint8_t eth_frame[14 + 2048];
-        ssize_t dec_len = bypass_decode(ctx, dec, sizeof(dec),
+        ssize_t dec_len = bypass_decode(ctx, eth_frame + 14, sizeof(eth_frame) - 14,
                                          enc_payload, enc_len, algo_idx);
         if (dec_len <= 0)
             return;
 
-        /* Reconstruct ethernet frame: dec is an IP packet */
-        /* dst MAC = our MAC, src MAC = our MAC (we don't know remote MAC) */
+        /* Reconstruct ethernet header in-place */
         memcpy(eth_frame, ctx->tap_mac, 6);
         memcpy(eth_frame + 6, ctx->tap_mac, 6);
         eth_frame[12] = 0x08; eth_frame[13] = 0x00;
-        memcpy(eth_frame + 14, dec, dec_len);
         tuntap_write(ctx->tap_device, eth_frame, 14 + dec_len);
         ctx->bp_rx_bytes += dec_len;
 
         /* Update peer's last_seen - extract src IP from IP header */
         if (dec_len >= 20) {
             uint32_t src_ip_n;
-            memcpy(&src_ip_n, dec + 12, 4);
+            memcpy(&src_ip_n, eth_frame + 14 + 12, 4);
             bypass_update_peer_last_seen(ctx->edge, ntohl(src_ip_n));
         }
         return;
@@ -1204,7 +1212,7 @@ void bypass_start_negotiation(bypass_context_t *ctx, struct peer_info *peer)
         return;
 
     /* Principle 10: wait at least 2 seconds after P2P establishment
-     * before starting bypass negotiation ("旁路只是备选项"). */
+     * before starting bypass negotiation (bypass is only a fallback). */
     if (n2n_now() - peer->p2p_est_time < 2)
         return;
 
