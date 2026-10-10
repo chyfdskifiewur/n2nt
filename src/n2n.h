@@ -206,8 +206,10 @@ struct tuntap_config {
 #define MSG_TYPE_REGISTER_SUPER_NAK     7
 #define MSG_TYPE_FEDERATION             8
 
-/* Set N2N_COMPRESSION_ENABLED to 0 to disable lzo1x compression — breaks
- * standard packet format, experimentation only. */
+/* Set N2N_COMPRESSION_ENABLED to 0 to disable lzo1x compression of ethernet
+ * frames. Doing this will break compatibility with the standard n2n packet
+ * format so do it only for experimentation. All edges must be built with the
+ * same value if they are to understand each other. */
 #define N2N_COMPRESSION_ENABLED 1
 
 #define DEFAULT_MTU   1350
@@ -219,35 +221,6 @@ typedef char ipstr_t[INET6_ADDRSTRLEN];
 #define N2N_MACSTR_SIZE 32
 typedef char macstr_t[N2N_MACSTR_SIZE];
 
-/* NAT type from dual-sn reflection (mapping compare + helper-socket bounce + brother N2NF) */
-#define N2N_NAT_UNKNOWN        0
-#define N2N_NAT_SYMMETRIC      2
-#define N2N_NAT_FULL_CONE      3  /* N2NF probe from a never-contacted brother got through */
-#define N2N_NAT_RESTRICTED     4  /* addr-restr: helper bounce got through (incl. full cone w/o brother) */
-#define N2N_NAT_PORT_RESTRICT  5  /* no bounce despite requests */
-
-/* Shared display name for a N2N_NAT_* value ("unknown" when not measured). */
-#define N2N_NAT_NAME(t) ( (t) == N2N_NAT_FULL_CONE ? "full-cone" : \
-                          (t) == N2N_NAT_RESTRICTED ? "addr-restr" : \
-                          (t) == N2N_NAT_PORT_RESTRICT ? "port-restr" : \
-                          (t) == N2N_NAT_SYMMETRIC ? "symmetric" : "unknown" )
-
-/* NAT type <-> aflags bits: REGISTER_SUPER carries the edge's own type,
- * PEER_INFO carries a peer's type to edges for mgmt display. */
-#define N2N_NAT_AFLAGS(t) ( (t) == N2N_NAT_FULL_CONE ? N2N_AFLAGS_NAT_FULL_CONE : \
-                            (t) == N2N_NAT_RESTRICTED ? N2N_AFLAGS_NAT_RESTRICTED : \
-                            (t) == N2N_NAT_PORT_RESTRICT ? N2N_AFLAGS_NAT_PORT_RESTRICT : \
-                            (t) == N2N_NAT_SYMMETRIC ? N2N_AFLAGS_NAT_SYMMETRIC : 0 )
-#define N2N_NAT_FROM_AFLAGS(a) ( ((a) & N2N_AFLAGS_NAT_RESTRICTED) ? N2N_NAT_RESTRICTED : \
-                                 ((a) & N2N_AFLAGS_NAT_PORT_RESTRICT) ? N2N_NAT_PORT_RESTRICT : \
-                                 ((a) & N2N_AFLAGS_NAT_FULL_CONE) ? N2N_NAT_FULL_CONE : \
-                                 ((a) & N2N_AFLAGS_NAT_SYMMETRIC) ? N2N_NAT_SYMMETRIC : N2N_NAT_UNKNOWN )
-
-/* NAT types reachable without punching: only full-cone (NAT1) / restricted-cone
- * (NAT2) qualify as community relay; stricter kinds fall back to the plain SN relay. */
-#define N2N_NAT_RELAY_CAPABLE(t) ( (t) == N2N_NAT_FULL_CONE || \
-                                   (t) == N2N_NAT_RESTRICTED )
-
 struct peer_info {
     struct peer_info *  next;
     n2n_community_t     community_name;
@@ -256,8 +229,6 @@ struct peer_info {
     n2n_sock_t          sock6;             /* IPv6 public address (family=0 if unavailable) */
     int                 num_sockets;       /* 1=public only, 2=public+LAN */
     n2n_sock_t          sockets[2];        /* [0]=public (primary), [1]=LAN */
-    uint8_t             nat_type;          /* N2N_NAT_* as reported by the edge (0 if not reported) */
-    time_t              last_nat_push;     /* sn: last time this edge's nat_type was pushed to the community */
     uint8_t             connect_family;    /* AF_INET or AF_INET6 - how edge connected to supernode */
     time_t              last_seen;
     char                version[8];
@@ -271,21 +242,18 @@ struct peer_info {
     time_t              last_probe_sent;   /* time last keepalive PROBE was sent */
     uint8_t             keepalive_fails;   /* consecutive keepalive failures */
     time_t              last_query_sent;   /* time last query_peer was sent, for rate-limiting */
+    time_t              last_punch_probe;  /* time last PROBE was sent during hole-punch */
     uint8_t             punch_retry_count; /* number of punch retries, remove after max */
-    uint8_t             punch_round;       /* current 2s punch round (0-based), reset on start_punch */
-    time_t              punch_round_time;  /* round anchor for the 2s punch cadence */
+    uint8_t             register_retry_count; /* REGISTER retries after PROBE_ACK, max 3 */
+    time_t              last_register_sent;   /* time last REGISTER was sent after PROBE_ACK */
     time_t              direct_seen;       /* time of last direct P2P communication with this peer; 0=never */
     time_t              p2p_est_time;      /* time P2P was established (set_peer_operational); for transition grace */
     n2n_sock_t          temp_local_sock;   /* dynamically selected best local IP for this peer */
     uint8_t             temp_local_sock_valid; /* 1 if temp_local_sock is valid */
+    uint8_t             psp_logged;        /* 1 if PsP message already printed for current state */
+    uint8_t             p2p_logged;        /* 1 if P2P direct message already printed for current state */
     uint8_t             p2p_is_lan;        /* 1=LAN P2P, set by edge.c at REGISTER_SUPER_ACK */
     uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
-    time_t              relay_adv_time;    /* sn: last time this edge was advertised as the relay (throttle) */
-    time_t              sn_fwd_first;      /* sn: first time this edge's unicast data was relayed via SN (0=never); gates community-relay announcement */
-    uint8_t             last_fwd_mac[N2N_MAC_SIZE]; /* sn: last unicast peer this edge's data was relayed to (communicating-pair tracking) */
-    time_t              last_fwd_time;     /* sn: time of that last relayed unicast (0=never) */
-    uint8_t             relay_willing;     /* sn: edge's relay stance: 0=refuse,1=default,2=willing,3=force */
-    time_t              relay_adv_live;    /* sn: last time this peer was advertised AS the community relay (0=never) */
     /* Compact packet protocol support (version 0xE5 header) */
     uint8_t             compact_capable;   /* 1=understands compact format, 0=legacy/unknown */
     uint16_t            transform_id;      /* transform ID learned from PACKET headers (for SN legacy conversion) */
@@ -293,37 +261,24 @@ struct peer_info {
     ws_conn_t *         ws;
 };
 
-/* Hard-NAT punch pair: two edges coordinate 2s punch rounds; SN hands each the other's latest address (PUNCH) */
-#define PUNCH_PAIR_MAX  64    /* max simultaneous hard-NAT punch pairs */
-#define PUNCH_PAIR_HOLD 10    /* sec: drop a pair whose edges both stopped round-querying */
-#define PUNCH_SYNC_MIN_DIFF_MS 10 /* ms: round-latency differences below this are noise */
-#define PUNCH_SYNC_MAX_DIFF_MS 1000 /* ms: larger gaps mean hopelessly asymmetric routes, skip compensation */
-struct sn_punch_pair {
-    struct sn_punch_pair * next;
-    n2n_community_t     community;
-    n2n_mac_t           edge_a;         /* canonical order: lower MAC first */
-    n2n_mac_t           edge_b;
-    time_t              a_reg;          /* last round REGISTER_SUPER time of edge_a */
-    time_t              b_reg;          /* last round REGISTER_SUPER time of edge_b */
-    time_t              last_exchanged; /* last handoff exchange time (0 = none yet) */
-    time_t              last_activity;  /* last QUERY touching this pair (purge key) */
-    /* Round-start sync: defer the near side so both punch together. */
-    int64_t             sync_send_ms;   /* ms: first handoff send time (measurement start) */
-    int64_t             sync_reg_a_ms;  /* ms: edge_a's first registration after the start */
-    int64_t             sync_reg_b_ms;  /* ms: edge_b's first registration after the start */
-    int64_t             sync_delay_ms;  /* ms: compensation delay applied to the near side */
-    int                 sync_near_a;    /* 1: edge_a is the near side (gets the delayed send) */
-    int                 sync_armed;     /* 1: delay measured, compensation active */
-    int64_t             defer_due_ms;   /* ms: due time of the pending near-side send (0 = none) */
-    n2n_mac_t           defer_self;     /* pending send: recipient */
-    n2n_mac_t           defer_other;    /* pending send: peer to describe */
-};
-
 struct n2n_edge; /* forward declaration, defined below */
 typedef struct n2n_edge         n2n_edge_t;
 
-/* Main loop tick: 10 ms = KCP 100 Hz + select(0) poll; avoids WSAEventSelect
- * whose non-blocking UDP flip would break SO_SNDBUF back-pressure. */
+/* Main loop tick cadence — shared by all platforms.
+ *   10 ms was chosen because it simultaneously satisfies three generic
+ *   constraints that every n2n edge deployment has to handle:
+ *     (1) KCP ikcp_update() runs naturally at 100 Hz,
+ *     (2) ingress fds (UDP v4/v6, mgmt sock, WS, bypass proxy/conns) are
+ *         polled via select(timeout=0) after every wakeup, so worst-case
+ *         0-10 ms extra ingress latency — completely invisible to
+ *         interactive ping (RTT >> 10 ms on any real WAN link),
+ *     (3) Windows side avoids WSAEventSelect entirely — that WinSock
+ *         function silently flips UDP sockets to non-blocking mode,
+ *         which would destroy the SO_SNDBUF-based implicit back-pressure
+ *         the single-threaded send_packet2net path relies on to auto-tune
+ *         TCP cwnd to the actual uplink bandwidth with zero parameters.
+ *   Same value at every bandwidth, peer count, and operating system —
+ *   fully generic, no scenario-specific tuning required. */
 #define N2N_MAINLOOP_TICK_MS    10
 
 
@@ -374,7 +329,17 @@ extern ssize_t tuntap_write(struct tuntap_dev *tuntap, unsigned char *buf, size_
 extern void tuntap_close(struct tuntap_dev *tuntap);
 extern void tuntap_get_address(struct tuntap_dev *tuntap);
 #ifdef _WIN32
-/* Overlapped TAP reader driven from the main loop; never call GetOverlappedResult on a pending IRP */
+/* Windows single-threaded TAP reader — overlapped I/O driven from the
+ *   main loop (architecture 100% aligned with cnn2n).  Replace the
+ *   blocking tunReadThread + tuntap_read pair.
+ *     tuntap_read_begin_overlapped : submit async ReadFile using
+ *         tuntap_dev.overlap_read + internal read_buf[2000].  Returns
+ *         >0 (sync-complete, bytes in read_buf, no IRP pending),
+ *         =0 (async queued, wait on overlap_read.hEvent then call
+ *            complete), <0 error.
+ *     tuntap_read_complete_overlapped : collect result after event
+ *         signal.  Returns byte count (>0) or error (<0).  Always
+ *         clears read_pending so a new read can be submitted. */
 extern ssize_t tuntap_read_begin_overlapped(struct tuntap_dev *tuntap);
 extern ssize_t tuntap_read_complete_overlapped(struct tuntap_dev *tuntap);
 #endif
@@ -426,31 +391,8 @@ extern char *n2n_sw_version, *n2n_sw_version_full, *n2n_sw_osName, *n2n_sw_build
 #define N2N_EDGE_SN_HOST_SIZE   48
 typedef char n2n_sn_name_t[N2N_EDGE_SN_HOST_SIZE];
 
-#define N2N_EDGE_NUM_SUPERNODES 3
+#define N2N_EDGE_NUM_SUPERNODES 2
 #define N2N_EDGE_SUP_ATTEMPTS   3
-
-#define N2N_AUTH_SIZE           32
-
-#define MAX_BROTHER_SNS         16
-
-/* Brother-SN direction (probing never crosses it):
- * MY_BIG = it registered ME as its little brother; MY_LITTLE = my configured little brother */
-#define N2N_BROTHER_ROLE_MY_BIG      1
-#define N2N_BROTHER_ROLE_MY_LITTLE   2
-
-typedef struct {
-    n2n_sock_t   sock;         /* current socket of this brother SN (IPv4 or IPv6, whichever arrives first) */
-    n2n_sock_t   sock6;        /* IPv6 socket of this brother SN (optional, family=0 if not seen on v6) */
-    n2n_sock_t   adv_sock;     /* advertised to ask_backup lookups: the big brother's
-                                  registration source port IS its real service port. v4 */
-    n2n_sock_t   adv_sock6;    /* same as adv_sock, v6 family (or reg.own_ipv6) */
-    time_t       seen;         /* last registration time (0 = never, not counted in num_brothers) */
-    time_t       seen6;        /* last v6 registration time */
-    n2n_mac_t    mac;          /* MAC of the brother SN (all-zero = invalid) */
-    uint8_t      role;         /* N2N_BROTHER_ROLE_* : direction of the relationship */
-    char         version[8];   /* version string this brother sent in its brother_reg */
-    char         os_name[16];  /* OS name this brother sent in its brother_reg */
-} n2n_brother_entry_t;
 
 #ifndef N2N_PATHNAME_MAXLEN
 #define N2N_PATHNAME_MAXLEN     256
@@ -470,20 +412,11 @@ struct n2n_edge
 
     n2n_sock_t          supernode;
     n2n_sock_t          supernode_alt;
-    n2n_sock_t          sn_query;       /* fixed query channel (sn2): always asks sn1's newest address here */
-    uint8_t             sn_query_index; /* index into sn_ip_array of the query channel (sn2) */
-    uint8_t             sn_backup_index; /* index into sn_ip_array of the failover target */
-    n2n_sock_t          sn1_probe_addr; /* last address we probed sn1 at while on the failover target */
-    uint8_t             sn_probe_cookie[N2N_COOKIE_SIZE]; /* shared cookie for Phase-3 failback probes; the ACK path tells them apart by sender */
-    uint8_t             sn_probe_cookie_valid;
-    uint8_t             sn1_ever_ok;    /*=1 once sn1 accepted a registration/answered us;
-                                          gate: only then ask sn2 for sn1's NEW address */
+    n2n_sock_t          sn_backup;      /* other supernode (dual-SN), used for probe/failback */
 
     size_t              sn_idx;
     size_t              sn_num;
     n2n_sn_name_t       sn_ip_array[N2N_EDGE_NUM_SUPERNODES];
-    n2n_auth_t          sn_tokens[N2N_EDGE_NUM_SUPERNODES];
-    int                 token_configured;
     int                 sn_af;
     int                 sn_wait;
 
@@ -513,34 +446,15 @@ struct n2n_edge
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
     size_t              tx_transop_idx;
 
-    /* Destination cache for the P2P send path: a hit avoids the per-packet
-     * peer-table scan. Accessed inside PEERS_LOCK. */
+    /* Destination cache for the P2P send path (see edge.c send_PACKET).
+     * A cache hit avoids the per-packet peer-table scan. All access is
+     * inside PEERS_LOCK, so it is safe on Windows (TAP thread + main
+     * loop) and a no-op lock on Linux (single thread). */
     uint8_t             cached_dst_valid;
     uint8_t             cached_dst_is_peer;
     n2n_mac_t           cached_dst_mac;
     n2n_sock_t          cached_dst_sock;
     time_t              cached_dst_time;
-
-    /* Relay client: dual-send relay+supernode until proven, then relay-only; cleared on direct P2P */
-    n2n_mac_t           relay_mac;
-    n2n_sock_t          relay_sock;
-    uint8_t             relay_valid;
-    time_t              relay_last_reg;
-    time_t              relay_proven;       /* last time a frame was received THROUGH the relay; 0=never */
-    time_t              relay_last_ack;     /* last relay REGISTER ACK; liveness, decoupled from data traffic */
-
-    /* Relay server: this edge forwards PACKETs for peers that registered to
-     * it (mini-SN). Only NAT1 + public address self-enables. */
-    uint8_t             relay_mode;
-
-    /* Relay server member table: peers registered to this relay for forwarding
-     * (NAT1, sockets from the REGISTER transport). Separate from P2P tables. */
-    struct peer_info *  relay_peers;
-
-    /* No relay ACK for RELAY_ACK_SECS => relay dead, fall back to SN, retry later */
-    time_t              relay_probe_next;       /* when to retry a dead relay */
-    uint8_t             relay_giveup;           /* 1=relay deemed dead, stay on SN until retry */
-    uint8_t             relay_willing;          /* advertised to SN for relay selection: 0/1/2/3 */
 
     struct peer_info *  known_peers;
     struct peer_info *  pending_peers;
@@ -553,13 +467,6 @@ struct n2n_edge
     time_t              last_p2p;
     time_t              last_sup;
     size_t              sup_attempts;
-    uint8_t             sn_all_failed;
-    uint8_t             sn_ask_backup;
-    n2n_mac_t           sn1_mac;        /* MAC of the SN the edge is currently registered with. */
-    n2n_sock_t          sn1_v6;         /* sn1's IPv6 address (as reported by sn1 in the ACK). */
-    uint8_t             sn_ack_backup[N2N_EDGE_NUM_SUPERNODES]; /* indices whose entry came from the sn1 ACK (backup). */
-    uint8_t             sn_ak_parsed;   /* sn1's ACK backup string parsed (learnt or already present) */
-    char                sn_bak_masked[N2N_EDGE_SN_HOST_SIZE]; /* ACK-learned brother: masked display copy ('*' + tail) */
     uint8_t             sn_relay_fails;   /* consecutive relay send failures, reset on success */
     n2n_cookie_t        last_cookie;
     uint8_t             sn_ack_count;
@@ -570,32 +477,9 @@ struct n2n_edge
 
     n2n_sock_t          my_public_sock;
 
-    /* NAT detection: twin probes to the SN's two ports + helper-socket bounce for cone sub-types */
-    uint8_t             nat_type;       /* N2N_NAT_* */
-    n2n_sock_t          nat_seen_sn1;   /* edge addr observed by sn1 (family=0 if none) */
-    n2n_sock_t          nat_seen_sn2;   /* twin probe MAIN-port echo (also sn2 query ACK in failover) */
-    n2n_sock_t          nat_seen_sn2_alt; /* alt-port echo: equal public ports prove per-IP mapping reuse */
-    n2n_sock_t          nat_seen_sn_cross; /* echo from a distinct public IP; confirmatory only (NAT3 varies port per destination) */
-    time_t              nat_probe_time; /* last one-shot symmetric check attempt */
-    uint8_t             nat_probe_pending; /* 1 while awaiting ACKs of the NAT probe */
-    uint8_t             nat_probe_cross;   /* 1: cross-IP probe to sn2 fired this round; routes its ACK to nat_seen_sn_cross */
-    uint8_t             nat_bounce_seen;   /* a helper-port delivery got through: not port-restricted */
-    uint8_t             fc_seen;        /* "N2NF" from the never-contacted sn2 got through */
-    uint8_t             fc_window;      /* 1 until the first packet is sent to sn2 */
-    time_t              fc_arm_time;    /* last (re-)arm of the stranger window; the one-shot symmetric check spends it 12s later */
-    uint8_t             nat_sym_tries;  /* attempts spent on the one-shot symmetric check */
-    uint8_t             nat_final;      /* 1: verdict frozen, twin check spent (cleared on restart / mapping change) */
-    uint8_t             nat_reprobe;    /* one-shot: next sn1 registration re-triggers the brother's N2NF probe */
-    uint8_t             punch_round_reg; /* one-shot: next registration carries the punch-round flag */
-    time_t              nat_revert_at;  /* mgmt "n" fixed-port: rebind the local port at this time (0 = none) */
-    time_t              nat_refresh_start; /* mgmt "n" refresh start; hard cap forces freeze/restore even if sn2 never answers */
-    uint8_t             nat_rebuild_tries; /* rebuilds already run; capped so a sick environment eventually freezes */
-    uint8_t             nat_suppress_remap; /* one-shot: next ACK-remap only updates
-                                           my_public_sock, keeps the fresh NAT verdict */
-    time_t              nat_autorecover_at; /* last automatic UDP socket rebuild (every
-                                           supernode silent); 0 = never */
-
-    n2n_sock_t          own_ipv6;       /* routable global IPv6, reported for IPv6 hole-punching; family==0 if none */
+    n2n_sock_t          own_ipv6;       /* routable global IPv6 (GUA) of this edge,
+                                           reported to supernode for IPv6 hole-punching
+                                           when the supernode is IPv4-only. family==0 if none. */
 
     n2n_sock_t          local_sock;
     int                 local_sock_ena;
@@ -606,12 +490,8 @@ struct n2n_edge
     /* UPnP/NAT-PMP */
     uint16_t            upnp_mapped_port;
 
+    n2n_sock_t          last_resolved_supernode;
     time_t              last_resolve_check;
-
-    /* HTTP redirect (pure socket, no curl/wget) */
-    char                http_redirect_url[N2N_EDGE_SN_HOST_SIZE];
-    time_t              last_http_check;
-    n2n_sock_t          last_http_supernode;
 
     /* "f" sync: lock mgmt input, take IP snapshot, compare vs PEER_INFO from SN */
     int                 peer_sync_active;     /* 1 = sync in progress, mgmt locked */
@@ -638,6 +518,7 @@ struct n2n_edge
     /* Rate-limiting for P2P/PsP log messages */
     uint8_t             last_p2p_log_mac[N2N_MAC_SIZE];
     n2n_sock_t          last_p2p_log_addr;
+    uint8_t             last_psp_log_mac[N2N_MAC_SIZE];
 
     /* Bypass module */
     bypass_context_t   *bp;
