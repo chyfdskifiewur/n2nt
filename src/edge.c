@@ -5215,13 +5215,8 @@ static int scan_route(char* optarg, struct tuntap_config* tuntap_config) {
     }
     else if ((tuntap_config->routes_count % 16) == 15)
     {
-        route *_new = (route*)realloc(tuntap_config->routes,
+        tuntap_config->routes = (route*)realloc(tuntap_config->routes,
             ((tuntap_config->routes_count / 16 + 2) * 16) * sizeof(route));
-        if (!_new) {
-            traceEvent(TRACE_ERROR, "Out of memory for routes");
-            return 0;
-        }
-        tuntap_config->routes = _new;
     }
 
     route* r = &tuntap_config->routes[tuntap_config->routes_count];
@@ -5269,10 +5264,7 @@ fail:
     }
     else if ((tuntap_config->routes_count % 16) == 15)
     {
-        route *_new = (route*) reallocarray(tuntap_config->routes, ((tuntap_config->routes_count / 16 + 1) * 16), sizeof(route));
-        if (_new)
-            tuntap_config->routes = _new;
-        /* else: keep the original allocation, leak is insignificant */
+        tuntap_config->routes = (route*) reallocarray(tuntap_config->routes, ((tuntap_config->routes_count / 16 + 1) * 16), sizeof(route));
     }
     return 0;
 }
