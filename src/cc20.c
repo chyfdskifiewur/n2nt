@@ -276,10 +276,10 @@ int cc20_crypt (unsigned char *out, const unsigned char *in, size_t in_len,
 #define ROL16(X) ROL(X,16)
 
 
-/* Lane rotates, identical to the SSE2 _MM_SHUFFLE(0,3,2,1)/(1,0,3,2)/(2,1,0,3) above. */
-static inline uint32x4_t neon_shuffle_0_3_2_1 (uint32x4_t v) { return vextq_u32(v, v, 1); } /* {v1,v2,v3,v0} */
-static inline uint32x4_t neon_shuffle_1_0_3_2 (uint32x4_t v) { return vextq_u32(v, v, 2); } /* {v2,v3,v0,v1} */
-static inline uint32x4_t neon_shuffle_2_1_0_3 (uint32x4_t v) { return vextq_u32(v, v, 3); } /* {v3,v0,v1,v2} */
+/* Lane rotates, matching the SSE2 _MM_SHUFFLE(0,3,2,1)/(1,0,3,2)/(2,1,0,3). */
+static inline uint32x4_t neon_shuffle_0_3_2_1 (uint32x4_t v) { return vextq_u32(v, v, 1); }
+static inline uint32x4_t neon_shuffle_1_0_3_2 (uint32x4_t v) { return vextq_u32(v, v, 2); }
+static inline uint32x4_t neon_shuffle_2_1_0_3 (uint32x4_t v) { return vextq_u32(v, v, 3); }
 
 #define CC20_PERMUTE_ROWS(A,B,C,D)                     \
     B = neon_shuffle_0_3_2_1(B);                       \
@@ -404,9 +404,9 @@ int cc20_crypt (unsigned char *out, const unsigned char *in, size_t in_len,
         k0 = ADD(k0, a); k1 = ADD(k1, b); k2 = ADD(k2, c); k3 = ADD(k3, d);
 
         vst1q_u32((uint32_t*)&(ctx->keystream32[0]), k0);
-        vst1q_u32((uint32_t*)&(ctx->keystream32[4]), k1);
-        vst1q_u32((uint32_t*)&(ctx->keystream32[8]), k2);
-        vst1q_u32((uint32_t*)&(ctx->keystream32[12]), k3);
+        vst1q_u32((uint32_t*)&(ctx->keystream32[1]), k1);
+        vst1q_u32((uint32_t*)&(ctx->keystream32[2]), k2);
+        vst1q_u32((uint32_t*)&(ctx->keystream32[3]), k3);
 
         /* keep in mind that out and in got increased inside the last loop
          * and point to current position now */
