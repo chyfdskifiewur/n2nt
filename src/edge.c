@@ -5203,16 +5203,18 @@ process_n2n_packet:
                         PEERS_UNLOCK(eee);
                         return 1;
                     }
-                    /* Address change is detected unconditionally: a changed address on a communicating pair restarts the punch immediately. */
+                    /* Flag a change only when the SAME family already stored differs;
+                     * we store one family, so the peer's other family being reported
+                     * back must not look like a change (it would demote known→pending in a loop). */
                     if (pi.sockets[0].family == AF_INET) {
-                        if (known->sock.family != AF_INET ||
+                        if (known->sock.family == AF_INET &&
                             sock_equal(&known->sock, &pi.sockets[0]) != 0) {
                             addr_changed = 1;
                             eee->cached_dst_valid = 0;
                         }
                     }
                     if (!addr_changed && pi.sock6.family == AF_INET6) {
-                        if (known->sock6.family != AF_INET6 ||
+                        if (known->sock6.family == AF_INET6 &&
                             sock_equal(&known->sock6, &pi.sock6) != 0) {
                             addr_changed = 1;
                             eee->cached_dst_valid = 0;
