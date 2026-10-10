@@ -289,6 +289,9 @@ struct peer_info {
     /* Compact packet protocol support (version 0xE5 header) */
     uint8_t             compact_capable;   /* 1=understands compact format, 0=legacy/unknown */
     uint16_t            transform_id;      /* transform ID learned from PACKET headers (for SN legacy conversion) */
+    /* P2P log dedup: per peer, else peers evict one another's single slot */
+    uint8_t             last_p2p_log_mac[N2N_MAC_SIZE];
+    n2n_sock_t          last_p2p_log_addr;
     /* WebSocket: non-NULL means this edge is connected via WS, forwarding uses ws_send instead of UDP sendto */
     ws_conn_t *         ws;
 };
@@ -634,10 +637,6 @@ struct n2n_edge
     size_t              p2p_rx_bytes;
 
     volatile int        keep_running;
-
-    /* Rate-limiting for P2P/PsP log messages */
-    uint8_t             last_p2p_log_mac[N2N_MAC_SIZE];
-    n2n_sock_t          last_p2p_log_addr;
 
     /* Bypass module */
     bypass_context_t   *bp;

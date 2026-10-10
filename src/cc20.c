@@ -316,7 +316,7 @@ static const uint32_t neon_one_arr[4] = {1, 0, 0, 0};
 static const uint32_t neon_two_arr[4] = {2, 0, 0, 0};
 
 
-static int cc20_crypt_neon (unsigned char *out, const unsigned char *in, size_t in_len,
+int cc20_crypt (unsigned char *out, const unsigned char *in, size_t in_len,
                 const unsigned char *iv, cc20_context_t *ctx) {
 
     uint32x4_t a, b, c, d, k0, k1, k2, k3, k4, k5, k6, k7;
@@ -417,93 +417,6 @@ static int cc20_crypt_neon (unsigned char *out, const unsigned char *in, size_t 
     }
 
     return(0);
-}
-
-
-/* Plain C reference for the NEON self-test below; same code path as the
- * plain-C build (MIPS etc.), so self-test pass = interoperable. */
-#define REF_ROTL(x, r) (((x) << (r)) | ((x) >> (32 - (r))))
-
-#define REF_QR(s, a, b, c, d) do {                      \
-    s[a] += s[b]; s[d] = REF_ROTL(s[d] ^ s[a], 16);     \
-    s[c] += s[d]; s[b] = REF_ROTL(s[b] ^ s[c], 12);     \
-    s[a] += s[b]; s[d] = REF_ROTL(s[d] ^ s[a],  8);     \
-    s[c] += s[d]; s[b] = REF_ROTL(s[b] ^ s[c],  7);     \
-} while(0)
-
-static void cc20_ref_block (const unsigned char *key, const unsigned char *iv, unsigned char out64[64]) {
-    uint32_t s[16], x[16];
-    int i;
-
-    memcpy(&s[0], "expand 32-byte k", 16);
-    memcpy(&s[4], key, 32);
-    memcpy(&s[12], iv, 16);
-    memcpy(x, s, sizeof(s));
-
-    for(i = 0; i < 10; i++) {
-        REF_QR(x, 0, 4,  8, 12); REF_QR(x, 1, 5,  9, 13);
-        REF_QR(x, 2, 6, 10, 14); REF_QR(x, 3, 7, 11, 15);
-        REF_QR(x, 0, 5, 10, 15); REF_QR(x, 1, 6, 11, 12);
-        REF_QR(x, 2, 7,  8, 13); REF_QR(x, 3, 4,  9, 14);
-    }
-
-    for(i = 0; i < 16; i++) x[i] += s[i];
-    memcpy(out64, x, 64);
-}
-
-static int cc20_crypt_ref (unsigned char *out, const unsigned char *in, size_t in_len,
-                           const unsigned char *iv, cc20_context_t *ctx) {
-    unsigned char ivc[16], blk[64];
-    size_t i;
-
-    memcpy(ivc, iv, 16);
-    while(in_len >= 64) {
-        cc20_ref_block(ctx->key, ivc, blk);
-        for(i = 0; i < 16; i++)
-            ((uint32_t*)out)[i] = ((const uint32_t*)in)[i] ^ ((const uint32_t*)blk)[i];
-        ((uint32_t*)ivc)[0] += 1;
-        in += 64; out += 64; in_len -= 64;
-    }
-    if(in_len) {
-        cc20_ref_block(ctx->key, ivc, blk);
-        for(i = 0; i < in_len; i++)
-            out[i] = in[i] ^ blk[i];
-    }
-    return(0);
-}
-
-static int cc20_neon_selftest (void) {
-    static const size_t lens[] = { 1, 15, 63, 64, 65, 127, 128, 129, 300 };
-    unsigned char key[32], iv[16], in[300], o1[300], o2[300];
-    cc20_context_t *ctx = NULL;
-    size_t n;
-    int i, ok = 1;
-
-    for(i = 0; i < 32; i++) key[i] = (unsigned char)(i * 7 + 1);
-    for(i = 0; i < 16; i++) iv[i]  = (unsigned char)(i * 13 + 5);
-    for(i = 0; i < 300; i++) in[i] = (unsigned char)(i * 11 + 3);
-
-    if(cc20_init(key, &ctx) != 0) return 0;
-    for(n = 0; n < sizeof(lens)/sizeof(lens[0]) && ok; n++) {
-        cc20_crypt_neon(o1, in, lens[n], iv, ctx);
-        cc20_crypt_ref (o2, in, lens[n], iv, ctx);
-        if(memcmp(o1, o2, lens[n]) != 0) ok = 0;
-    }
-    free(ctx);
-    return ok;
-}
-
-int cc20_crypt (unsigned char *out, const unsigned char *in, size_t in_len,
-                const unsigned char *iv, cc20_context_t *ctx) {
-    static int neon_ok = -1;
-
-    if(neon_ok < 0) {
-        neon_ok = cc20_neon_selftest();
-        traceEvent(TRACE_NORMAL, "cc20 NEON self-test %s",
-                   neon_ok ? "passed" : "failed, using plain C");
-    }
-    if(neon_ok) return cc20_crypt_neon(out, in, in_len, iv, ctx);
-    return cc20_crypt_ref (out, in, in_len, iv, ctx);
 }
 
 
